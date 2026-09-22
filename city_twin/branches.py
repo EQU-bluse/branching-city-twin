@@ -327,6 +327,57 @@ class BranchStore:
             )
         return tuple(records)
 
+    def explain_impact(
+        self, name: str, event_id: str
+    ) -> tuple[dict[str, object], ...]:
+        """Explain the forward causal impact of an event on a branch.
+
+        Edges are read parent-to-child within the current head ancestor
+        closure of branch ``name``: the result covers the strict
+        descendants of ``event_id`` -- events causally *after* it -- never
+        the event itself, each exactly once, in the graph's
+        parents-before-children, ``(at, id)`` order. When several paths
+        reach a descendant, the one with the fewest edges is reported;
+        same-length paths are broken by the lexicographically smallest
+        full id tuple (compared by Unicode code point). Each record is a
+        fresh dict whose keys are ordered ``event_id, at, path, keys``:
+        the descendant id, its non-negative timestamp, the id tuple of
+        the chosen path from ``event_id`` to the descendant with both
+        ends included, and the tuple of change keys the descendant
+        touches, ordered by Unicode code point (an empty tuple for events
+        with no changes). An event with no descendants yields an empty
+        tuple.
+
+        ``name`` and ``event_id`` are validated (in that order) before the
+        branch is looked up: non-``str`` values raise :class:`TypeError`,
+        empty strings raise :class:`ValueError`, an unknown branch name or
+        an event id that does not exist in the graph or is not in the
+        branch's current head ancestor closure raises :class:`KeyError`.
+        The query is read-only and its result is detached from internal
+        state, so the graph, branch heads, audit and idempotency records
+        are never modified, and repeated calls return item-wise equal
+        results in a stable order.
+        """
+        self._require_nonempty_str(name, "name")
+        self._require_nonempty_str(event_id, "event_id")
+        self._require_known_branch(name)
+
+        records: list[dict[str, object]] = []
+        for descendant_id, at_value, path, keys in (
+            self._graph._impact_descendants(
+                self._heads[name], event_id
+            )
+        ):
+            records.append(
+                {
+                    "event_id": descendant_id,
+                    "at": at_value,
+                    "path": tuple(path),
+                    "keys": tuple(keys),
+                }
+            )
+        return tuple(records)
+
     def diff_at(self, name_a: str, name_b: str, at: int) -> dict[str, tuple[int, int]]:
         """Diff two branches' current heads as of ``at``.
 

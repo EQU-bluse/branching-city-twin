@@ -373,3 +373,69 @@ class EventGraph:
         return tuple(
             event_id for event_id in order if key in self._changes[event_id]
         )
+
+    def _impact_descendants(
+        self, head: str, start: str
+    ) -> list[tuple[str, int, tuple[str, ...], tuple[str, ...]]]:
+        """Return ``start``'s strict descendants inside ``head``'s closure.
+
+        Edges are read parent-to-child, so only events causally *after*
+        ``start`` are considered; ``start`` itself is excluded. Each entry
+        is ``(id, at, path, keys)``: the descendant id, its non-negative
+        timestamp, the id tuple of the chosen path from ``start`` to the
+        descendant with both ends included, and the tuple of change keys
+        the descendant touches, ordered by Unicode code point (an empty
+        tuple for events with no changes).
+
+        When several paths reach a descendant, the one with the fewest
+        edges wins; same-length paths are broken by the lexicographically
+        smallest full id tuple (compared by Unicode code point). Entries
+        follow the unique parents-before-children, ``(at, id)`` order of
+        :meth:`_ordered_ancestors`. Unknown ``start`` ids and ids outside
+        ``head``'s ancestor closure raise :class:`KeyError`. The query is
+        read-only and every returned tuple is freshly built.
+        """
+        order = self._ordered_ancestors(head)
+        closure = set(order)
+        if start not in self._at or start not in closure:
+            raise KeyError(start)
+
+        children: dict[str, list[str]] = {event_id: [] for event_id in closure}
+        for event_id in closure:
+            for parent in self._parents[event_id]:
+                children[parent].append(event_id)
+
+        # Breadth-first expansion, one edge-count level at a time, keeps
+        # the first path found to each node shortest; within a level the
+        # lexicographically smallest parent path wins (the child id is a
+        # common suffix, so parent-path order decides the full tuple).
+        best: dict[str, tuple[str, ...]] = {start: (start,)}
+        frontier = [start]
+        while frontier:
+            candidates: dict[str, list[tuple[str, ...]]] = {}
+            for event_id in frontier:
+                for child in children[event_id]:
+                    if child not in best:
+                        candidates.setdefault(child, []).append(best[event_id])
+            next_frontier: list[str] = []
+            for child, parent_paths in candidates.items():
+                best[child] = min(parent_paths) + (child,)
+                next_frontier.append(child)
+            frontier = next_frontier
+
+        records: list[
+            tuple[str, int, tuple[str, ...], tuple[str, ...]]
+        ] = []
+        for event_id in order:
+            path = best.get(event_id)
+            if path is None or event_id == start:
+                continue
+            records.append(
+                (
+                    event_id,
+                    self._at[event_id],
+                    path,
+                    tuple(sorted(self._changes[event_id])),
+                )
+            )
+        return records
