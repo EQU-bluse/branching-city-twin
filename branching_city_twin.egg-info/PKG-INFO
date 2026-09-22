@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: branching-city-twin
+Version: 0.1.0
+Summary: Branching and replayable city digital twin backend
+Requires-Python: >=3.12
