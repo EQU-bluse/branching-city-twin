@@ -491,29 +491,11 @@ class BranchStore:
         :class:`TypeError`, empty strings raise :class:`ValueError`,
         unknown branches raise :class:`KeyError` (``name_a`` first), and
         naming the same branch twice raises :class:`ValueError`. Each
-        branch's current head ancestor closure is replayed in the graph's
-        parents-before-children, ``(at, id)`` order; a side on which
-        ``key`` never appears contributes the value ``0``.
-
-        The result is a fresh dict whose keys are ordered
-        ``key, fork, left, right``: ``key`` is the queried key as given
-        and ``fork`` is the last common event id in left replay order (or
-        ``None`` when the closures share no event). ``left`` and ``right``
-        are fresh dicts whose keys are ordered ``value, cause, path,
-        affected``: the replayed integer value, the cause event id, and
-        data derived from it. When the two values differ, a side's cause
-        is the first event exclusive to that side whose changes contain
-        ``key`` (zero deltas included) in that side's replay order, or
-        ``None`` when no such event exists; when the values are equal,
-        both causes are ``None``. ``path`` is the tuple of ids on the
-        shortest parent-to-child path from the cause to that side's
-        current head (both ends included), ties broken by the Unicode
-        code point order of the complete id tuples, and ``affected`` is
-        the tuple of the cause's strict descendant ids in that side's
-        replay order; both are empty tuples when the cause is ``None``.
-        The query is read-only: the graph, branch heads and records are
-        never modified, and the returned dict and tuples are detached
-        from internal state.
+        branch's current head is used as that side's node; see
+        :meth:`attribute_divergence_at` for the full attribution rules.
+        The query is read-only: the graph, branch heads, audit and
+        idempotency records are never modified, and the returned dict and
+        tuples are detached from internal state.
         """
         self._require_nonempty_str(name_a, "name_a")
         self._require_nonempty_str(name_b, "name_b")
@@ -525,11 +507,91 @@ class BranchStore:
                 f"cannot attribute divergence for branch {name_a!r} "
                 "against itself"
             )
+        return self._attribute_divergence_for(
+            self._heads[name_a], self._heads[name_b], key
+        )
 
-        head_a = self._heads[name_a]
-        head_b = self._heads[name_b]
-        left_order = self._graph._ordered_ancestors(head_a)
-        right_order = self._graph._ordered_ancestors(head_b)
+    def attribute_divergence_at(
+        self,
+        name_a: str,
+        node_a: str,
+        name_b: str,
+        node_b: str,
+        key: str,
+    ) -> dict[str, object]:
+        """Attribute the divergence of ``key`` at two historical nodes.
+
+        Works like :meth:`attribute_divergence`, but each side is rooted
+        at an arbitrary historical node instead of the branch's current
+        head: ``node_a`` is replayed as the tip of ``name_a``'s history
+        and ``node_b`` as the tip of ``name_b``'s. The five parameters
+        are validated in signature order -- non-``str`` values raise
+        :class:`TypeError`, empty strings raise :class:`ValueError` --
+        before either branch is looked up (``name_a`` first): unknown
+        branches raise :class:`KeyError`, and naming the same branch
+        twice raises :class:`ValueError`. A node missing from the graph,
+        or outside its branch's current head ancestor closure, raises
+        :class:`KeyError` (``node_a`` checked before ``node_b``).
+
+        Each node's ancestor closure is replayed in the graph's
+        parents-before-children, ``(at, id)`` order; a side on which
+        ``key`` never appears contributes the value ``0``. The result is
+        a fresh dict whose keys are ordered ``key, fork, left, right``:
+        ``key`` is the queried key as given and ``fork`` is the last
+        common event id in left replay order (or ``None`` when the
+        closures share no event). ``left`` and ``right`` are fresh dicts
+        whose keys are ordered ``value, cause, path, affected``: the
+        replayed integer value, the cause event id, and data derived
+        from it. When the two values differ, a side's cause is the first
+        event exclusive to that side whose changes contain ``key`` (zero
+        deltas included) in that side's replay order, or ``None`` when no
+        such event exists; when the values are equal, both causes are
+        ``None``. ``path`` is the tuple of ids on the shortest
+        parent-to-child path from the cause to that side's node (both
+        ends included), ties broken by the Unicode code point order of
+        the complete id tuples, and ``affected`` is the tuple of the
+        cause's strict descendant ids within that side's closure in
+        replay order; both are empty tuples when the cause is ``None``.
+        The query is read-only: success or failure never modifies the
+        graph, branch heads, audit or idempotency records, and the
+        returned dict and tuples are detached from internal state.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(node_a, "node_a")
+        self._require_nonempty_str(name_b, "name_b")
+        self._require_nonempty_str(node_b, "node_b")
+        self._require_nonempty_str(key, "key")
+
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(
+                f"cannot attribute divergence for branch {name_a!r} "
+                "against itself"
+            )
+
+        if node_a not in self._graph._at:
+            raise KeyError(node_a)
+        if node_a not in set(
+            self._graph._ordered_ancestors(self._heads[name_a])
+        ):
+            raise KeyError(node_a)
+
+        if node_b not in self._graph._at:
+            raise KeyError(node_b)
+        if node_b not in set(
+            self._graph._ordered_ancestors(self._heads[name_b])
+        ):
+            raise KeyError(node_b)
+
+        return self._attribute_divergence_for(node_a, node_b, key)
+
+    def _attribute_divergence_for(
+        self, node_a: str, node_b: str, key: str
+    ) -> dict[str, object]:
+        """Attribute the divergence of ``key`` between two closure tips."""
+        left_order = self._graph._ordered_ancestors(node_a)
+        right_order = self._graph._ordered_ancestors(node_b)
         left_ids = set(left_order)
         right_ids = set(right_order)
 
@@ -577,7 +639,7 @@ class BranchStore:
             right_cause = None
 
         def cause_impact(
-            order: list[str], head: str, cause: str | None
+            order: list[str], tip: str, cause: str | None
         ) -> tuple[tuple[str, ...], tuple[str, ...]]:
             if cause is None:
                 return (), ()
@@ -590,8 +652,7 @@ class BranchStore:
             }
             for current in closure:
                 for parent in self._graph._parents[current]:
-                    if parent in closure:
-                        children[parent].append(current)
+                    children[parent].append(current)
 
             # Level-by-level breadth-first search gives the fewest-edge
             # paths; keeping the minimum full id tuple within a level
@@ -614,7 +675,7 @@ class BranchStore:
                     paths[child] = path
                 frontier = list(candidates)
 
-            path = tuple(paths[head])
+            path = tuple(paths[tip])
             affected = tuple(
                 event_id
                 for event_id in order
@@ -623,10 +684,10 @@ class BranchStore:
             return path, affected
 
         left_path, left_affected = cause_impact(
-            left_order, head_a, left_cause
+            left_order, node_a, left_cause
         )
         right_path, right_affected = cause_impact(
-            right_order, head_b, right_cause
+            right_order, node_b, right_cause
         )
 
         return {
