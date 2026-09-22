@@ -221,6 +221,27 @@ class BranchStore:
         self._require_known_branch(name)
         return self._graph.explain(self._heads[name], key)
 
+    def diff_at(self, name_a: str, name_b: str, at: int) -> dict[str, tuple[int, int]]:
+        """Diff two branches' current heads as of ``at``.
+
+        Both names and ``at`` are validated (in signature order) before
+        either branch is looked up; the diff itself is delegated to
+        :meth:`EventGraph.diff_at` on the branches' current heads. The
+        query is read-only: the graph, branch heads and records are
+        never modified, and the returned dict and tuples are detached
+        from internal state.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(name_b, "name_b")
+        at_value = EventGraph._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        return self._graph.diff_at(
+            self._heads[name_a], self._heads[name_b], at_value
+        )
+
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
         self._require_nonempty_str(name, "name")

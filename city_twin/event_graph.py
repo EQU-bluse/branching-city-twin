@@ -162,6 +162,32 @@ class EventGraph:
                 state[key] = state.get(key, 0) + delta
         return {key: state[key] for key in sorted(state)}
 
+    def diff_at(self, head_a: str, head_b: str, at: int) -> dict[str, tuple[int, int]]:
+        """Compare two heads' ancestor closures as of timestamp ``at``.
+
+        Each head is replayed with :meth:`replay_at`'s rules (only events
+        whose own ``at`` is at most the given ``at``, parents-before-
+        children in ``(at, id)`` order, zero-valued keys kept). The result
+        is a fresh dict over the union of both states' keys, ordered by
+        Unicode code point, mapping each key to a ``(left, right)`` tuple
+        where a side missing the key contributes ``0``. All parameters
+        are validated (in signature order) before either head is looked
+        up; the query is read-only and its result is detached from the
+        graph's internal state.
+        """
+        self._require_nonempty_str(head_a, "head_a")
+        self._require_nonempty_str(head_b, "head_b")
+        at_value = self._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+
+        left = self.replay_at(head_a, at_value)
+        right = self.replay_at(head_b, at_value)
+        return {
+            key: (left.get(key, 0), right.get(key, 0))
+            for key in sorted(left.keys() | right.keys())
+        }
+
     def explain(self, head: str, key: str) -> tuple[str, ...]:
         """Return ids of events touching ``key``, in replay order.
 
