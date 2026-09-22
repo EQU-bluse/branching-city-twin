@@ -27,7 +27,8 @@ class BranchStore:
         self._graph = graph
         self._heads: dict[str, str] = {}
         self._sources: dict[str, str] = {}
-        self._appends: dict[str, dict[str, tuple[int, dict[str, int]]]] = {}
+        # Appends record (at, changes); merges record (source, at, changes).
+        self._appends: dict[str, dict[str, tuple[Any, ...]]] = {}
 
     @staticmethod
     def _require_nonempty_str(value: Any, name: str) -> None:
@@ -109,6 +110,99 @@ class BranchStore:
         # --- Commit: only after the graph accepted the event. ---
         self._heads[name] = id
         self._appends[name][id] = (at_value, changes)
+
+    def merge(
+        self,
+        target: str,
+        source: str,
+        id: str,
+        at: int,
+        changes: dict[str, int],
+    ) -> None:
+        """Merge ``source`` into ``target`` under a new two-parent event.
+
+        The merge event's parents are ``(target head, source head)`` in
+        that fixed order. On success only the target head moves; the
+        source head is left untouched. Conflicting change keys among the
+        events that are ancestors of exactly one of the two heads make
+        the merge invalid. Repeating a merge with the same five inputs
+        is a no-op; reusing the record's id or an id already in the
+        graph with any different input is a conflict.
+        """
+        # --- Full validation happens before any state is consulted. ---
+        self._require_nonempty_str(target, "target")
+        self._require_nonempty_str(source, "source")
+        self._require_nonempty_str(id, "id")
+        # The at/changes contract is exactly EventGraph.add's.
+        at_value = EventGraph._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+        if not isinstance(changes, dict):
+            raise TypeError(
+                f"changes must be a dict, got {type(changes).__name__}"
+            )
+        for key, value in changes.items():
+            EventGraph._require_nonempty_str(key, "change key")
+            EventGraph._require_int(value, f"change value for {key!r}")
+        # Copy caller-owned input before it can be recorded anywhere.
+        changes = dict(changes)
+
+        self._require_known_branch(target)
+        self._require_known_branch(source)
+        if target == source:
+            raise ValueError(f"cannot merge branch {target!r} into itself")
+
+        recorded = self._appends[target].get(id)
+        if recorded is not None:
+            if recorded == (source, at_value, changes):
+                return
+            raise ValueError(
+                f"event {id!r} already recorded on branch {target!r} "
+                f"with different inputs"
+            )
+
+        def closure(head: str) -> set[str]:
+            found = {head}
+            stack = [head]
+            while stack:
+                current = stack.pop()
+                for parent in self._graph._parents[current]:
+                    if parent not in found:
+                        found.add(parent)
+                        stack.append(parent)
+            return found
+
+        target_head = self._heads[target]
+        source_head = self._heads[source]
+        t_closure = closure(target_head)
+        s_closure = closure(source_head)
+        common = t_closure & s_closure
+        t_only = t_closure - common
+        s_only = s_closure - common
+
+        def change_keys(event_ids: set[str]) -> set[str]:
+            keys: set[str] = set()
+            for event_id in event_ids:
+                keys.update(self._graph._changes[event_id])
+            return keys
+
+        conflicts = change_keys(t_only) & change_keys(s_only)
+        if conflicts:
+            raise ValueError(
+                f"merge conflicts on change keys: "
+                f"{', '.join(sorted(conflicts))}"
+            )
+
+        # graph.add enforces id idempotency/conflict for ids already in
+        # the graph (e.g. appended by another branch) and parent validity.
+        self._graph.add(id, at_value, (target_head, source_head), changes)
+
+        # --- Commit: only after the graph accepted the event. ---
+        self._heads[target] = id
+        # The record is the five-tuple of inputs (target/id are the dict
+        # keys); the heads captured by the merge are deliberately absent,
+        # so the same inputs stay idempotent after either branch moves.
+        self._appends[target][id] = (source, at_value, changes)
 
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
