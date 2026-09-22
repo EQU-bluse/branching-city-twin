@@ -278,6 +278,60 @@ class BranchStore:
         self._require_known_branch(name)
         return self._graph.explain(self._heads[name], key)
 
+    def explain_change(
+        self, name: str, key: str
+    ) -> tuple[dict[str, object], ...]:
+        """Explain the causal trajectory of ``key`` on branch ``name``.
+
+        Takes the ancestor closure of the branch's current head and, in
+        the graph's parents-before-children, ``(at, id)`` replay order,
+        selects every event whose changes contain ``key`` (zero deltas
+        included). Starting from an initial value of ``0``, the key's
+        integer delta is accumulated event by event. Each returned
+        record is a fresh dict whose keys are ordered
+        ``event_id, at, parents, delta, before, after``: the event id,
+        its non-negative timestamp, its recorded parent ids as a tuple
+        in recorded order (so a merge event shows the target head first
+        and the source head second), the event's integer delta for
+        ``key``, the value before applying that delta and the value
+        after it. Every relevant event appears exactly once; a key no
+        event touches yields an empty tuple.
+
+        ``name`` and ``key`` are validated (in that order) before the
+        branch is looked up: non-``str`` arguments raise
+        :class:`TypeError`, empty strings raise :class:`ValueError` and
+        an unknown branch name raises :class:`KeyError`. The query is
+        read-only: the graph, branch heads, audit and idempotency
+        records are never modified, and the returned tuple, dicts and
+        parent tuples are detached from internal state, so repeated
+        calls return item-wise equal results.
+        """
+        self._require_nonempty_str(name, "name")
+        self._require_nonempty_str(key, "key")
+        self._require_known_branch(name)
+
+        order = self._graph._ordered_ancestors(self._heads[name])
+        records: list[dict[str, object]] = []
+        value = 0
+        for event_id in order:
+            changes = self._graph._changes[event_id]
+            if key not in changes:
+                continue
+            delta = changes[key]
+            before = value
+            value += delta
+            records.append(
+                {
+                    "event_id": event_id,
+                    "at": self._graph._at[event_id],
+                    "parents": tuple(self._graph._parents[event_id]),
+                    "delta": delta,
+                    "before": before,
+                    "after": value,
+                }
+            )
+        return tuple(records)
+
     def diff_at(self, name_a: str, name_b: str, at: int) -> dict[str, tuple[int, int]]:
         """Diff two branches' current heads as of ``at``.
 
