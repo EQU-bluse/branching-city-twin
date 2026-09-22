@@ -605,6 +605,90 @@ class BranchStore:
 
         return self._attribute_divergence_for(node_a, node_b, key)
 
+    def attribute_divergences_at(
+        self,
+        name_a: str,
+        node_a: str,
+        name_b: str,
+        node_b: str,
+        keys: tuple[str, ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Attribute the divergence of several keys at two historical nodes.
+
+        This is the multi-key form of :meth:`attribute_divergence_at`:
+        the left side replays the ancestor closure of ``node_a`` on
+        branch ``name_a`` and the right side that of ``node_b`` on
+        branch ``name_b``, once each, and every key is attributed
+        against that same read-only historical view. The first four
+        parameters are validated in signature order (``name_a``,
+        ``node_a``, ``name_b``, ``node_b``): non-``str`` values raise
+        :class:`TypeError`, empty strings raise :class:`ValueError`.
+        ``keys`` must be a tuple -- anything else raises
+        :class:`TypeError` -- and its elements are checked in input
+        order: a non-``str`` element raises :class:`TypeError`, an
+        empty string or a duplicate key raises :class:`ValueError`. The
+        branches are then looked up in order (``name_a`` first), an
+        unknown branch raises :class:`KeyError`, and naming the same
+        branch twice raises :class:`ValueError`; a node absent from the
+        graph, or outside its named branch's current head ancestor
+        closure (``node_a`` checked before ``node_b``), raises
+        :class:`KeyError`. All of these checks run even when ``keys``
+        is empty, in which case an empty tuple is returned.
+
+        The result holds one item per key, ordered by the Unicode code
+        point of the keys; each item is exactly what
+        :meth:`attribute_divergence_at` returns for the same first four
+        parameters and that key, with the same key order, types and
+        semantics. The query is read-only: success or failure never
+        modifies the graph, branch heads, audit or idempotency records,
+        and the returned tuple, dicts and tuples share no state with
+        each other or with internal records.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(node_a, "node_a")
+        self._require_nonempty_str(name_b, "name_b")
+        self._require_nonempty_str(node_b, "node_b")
+        if not isinstance(keys, tuple):
+            raise TypeError(
+                f"keys must be a tuple, got {type(keys).__name__}"
+            )
+        seen_keys: set[str] = set()
+        for key in keys:
+            self._require_nonempty_str(key, "key")
+            if key in seen_keys:
+                raise ValueError(f"duplicate key {key!r}")
+            seen_keys.add(key)
+
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(
+                f"cannot attribute divergence for branch {name_a!r} "
+                "against itself"
+            )
+
+        if node_a not in self._graph._at:
+            raise KeyError(node_a)
+        left_order = self._graph._ordered_ancestors(self._heads[name_a])
+        if node_a not in set(left_order):
+            raise KeyError(node_a)
+        if node_b not in self._graph._at:
+            raise KeyError(node_b)
+        right_order = self._graph._ordered_ancestors(self._heads[name_b])
+        if node_b not in set(right_order):
+            raise KeyError(node_b)
+
+        # One read-only historical view serves every key: each side's
+        # closure is taken once, before any attribution is computed.
+        left_view = self._graph._ordered_ancestors(node_a)
+        right_view = self._graph._ordered_ancestors(node_b)
+        return tuple(
+            self._attribute_divergence_in(
+                left_view, right_view, node_a, node_b, key
+            )
+            for key in sorted(keys)
+        )
+
     def _attribute_divergence_for(
         self, head_a: str, head_b: str, key: str
     ) -> dict[str, object]:
@@ -616,6 +700,24 @@ class BranchStore:
         """
         left_order = self._graph._ordered_ancestors(head_a)
         right_order = self._graph._ordered_ancestors(head_b)
+        return self._attribute_divergence_in(
+            left_order, right_order, head_a, head_b, key
+        )
+
+    def _attribute_divergence_in(
+        self,
+        left_order: list[str],
+        right_order: list[str],
+        head_a: str,
+        head_b: str,
+        key: str,
+    ) -> dict[str, object]:
+        """Divergence attribution over two already-computed closures.
+
+        ``left_order``/``right_order`` are the ancestor closures of
+        ``head_a``/``head_b`` in replay order, taken from a single
+        read-only view of the graph by the caller.
+        """
         left_ids = set(left_order)
         right_ids = set(right_order)
 
