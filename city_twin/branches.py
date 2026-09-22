@@ -28,6 +28,7 @@ class BranchStore:
         self._heads: dict[str, str] = {}
         self._sources: dict[str, str] = {}
         self._appends: dict[str, dict[str, tuple[int, dict[str, int]]]] = {}
+        self._merges: dict[str, tuple[str, str, int, dict[str, int]]] = {}
 
     @staticmethod
     def _require_nonempty_str(value: Any, name: str) -> None:
@@ -109,6 +110,80 @@ class BranchStore:
         # --- Commit: only after the graph accepted the event. ---
         self._heads[name] = id
         self._appends[name][id] = (at_value, changes)
+
+    def merge(
+        self,
+        target: str,
+        source: str,
+        id: str,
+        at: int,
+        changes: dict[str, int],
+    ) -> None:
+        """Merge ``source`` into ``target`` under a new two-parent event.
+
+        The event's parents are ordered ``(target head, source head)``;
+        only the target head moves, the source head is untouched. Calls
+        are idempotent on the exact five-tuple, and reusing ``id`` with
+        different inputs (here or in the graph) is a conflict. A merge is
+        rejected when events exclusive to either side touch overlapping
+        change keys. All validation finishes before any state is touched,
+        so a failed call leaves the graph, heads and records unchanged.
+        """
+        # --- Full validation happens before any state is consulted. ---
+        self._require_nonempty_str(target, "target")
+        self._require_nonempty_str(source, "source")
+        self._require_nonempty_str(id, "id")
+        at_value = EventGraph._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+        if not isinstance(changes, dict):
+            raise TypeError(
+                f"changes must be a dict, got {type(changes).__name__}"
+            )
+        for key, value in changes.items():
+            EventGraph._require_nonempty_str(key, "change key")
+            EventGraph._require_int(value, f"change value for {key!r}")
+        # Copy caller-owned input before it can be recorded anywhere.
+        changes = dict(changes)
+
+        self._require_known_branch(target)
+        self._require_known_branch(source)
+        if target == source:
+            raise ValueError(f"cannot merge branch {target!r} into itself")
+
+        recorded = self._merges.get(id)
+        if recorded is not None:
+            if recorded == (target, source, at_value, changes):
+                return
+            raise ValueError(
+                f"merge event {id!r} already recorded with different inputs"
+            )
+
+        target_head = self._heads[target]
+        source_head = self._heads[source]
+
+        target_closure = set(self._graph._ordered_ancestors(target_head))
+        source_closure = set(self._graph._ordered_ancestors(source_head))
+        common = target_closure & source_closure
+
+        target_keys: set[str] = set()
+        for event_id in target_closure - common:
+            target_keys.update(self._graph._changes[event_id])
+        source_keys: set[str] = set()
+        for event_id in source_closure - common:
+            source_keys.update(self._graph._changes[event_id])
+        overlap = target_keys & source_keys
+        if overlap:
+            raise ValueError(
+                "conflicting changes on keys: "
+                + ", ".join(sorted(overlap))
+            )
+
+        self._graph.add(id, at_value, (target_head, source_head), changes)
+
+        # --- Commit: only after the graph accepted the event. ---
+        self._heads[target] = id
+        self._merges[id] = (target, source, at_value, changes)
 
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
