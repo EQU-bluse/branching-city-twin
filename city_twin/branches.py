@@ -327,6 +327,92 @@ class BranchStore:
             )
         return tuple(records)
 
+    def explain_impact(
+        self, name: str, event_id: str
+    ) -> tuple[dict[str, object], ...]:
+        """Explain the forward causal impact of an event on a branch.
+
+        Within the ancestor closure of the branch's current head, edges
+        point parent-to-child as the impact direction. The strict
+        descendants of ``event_id`` -- reachable events other than
+        ``event_id`` itself -- are returned each exactly once, in the
+        graph's parents-before-children, ``(at, id)`` order. Each record
+        is a fresh dict whose keys are ordered ``event_id, at, path,
+        keys``: the descendant id, its non-negative timestamp, the tuple
+        of ids on the shortest path from ``event_id`` to it (both ends
+        included), and the tuple of change keys its ``changes`` touch,
+        sorted by Unicode code point (an empty tuple for events with no
+        changes). When several paths exist, the one with the fewest edges
+        wins, ties broken by the Unicode code point order of the complete
+        id tuples; no descendants yields an empty tuple. ``name`` and
+        ``event_id`` are validated (in that order) before the branch is
+        looked up: non-``str`` values raise :class:`TypeError`, empty
+        strings raise :class:`ValueError`, unknown branches raise
+        :class:`KeyError`, and an ``event_id`` absent from the graph or
+        outside the branch's current head ancestor closure raises
+        :class:`KeyError`. The query is read-only and its result is
+        detached from internal state, so the graph, branch heads, audit
+        and idempotency records are never modified, and repeated calls
+        return item-wise equal results.
+        """
+        self._require_nonempty_str(name, "name")
+        self._require_nonempty_str(event_id, "event_id")
+        self._require_known_branch(name)
+        if event_id not in self._graph._at:
+            raise KeyError(event_id)
+
+        head = self._heads[name]
+        order = self._graph._ordered_ancestors(head)
+        closure = set(order)
+        if event_id not in closure:
+            raise KeyError(event_id)
+
+        # Reverse the parent edges within the closure so children can be
+        # enumerated parent-to-child.
+        children: dict[str, list[str]] = {event: [] for event in closure}
+        for current in closure:
+            for parent in self._graph._parents[current]:
+                children[parent].append(current)
+
+        # Level-by-level breadth-first search gives the fewest-edge
+        # paths. Within a level every candidate path has equal length, so
+        # keeping the minimum full id tuple applies the Unicode code
+        # point tie-break; children are claimed only after the whole
+        # level is evaluated, so every shortest candidate is compared.
+        paths: dict[str, tuple[str, ...]] = {event_id: (event_id,)}
+        frontier = [event_id]
+        while frontier:
+            candidates: dict[str, tuple[str, ...]] = {}
+            for current in frontier:
+                current_path = paths[current]
+                for child in children[current]:
+                    if child in paths:
+                        continue
+                    candidate = (*current_path, child)
+                    best = candidates.get(child)
+                    if best is None or candidate < best:
+                        candidates[child] = candidate
+            for child, path in candidates.items():
+                paths[child] = path
+            frontier = list(candidates)
+
+        # Descendants are reported in the closure's existing replay
+        # order: parents before children, ready events by (at, id).
+        records: list[dict[str, object]] = []
+        for descendant in order:
+            if descendant == event_id or descendant not in paths:
+                continue
+            changes = self._graph._changes[descendant]
+            records.append(
+                {
+                    "event_id": descendant,
+                    "at": self._graph._at[descendant],
+                    "path": (*paths[descendant],),
+                    "keys": tuple(sorted(changes)),
+                }
+            )
+        return tuple(records)
+
     def diff_at(self, name_a: str, name_b: str, at: int) -> dict[str, tuple[int, int]]:
         """Diff two branches' current heads as of ``at``.
 
