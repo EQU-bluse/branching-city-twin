@@ -185,6 +185,42 @@ class BranchStore:
         self._heads[target] = id
         self._merges[id] = (target, source, at_value, changes)
 
+    def audit_merge(self, id: str) -> dict[str, object]:
+        """Return an audit record for the merge event ``id``.
+
+        The record is a fresh dict whose keys are ordered
+        ``event_id, target, source, parents, at, changes``: the merge
+        event id, the target and source branch names, the recorded
+        parent ids (target head first), the non-negative timestamp and
+        a copy of the merged changes. Unknown ids and ids of non-merge
+        events raise :class:`KeyError`; mutating the returned dict or
+        its ``changes`` never affects the store's records.
+        """
+        self._require_nonempty_str(id, "id")
+        recorded = self._merges.get(id)
+        if recorded is None:
+            raise KeyError(id)
+        target, source, at_value, changes = recorded
+        return {
+            "event_id": id,
+            "target": target,
+            "source": source,
+            "parents": self._graph._parents[id],
+            "at": at_value,
+            "changes": dict(changes),
+        }
+
+    def trace(self, name: str, key: str) -> tuple[str, ...]:
+        """Return ids of events on ``name``'s head closure touching ``key``.
+
+        Ids follow the graph's replay order and include zero-delta and
+        merge events, each at most once.
+        """
+        self._require_nonempty_str(name, "name")
+        self._require_nonempty_str(key, "key")
+        self._require_known_branch(name)
+        return self._graph.explain(self._heads[name], key)
+
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
         self._require_nonempty_str(name, "name")
