@@ -185,6 +185,49 @@ class BranchStore:
         self._heads[target] = id
         self._merges[id] = (target, source, at_value, changes)
 
+    def audit_merge(self, id: str) -> dict[str, object]:
+        """Return an audit record for a merge event.
+
+        The returned dict is freshly built with keys ordered
+        ``event_id, target, source, parents, at, changes``; ``parents`` is
+        the merge event's parent tuple (target head first) and ``changes``
+        is a copy, so mutating the result cannot pollute internal records.
+        Unknown ids and ids of non-merge events (including ordinary
+        appends) raise :class:`KeyError`.
+        """
+        # Read-only: a failed lookup cannot touch any state.
+        self._require_nonempty_str(id, "id")
+        recorded = self._merges.get(id)
+        if recorded is None:
+            # Covers both unknown ids and known non-merge events; no audit
+            # record is fabricated for ordinary events.
+            raise KeyError(id)
+        target, source, at_value, recorded_changes = recorded
+        return {
+            "event_id": id,
+            "target": target,
+            "source": source,
+            "parents": tuple(parent for parent in self._graph._parents[id]),
+            "at": at_value,
+            "changes": dict(recorded_changes),
+        }
+
+    def trace(self, name: str, key: str) -> tuple[str, ...]:
+        """Return ids of events touching ``key`` on branch ``name``.
+
+        Events are taken from the ancestor closure of the branch's current
+        head in the graph's replay order (parents before children, ties by
+        ``(at, id)``); zero-delta events and merge events are included and
+        no event repeats. Validation runs in parameter order: ``name``,
+        then ``key``, and only afterwards is the branch name looked up.
+        """
+        self._require_nonempty_str(name, "name")
+        self._require_nonempty_str(key, "key")
+        self._require_known_branch(name)
+        # EventGraph.explain applies exactly the replay order over the
+        # head's ancestor closure, including zero-delta touches.
+        return self._graph.explain(self._heads[name], key)
+
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
         self._require_nonempty_str(name, "name")
