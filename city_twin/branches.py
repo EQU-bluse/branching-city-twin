@@ -210,6 +210,63 @@ class BranchStore:
             "changes": dict(changes),
         }
 
+    def audit_log(self) -> tuple[dict[str, object], ...]:
+        """Return audit records for every event this store recorded.
+
+        Covers exactly the branch appends and merges performed through
+        this store -- events added directly to the graph are not
+        included -- each exactly once, ordered by ``(at, event_id)``
+        ascending (event ids compared by Unicode code point). Each
+        record is a fresh dict whose keys are ordered
+        ``event_id, kind, owner, peer, parents, at, changes``: for an
+        append, ``owner`` is the branch name, ``peer`` is ``None`` and
+        ``parents`` is the single-element parent id tuple; for a merge,
+        ``owner`` is the target branch, ``peer`` is the source branch
+        and ``parents`` is the two-element tuple with the target parent
+        first. ``changes`` is a copy ordered by Unicode code point of
+        its keys. The query is read-only: the graph, branch heads and
+        records are never modified, and the returned tuple, dicts and
+        changes are detached from internal state, so mutating them
+        affects neither the store nor later calls, and repeated calls
+        return item-wise equal results in a stable order.
+        """
+        records: list[dict[str, object]] = []
+        for name, appends in self._appends.items():
+            for event_id, (at_value, changes) in appends.items():
+                records.append(
+                    {
+                        "event_id": event_id,
+                        "kind": "append",
+                        "owner": name,
+                        "peer": None,
+                        "parents": self._graph._parents[event_id],
+                        "at": at_value,
+                        "changes": {
+                            key: changes[key] for key in sorted(changes)
+                        },
+                    }
+                )
+        for event_id, (target, source, at_value, changes) in (
+            self._merges.items()
+        ):
+            records.append(
+                {
+                    "event_id": event_id,
+                    "kind": "merge",
+                    "owner": target,
+                    "peer": source,
+                    "parents": self._graph._parents[event_id],
+                    "at": at_value,
+                    "changes": {
+                        key: changes[key] for key in sorted(changes)
+                    },
+                }
+            )
+        records.sort(
+            key=lambda record: (record["at"], record["event_id"])
+        )
+        return tuple(records)
+
     def trace(self, name: str, key: str) -> tuple[str, ...]:
         """Return ids of events on ``name``'s head closure touching ``key``.
 
