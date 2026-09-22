@@ -162,6 +162,43 @@ class EventGraph:
                 state[key] = state.get(key, 0) + delta
         return {key: state[key] for key in sorted(state)}
 
+    def diff_at(
+        self,
+        head_a: str,
+        head_b: str,
+        at: int,
+    ) -> dict[str, tuple[int, int]]:
+        """Compare replays of two ancestor closures as of timestamp ``at``.
+
+        Each head is replayed with the same rules as :meth:`replay_at`:
+        only events whose own ``at`` is at most the given ``at`` are
+        accumulated, in parents-before-children, ``(at, id)`` order. The
+        result takes the union of both states' keys, sorted by Unicode
+        code point, mapping each to a ``(left, right)`` pair; a side
+        missing a key contributes ``0``. All parameters are validated
+        (in signature order) before either head is looked up. The query
+        is read-only and returns fresh objects, so the graph and the
+        caller's data can never alias each other.
+        """
+        self._require_nonempty_str(head_a, "head_a")
+        self._require_nonempty_str(head_b, "head_b")
+        at_value = self._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+
+        # Validation is finished; only now may unknown heads be reported.
+        if head_a not in self._at:
+            raise KeyError(head_a)
+        if head_b not in self._at:
+            raise KeyError(head_b)
+
+        left = self.replay_at(head_a, at_value)
+        right = self.replay_at(head_b, at_value)
+        return {
+            key: (left.get(key, 0), right.get(key, 0))
+            for key in sorted(left.keys() | right.keys())
+        }
+
     def explain(self, head: str, key: str) -> tuple[str, ...]:
         """Return ids of events touching ``key``, in replay order.
 

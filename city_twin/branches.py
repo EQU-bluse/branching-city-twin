@@ -210,6 +210,34 @@ class BranchStore:
             "changes": dict(changes),
         }
 
+    def diff_at(
+        self,
+        name_a: str,
+        name_b: str,
+        at: int,
+    ) -> dict[str, tuple[int, int]]:
+        """Diff the two branches' current-head replays as of ``at``.
+
+        Delegates to :meth:`EventGraph.diff_at` with each branch's
+        current head. ``name_a``, ``name_b`` and ``at`` are validated
+        (in that order) before either branch is looked up; the query is
+        read-only, so the graph, branch heads and records are never
+        modified.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(name_b, "name_b")
+        at_value = EventGraph._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+
+        # Validation is finished; only now may unknown branches be reported.
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+
+        return self._graph.diff_at(
+            self._heads[name_a], self._heads[name_b], at_value
+        )
+
     def trace(self, name: str, key: str) -> tuple[str, ...]:
         """Return ids of events on ``name``'s head closure touching ``key``.
 
