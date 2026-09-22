@@ -242,6 +242,53 @@ class BranchStore:
             self._heads[name_a], self._heads[name_b], at_value
         )
 
+    def compare(self, name_a: str, name_b: str) -> dict[str, object]:
+        """Compare the ancestor closures of two branches' current heads.
+
+        Both names are validated (in signature order) before either
+        branch is looked up: non-``str`` names raise :class:`TypeError`,
+        empty names raise :class:`ValueError`, unknown branches raise
+        :class:`KeyError`, and comparing a branch with itself raises
+        :class:`ValueError`. Each head's ancestor closure is taken once,
+        in the graph's parents-before-children, ``(at, id)`` replay
+        order. The result is a fresh dict whose keys are ordered
+        ``common, left_only, right_only, fork``: tuples of event ids for
+        the intersection, the left-only and the right-only events
+        (common and left-only in left replay order, right-only in right
+        replay order), plus ``fork`` -- the last common id in left replay
+        order, or ``None`` when the closures share no event. The query
+        is read-only: the graph, branch heads and records are never
+        modified, and the returned dict and tuples are detached from
+        internal state.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(name_b, "name_b")
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(f"cannot compare branch {name_a!r} with itself")
+
+        left_order = self._graph._ordered_ancestors(self._heads[name_a])
+        right_order = self._graph._ordered_ancestors(self._heads[name_b])
+        left_ids = set(left_order)
+        right_ids = set(right_order)
+
+        common = tuple(
+            event_id for event_id in left_order if event_id in right_ids
+        )
+        left_only = tuple(
+            event_id for event_id in left_order if event_id not in right_ids
+        )
+        right_only = tuple(
+            event_id for event_id in right_order if event_id not in left_ids
+        )
+        return {
+            "common": common,
+            "left_only": left_only,
+            "right_only": right_only,
+            "fork": common[-1] if common else None,
+        }
+
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
         self._require_nonempty_str(name, "name")
