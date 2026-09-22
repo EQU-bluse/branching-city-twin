@@ -232,3 +232,17 @@ class BranchStore:
         self._require_nonempty_str(name, "name")
         self._require_known_branch(name)
         return self._graph.replay(self._heads[name])
+
+    def replay_at(self, name: str, at: int) -> dict[str, int]:
+        """Replay the branch's head as of ``at`` via :meth:`EventGraph.replay_at`.
+
+        ``name`` and ``at`` are validated (in that order) before the
+        branch is looked up; the query is read-only, so the graph,
+        branch heads and records are never modified.
+        """
+        self._require_nonempty_str(name, "name")
+        at_value = EventGraph._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+        self._require_known_branch(name)
+        return self._graph.replay_at(self._heads[name], at_value)

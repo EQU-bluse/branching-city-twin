@@ -138,6 +138,30 @@ class EventGraph:
                 state[key] = state.get(key, 0) + delta
         return {key: state[key] for key in sorted(state)}
 
+    def replay_at(self, head: str, at: int) -> dict[str, int]:
+        """Replay ``head``'s ancestor closure as of timestamp ``at``.
+
+        Only events whose own ``at`` is at most the given ``at`` are
+        accumulated, in the same parents-before-children, ``(at, id)``
+        order as :meth:`replay`. Keys are kept (even at a zero value)
+        once introduced, and the returned dict is ordered by Unicode
+        code point of its keys. The query is read-only: the graph and
+        its events are never modified.
+        """
+        self._require_nonempty_str(head, "head")
+        at_value = self._require_int(at, "at")
+        if at_value < 0:
+            raise ValueError("at must be a non-negative int")
+
+        order = self._ordered_ancestors(head)
+        state: dict[str, int] = {}
+        for event_id in order:
+            if self._at[event_id] > at_value:
+                continue
+            for key, delta in self._changes[event_id].items():
+                state[key] = state.get(key, 0) + delta
+        return {key: state[key] for key in sorted(state)}
+
     def explain(self, head: str, key: str) -> tuple[str, ...]:
         """Return ids of events touching ``key``, in replay order.
 
