@@ -526,8 +526,94 @@ class BranchStore:
                 "against itself"
             )
 
-        head_a = self._heads[name_a]
-        head_b = self._heads[name_b]
+        return self._attribute_divergence_for(
+            self._heads[name_a], self._heads[name_b], key
+        )
+
+    def attribute_divergence_at(
+        self,
+        name_a: str,
+        node_a: str,
+        name_b: str,
+        node_b: str,
+        key: str,
+    ) -> dict[str, object]:
+        """Attribute the divergence of ``key`` at two historical nodes.
+
+        This is the historical-node form of :meth:`attribute_divergence`:
+        instead of each branch's current head, the left side replays the
+        ancestor closure of ``node_a`` on branch ``name_a`` and the right
+        side that of ``node_b`` on branch ``name_b``. All five parameters
+        are validated in signature order (``name_a``, ``node_a``,
+        ``name_b``, ``node_b``, ``key``) before either node is replayed:
+        non-``str`` values raise :class:`TypeError`, empty strings raise
+        :class:`ValueError`; the branches are then looked up in order
+        (``name_a`` first), an unknown branch raises :class:`KeyError`,
+        and naming the same branch twice raises :class:`ValueError`; a
+        node absent from the graph, or outside its named branch's current
+        head ancestor closure (``node_a`` checked before ``node_b``),
+        raises :class:`KeyError`.
+
+        Each node's ancestor closure is replayed in the graph's
+        parents-before-children, ``(at, id)`` order; a side on which
+        ``key`` never appears contributes the value ``0``. The result is
+        a fresh dict whose keys are ordered ``key, fork, left, right``:
+        ``key`` is the queried key as given, ``fork`` is the last common
+        event id in left replay order (or ``None`` when the closures
+        share no event), and ``left``/``right`` are fresh dicts whose
+        keys are ordered ``value, cause, path, affected``. When the two
+        values differ, a side's cause is the first event exclusive to
+        that side whose changes contain ``key`` (zero deltas included)
+        in that side's replay order, or ``None`` when no such event
+        exists; when the values are equal, both causes are ``None``.
+        ``path`` is the tuple of ids on the shortest parent-to-child
+        path from the cause to that side's node (both ends included),
+        ties broken by the Unicode code point order of the complete id
+        tuples, and ``affected`` is the tuple of the cause's strict
+        descendant ids within that side's closure in its replay order;
+        both are empty tuples when the cause is ``None``. The query is
+        read-only: success or failure never modifies the graph, branch
+        heads, audit or idempotency records, and the returned dict and
+        tuples are detached from internal state.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(node_a, "node_a")
+        self._require_nonempty_str(name_b, "name_b")
+        self._require_nonempty_str(node_b, "node_b")
+        self._require_nonempty_str(key, "key")
+
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(
+                f"cannot attribute divergence for branch {name_a!r} "
+                "against itself"
+            )
+
+        if node_a not in self._graph._at:
+            raise KeyError(node_a)
+        if node_a not in set(
+            self._graph._ordered_ancestors(self._heads[name_a])
+        ):
+            raise KeyError(node_a)
+        if node_b not in self._graph._at:
+            raise KeyError(node_b)
+        if node_b not in set(
+            self._graph._ordered_ancestors(self._heads[name_b])
+        ):
+            raise KeyError(node_b)
+
+        return self._attribute_divergence_for(node_a, node_b, key)
+
+    def _attribute_divergence_for(
+        self, head_a: str, head_b: str, key: str
+    ) -> dict[str, object]:
+        """Replay-based divergence attribution for two closure heads.
+
+        Shared by :meth:`attribute_divergence` (the branches' current
+        heads) and :meth:`attribute_divergence_at` (arbitrary historical
+        nodes); all argument validation belongs to the callers.
+        """
         left_order = self._graph._ordered_ancestors(head_a)
         right_order = self._graph._ordered_ancestors(head_b)
         left_ids = set(left_order)
