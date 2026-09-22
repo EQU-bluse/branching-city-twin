@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import json
 from typing import Any
 
 
@@ -83,6 +84,180 @@ class EventGraph:
         self._at[id] = at_value
         self._parents[id] = tuple(parents)
         self._changes[id] = dict(changes)
+
+    def to_json(self) -> str:
+        """Serialize the graph to a compact, deterministic JSON string.
+
+        The top-level object contains only the ``events`` key. Events are
+        ordered by the Unicode code point of their id; each event's keys
+        are ordered ``id, at, parents, changes``, parent ids keep their
+        recorded order, and change keys are sorted by Unicode code point.
+        The output uses ``separators=(',', ':')``, ``ensure_ascii=False``
+        and no trailing newline.
+        """
+        events: list[dict[str, object]] = []
+        for event_id in sorted(self._at):
+            events.append(
+                {
+                    "id": event_id,
+                    "at": self._at[event_id],
+                    "parents": list(self._parents[event_id]),
+                    "changes": {
+                        key: self._changes[event_id][key]
+                        for key in sorted(self._changes[event_id])
+                    },
+                }
+            )
+        return json.dumps(
+            {"events": events},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def from_json(cls, payload: Any) -> "EventGraph":
+        """Deserialize a string produced by :meth:`to_json`.
+
+        Validation is strict and layered: a non-``str`` payload raises
+        :class:`TypeError`; unparseable JSON, a wrong top-level shape,
+        missing or extra fields, type errors, empty strings, negative
+        timestamps, booleans posing as integers, duplicate event or
+        parent ids, unknown parents, cycles and invalid change entries
+        raise :class:`ValueError`. All validation finishes before the
+        new graph is built, so a failure never leaves a partially
+        populated object, and the result shares no mutable state with
+        either the input string or the parsed JSON values.
+        """
+        if not isinstance(payload, str):
+            raise TypeError(
+                f"payload must be a str, got {type(payload).__name__}"
+            )
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"payload is not valid JSON: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise ValueError("top-level JSON value must be an object")
+        if set(data.keys()) != {"events"}:
+            raise ValueError(
+                "top-level object must contain exactly the 'events' key"
+            )
+        raw_events = data["events"]
+        if not isinstance(raw_events, list):
+            raise ValueError("'events' must be an array")
+
+        # Parse into fully local structures first; the EventGraph is only
+        # constructed below, after every check has passed.
+        at_values: dict[str, int] = {}
+        parent_map: dict[str, tuple[str, ...]] = {}
+        change_map: dict[str, dict[str, int]] = {}
+
+        for index, event in enumerate(raw_events):
+            if not isinstance(event, dict):
+                raise ValueError(f"event at index {index} must be an object")
+            if set(event.keys()) != {"id", "at", "parents", "changes"}:
+                raise ValueError(
+                    f"event at index {index} must contain exactly the keys "
+                    "'id', 'at', 'parents' and 'changes'"
+                )
+
+            event_id = event["id"]
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError(
+                    f"event at index {index}: id must be a non-empty str"
+                )
+            if event_id in at_values:
+                raise ValueError(f"duplicate event id {event_id!r}")
+
+            at_value = event["at"]
+            # bool is a subclass of int, but must not be accepted as one.
+            if isinstance(at_value, bool) or not isinstance(at_value, int):
+                raise ValueError(f"event {event_id!r}: at must be an int")
+            if at_value < 0:
+                raise ValueError(f"event {event_id!r}: at must be non-negative")
+
+            raw_parents = event["parents"]
+            if not isinstance(raw_parents, list):
+                raise ValueError(
+                    f"event {event_id!r}: parents must be an array"
+                )
+            event_parents: list[str] = []
+            seen_parents: set[str] = set()
+            for parent in raw_parents:
+                if not isinstance(parent, str) or not parent:
+                    raise ValueError(
+                        f"event {event_id!r}: every parent must be a "
+                        "non-empty str"
+                    )
+                if parent in seen_parents:
+                    raise ValueError(
+                        f"event {event_id!r}: duplicate parent {parent!r}"
+                    )
+                seen_parents.add(parent)
+                event_parents.append(parent)
+
+            raw_changes = event["changes"]
+            if not isinstance(raw_changes, dict):
+                raise ValueError(
+                    f"event {event_id!r}: changes must be an object"
+                )
+            event_changes: dict[str, int] = {}
+            for key, value in raw_changes.items():
+                if not isinstance(key, str) or not key:
+                    raise ValueError(
+                        f"event {event_id!r}: every change key must be a "
+                        "non-empty str"
+                    )
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        f"event {event_id!r}: change value for {key!r} "
+                        "must be an int"
+                    )
+                event_changes[key] = value
+
+            at_values[event_id] = at_value
+            parent_map[event_id] = tuple(event_parents)
+            change_map[event_id] = event_changes
+
+        for event_id, event_parents in parent_map.items():
+            for parent in event_parents:
+                if parent not in at_values:
+                    raise ValueError(
+                        f"event {event_id!r}: unknown parent {parent!r}"
+                    )
+
+        # Cycle detection: iterative DFS following child -> parent edges.
+        white, gray, black = 0, 1, 2
+        color = {event_id: white for event_id in at_values}
+        for start in at_values:
+            if color[start] != white:
+                continue
+            color[start] = gray
+            stack: list[tuple[str, int]] = [(start, 0)]
+            while stack:
+                node, cursor = stack[-1]
+                node_parents = parent_map[node]
+                if cursor < len(node_parents):
+                    nxt = node_parents[cursor]
+                    stack[-1] = (node, cursor + 1)
+                    if color[nxt] == gray:
+                        raise ValueError(
+                            f"cycle detected involving event {nxt!r}"
+                        )
+                    if color[nxt] == white:
+                        color[nxt] = gray
+                        stack.append((nxt, 0))
+                else:
+                    color[node] = black
+                    stack.pop()
+
+        graph = cls()
+        for event_id in at_values:
+            graph._at[event_id] = at_values[event_id]
+            graph._parents[event_id] = parent_map[event_id]
+            graph._changes[event_id] = dict(sorted(change_map[event_id].items()))
+        return graph
 
     def _ordered_ancestors(self, head: str) -> list[str]:
         """Validate ``head`` and return its ancestor closure in the unique
