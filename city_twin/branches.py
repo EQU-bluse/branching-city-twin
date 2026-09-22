@@ -691,6 +691,137 @@ class BranchStore:
             for key in sorted(keys)
         )
 
+    def divergence_timeline(
+        self,
+        name_a: str,
+        name_b: str,
+        points: tuple[tuple[str, str], ...],
+        keys: tuple[str, ...],
+    ) -> tuple[tuple[dict[str, object], ...], ...]:
+        """Attribute divergences for several node pairs and keys at once.
+
+        The multi-point form of :meth:`attribute_divergences_at`:
+        ``points`` is a tuple of ``(node_a, node_b)`` pairs, each played
+        against the same two branches -- the left nodes live on
+        ``name_a``'s current head ancestor closure and the right nodes on
+        ``name_b``'s.
+
+        All four parameters are validated in signature order
+        (``name_a``, ``name_b``, ``points``, ``keys``); containers are
+        walked in input order, and all of this finishes before any state
+        is consulted. The names raise :class:`TypeError` when not
+        ``str`` and :class:`ValueError` when empty. ``points`` and
+        ``keys`` must be tuples (else :class:`TypeError`); a point that
+        is not a length-2 tuple raises :class:`TypeError`, and within
+        each point the left node is checked before the right one:
+        non-``str`` nodes and keys raise :class:`TypeError`, empty
+        strings raise :class:`ValueError`, and a repeated node pair or
+        key (in input order) raises :class:`ValueError`.
+
+        The branches are then looked up in order (``name_a`` first): an
+        unknown branch raises :class:`KeyError` and naming the same
+        branch twice raises :class:`ValueError`. Nodes are checked per
+        pair, left before right, pairs in ``points`` order: a node
+        absent from the graph or outside its named branch's current
+        head ancestor closure raises :class:`KeyError`. With empty
+        ``points`` the names, keys and branches are still validated and
+        an empty tuple is returned; with empty ``keys`` every node is
+        still validated and each point contributes an empty tuple.
+
+        Every point and key is answered from one read-only historical
+        view: both branches' current head closures and every node's own
+        closure are taken once before results are built. The outer
+        tuple follows ``points`` in its original order; each point
+        contributes a tuple of one fresh dict per key, ordered by the
+        Unicode code point of the keys (independent of their input
+        order), item-wise equal to calling
+        :meth:`attribute_divergences_at` with that node pair and
+        ``keys`` -- preserving its dict key order, types and full
+        attribution semantics. The tuples and dicts at every level are
+        freshly built, neither sharing objects with each other nor
+        aliasing internal state. Success or failure never modifies the
+        graph, branch heads, audit or idempotency records.
+        """
+        # --- Parameters validated in signature order, containers in
+        # input order, before any state is consulted. ---
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(name_b, "name_b")
+        if not isinstance(points, tuple):
+            raise TypeError(
+                f"points must be a tuple, got {type(points).__name__}"
+            )
+        seen_points: set[tuple[str, str]] = set()
+        for point in points:
+            if not isinstance(point, tuple) or len(point) != 2:
+                raise TypeError(
+                    "each point must be a length-2 tuple of node ids, "
+                    f"got {point!r} ({type(point).__name__})"
+                )
+            node_a, node_b = point
+            self._require_nonempty_str(node_a, "node_a")
+            self._require_nonempty_str(node_b, "node_b")
+            pair = (node_a, node_b)
+            if pair in seen_points:
+                raise ValueError(f"duplicate point {pair!r}")
+            seen_points.add(pair)
+        if not isinstance(keys, tuple):
+            raise TypeError(
+                f"keys must be a tuple, got {type(keys).__name__}"
+            )
+        seen_keys: set[str] = set()
+        for key in keys:
+            self._require_nonempty_str(key, "key")
+            if key in seen_keys:
+                raise ValueError(f"duplicate key {key!r}")
+            seen_keys.add(key)
+
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(
+                f"cannot attribute divergence for branch {name_a!r} "
+                "against itself"
+            )
+
+        if not points:
+            return ()
+
+        # Capture the single read-only historical view: the current head
+        # closures decide node membership for every pair, and the nodes'
+        # own closures answer every key.
+        head_closure_a = set(
+            self._graph._ordered_ancestors(self._heads[name_a])
+        )
+        head_closure_b = set(
+            self._graph._ordered_ancestors(self._heads[name_b])
+        )
+        for node_a, node_b in points:
+            if node_a not in self._graph._at or node_a not in head_closure_a:
+                raise KeyError(node_a)
+            if node_b not in self._graph._at or node_b not in head_closure_b:
+                raise KeyError(node_b)
+
+        ordered_points: list[tuple[list[str], list[str], str, str]] = []
+        for node_a, node_b in points:
+            ordered_points.append(
+                (
+                    self._graph._ordered_ancestors(node_a),
+                    self._graph._ordered_ancestors(node_b),
+                    node_a,
+                    node_b,
+                )
+            )
+
+        return tuple(
+            tuple(
+                self._attribute_divergence_on_orders(
+                    left_order, right_order, node_a, node_b, key
+                )
+                for key in sorted(keys)
+            )
+            for left_order, right_order, node_a, node_b in ordered_points
+        )
+
     def _attribute_divergence_for(
         self, head_a: str, head_b: str, key: str
     ) -> dict[str, object]:
