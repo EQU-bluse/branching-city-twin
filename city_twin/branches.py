@@ -481,6 +481,176 @@ class BranchStore:
             "fork": common[-1] if common else None,
         }
 
+    def _attribute_side(
+        self,
+        order: list[str],
+        exclusive: set[str],
+        key: str,
+        value: int,
+    ) -> dict[str, object]:
+        """Build one side record of :meth:`attribute_divergence`.
+
+        ``order`` is the side's head replay order and ``exclusive`` the
+        events the side's closure does not share with the other side.
+        """
+        cause: str | None = None
+        for event_id in order:
+            if event_id in exclusive and key in self._graph._changes[event_id]:
+                cause = event_id
+                break
+
+        if cause is None:
+            return {
+                "value": value,
+                "cause": None,
+                "path": (),
+                "affected": (),
+            }
+
+        head = order[-1]
+        closure = set(order)
+
+        # Reverse the parent edges within the closure so children can be
+        # enumerated parent-to-child.
+        children: dict[str, list[str]] = {event: [] for event in closure}
+        for current in closure:
+            for parent in self._graph._parents[current]:
+                if parent in closure:
+                    children[parent].append(current)
+
+        # Level-by-level breadth-first search gives the fewest-edge
+        # paths. Within a level every candidate path has equal length, so
+        # keeping the minimum full id tuple applies the Unicode code
+        # point tie-break; children are claimed only after the whole
+        # level is evaluated, so every shortest candidate is compared.
+        paths: dict[str, tuple[str, ...]] = {cause: (cause,)}
+        frontier = [cause]
+        while frontier:
+            candidates: dict[str, tuple[str, ...]] = {}
+            for current in frontier:
+                current_path = paths[current]
+                for child in children[current]:
+                    if child in paths:
+                        continue
+                    candidate = (*current_path, child)
+                    best = candidates.get(child)
+                    if best is None or candidate < best:
+                        candidates[child] = candidate
+            for child, path in candidates.items():
+                paths[child] = path
+            frontier = list(candidates)
+
+        # The cause lies in the head's ancestor closure, so the head is
+        # always among its strict descendants.
+        path = (*paths[head],)
+        affected = tuple(
+            event_id
+            for event_id in order
+            if event_id != cause and event_id in paths
+        )
+        return {
+            "value": value,
+            "cause": cause,
+            "path": path,
+            "affected": affected,
+        }
+
+    def attribute_divergence(
+        self, name_a: str, name_b: str, key: str
+    ) -> dict[str, object]:
+        """Attribute the cross-branch divergence of ``key`` to its causes.
+
+        The parameters are validated in signature order: non-``str``
+        values raise :class:`TypeError`, empty strings raise
+        :class:`ValueError`, then each branch is looked up in turn
+        (:class:`KeyError` when unknown) and comparing a branch with
+        itself raises :class:`ValueError`.
+
+        Each branch's current head ancestor closure is replayed once in
+        the graph's parents-before-children, ``(at, id)`` order; a side
+        on which ``key`` never appears contributes value ``0``. The
+        closures split into common events and per-side exclusive events,
+        and ``fork`` is the last common id in left replay order (or
+        ``None`` when the closures share no event). When the two values
+        differ, each side's ``cause`` is the first exclusive event in
+        that side's replay order whose changes contain ``key`` (or
+        ``None`` when none exists); when the values are equal both
+        causes are ``None``.
+
+        The result is a fresh dict whose keys are ordered
+        ``key, fork, left, right``: ``key`` is the queried key as
+        passed, and ``left``/``right`` are fresh dicts whose keys are
+        ordered ``value, cause, path, affected``. ``value`` is the
+        replayed integer, ``cause`` the event id or ``None``, ``path``
+        the tuple of ids on the shortest parent-to-child path from the
+        cause to that side's current head (both ends included), and
+        ``affected`` the tuple of the cause's strict descendant ids in
+        that side's replay order. Shortest-path ties are broken by the
+        Unicode code point order of the complete id tuples; with no
+        cause both ``path`` and ``affected`` are empty tuples. The
+        query is strictly read-only and its result is detached from
+        internal state, so mutating it affects neither the store nor
+        later calls.
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(name_b, "name_b")
+        self._require_nonempty_str(key, "key")
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(
+                f"cannot attribute divergence for branch {name_a!r} with itself"
+            )
+
+        left_order = self._graph._ordered_ancestors(self._heads[name_a])
+        right_order = self._graph._ordered_ancestors(self._heads[name_b])
+        left_ids = set(left_order)
+        right_ids = set(right_order)
+
+        fork: str | None = None
+        for event_id in left_order:
+            if event_id in right_ids:
+                fork = event_id
+
+        left_value = 0
+        for event_id in left_order:
+            changes = self._graph._changes[event_id]
+            if key in changes:
+                left_value += changes[key]
+        right_value = 0
+        for event_id in right_order:
+            changes = self._graph._changes[event_id]
+            if key in changes:
+                right_value += changes[key]
+
+        if left_value == right_value:
+            left: dict[str, object] = {
+                "value": left_value,
+                "cause": None,
+                "path": (),
+                "affected": (),
+            }
+            right: dict[str, object] = {
+                "value": right_value,
+                "cause": None,
+                "path": (),
+                "affected": (),
+            }
+        else:
+            left = self._attribute_side(
+                left_order, left_ids - right_ids, key, left_value
+            )
+            right = self._attribute_side(
+                right_order, right_ids - left_ids, key, right_value
+            )
+
+        return {
+            "key": key,
+            "fork": fork,
+            "left": left,
+            "right": right,
+        }
+
     def head(self, name: str) -> str:
         """Return the id of the branch's current head event."""
         self._require_nonempty_str(name, "name")
