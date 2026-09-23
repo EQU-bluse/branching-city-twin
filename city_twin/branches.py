@@ -744,6 +744,198 @@ class BranchStore:
         """
         # --- Parameters validated in signature order, containers in
         # input order, before any state is consulted. ---
+        ordered_points = self._divergence_view(name_a, name_b, points, keys)
+        if ordered_points is None:
+            return ()
+
+        return tuple(
+            tuple(
+                self._attribute_divergence_on_orders(
+                    left_order, right_order, node_a, node_b, key
+                )
+                for key in sorted(keys)
+            )
+            for left_order, right_order, node_a, node_b in ordered_points
+        )
+
+    def divergence_summary(
+        self,
+        name_a: str,
+        name_b: str,
+        points: tuple[tuple[str, str], ...],
+        keys: tuple[str, ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Summarize how each key diverges and converges across node pairs.
+
+        Shares :meth:`divergence_timeline`'s parameters, validation order
+        and errors, empty-container handling and branch/node closure rules
+        exactly: the four parameters are validated in signature order
+        (``name_a``, ``name_b``, ``points``, ``keys``), containers walked
+        in input order, before any state is consulted; non-``str`` values
+        raise :class:`TypeError`, empty strings :class:`ValueError`,
+        ``points``/``keys`` that are not tuples or points that are not
+        length-2 tuples raise :class:`TypeError`, and a repeated node pair
+        or key raises :class:`ValueError`. Branches are then looked up in
+        order (unknown branch :class:`KeyError`, same branch twice
+        :class:`ValueError`), and nodes are checked per pair, left before
+        right, pairs in ``points`` order (:class:`KeyError` when absent
+        from the graph or the named branch's current head closure).
+
+        Every point and key is answered from the same single read-only
+        historical view as :meth:`divergence_timeline`: both branches'
+        current head closures and every node's own closure are taken once
+        before results are built. Points are indexed from ``0`` in their
+        given order. For each key (ordered by Unicode code point,
+        independent of input order) the result is a fresh dict whose keys
+        are ordered ``key, first_diverged, transitions, last``:
+
+        ``first_diverged`` is the index of the first point whose left and
+        right replayed values for the key differ, or ``None`` when they are
+        equal at every point. ``transitions`` lists, in point-index order,
+        every state change between adjacent points (plus divergence at the
+        first point): each item is a fresh dict whose keys are ordered
+        ``index, kind, left_value, right_value, left_cause, right_cause``.
+        ``kind`` is ``diverged`` when the first point already diverges or
+        equality becomes divergence, ``converged`` when divergence becomes
+        equality, and ``reattributed`` when adjacent points both diverge
+        but either attributed cause changes; adjacent points with no such
+        change record nothing. The values and causes are those of the
+        attribution at ``index``. ``last`` is a detached deep copy of the
+        complete attribution dict for the key at the final point (the
+        ``key, fork, left, right`` structure of
+        :meth:`attribute_divergences_at`), or ``None`` when ``points`` is
+        empty.
+
+        Empty ``points`` still validates names, keys and branches and
+        yields an empty tuple; empty ``keys`` still validates every node
+        and yields an empty tuple. The tuples and dicts at every level are
+        freshly built, neither sharing objects with each other nor aliasing
+        internal state. Success or failure never modifies the graph,
+        branch heads, audit or idempotency records.
+        """
+        # Same validation, single-view capture and empty handling as
+        # divergence_timeline; with empty points there is no final-point
+        # attribution to copy.
+        ordered_points = self._divergence_view(name_a, name_b, points, keys)
+        if ordered_points is None:
+            return ()
+        if not keys:
+            return ()
+
+        # All attributes per (point, key) come from the captured view.
+        attributed: list[dict[str, dict[str, Any]]] = [
+            {
+                key: self._attribute_divergence_on_orders(
+                    left_order, right_order, node_a, node_b, key
+                )
+                for key in sorted(keys)
+            }
+            for left_order, right_order, node_a, node_b in ordered_points
+        ]
+
+        summaries: list[dict[str, object]] = []
+        for key in sorted(keys):
+            first_diverged: int | None = None
+            transitions: list[dict[str, object]] = []
+            prev_diverged: bool | None = None
+            prev_left_cause: object = None
+            prev_right_cause: object = None
+            for index, per_key in enumerate(attributed):
+                record = per_key[key]
+                left = record["left"]
+                right = record["right"]
+                left_value = left["value"]
+                right_value = right["value"]
+                left_cause = left["cause"]
+                right_cause = right["cause"]
+                diverged = left_value != right_value
+                if diverged and first_diverged is None:
+                    first_diverged = index
+
+                kind: str | None = None
+                if prev_diverged is None:
+                    if diverged:
+                        kind = "diverged"
+                elif not prev_diverged and diverged:
+                    kind = "diverged"
+                elif prev_diverged and not diverged:
+                    kind = "converged"
+                elif (
+                    prev_diverged
+                    and diverged
+                    and (
+                        prev_left_cause != left_cause
+                        or prev_right_cause != right_cause
+                    )
+                ):
+                    kind = "reattributed"
+                if kind is not None:
+                    transitions.append(
+                        {
+                            "index": index,
+                            "kind": kind,
+                            "left_value": left_value,
+                            "right_value": right_value,
+                            "left_cause": left_cause,
+                            "right_cause": right_cause,
+                        }
+                    )
+
+                prev_diverged = diverged
+                prev_left_cause = left_cause
+                prev_right_cause = right_cause
+
+            summaries.append(
+                {
+                    "key": key,
+                    "first_diverged": first_diverged,
+                    "transitions": tuple(transitions),
+                    "last": self._copy_attribution(attributed[-1][key]),
+                }
+            )
+        return tuple(summaries)
+
+    @staticmethod
+    def _copy_attribution(
+        record: dict[str, Any],
+    ) -> dict[str, object]:
+        """Deep-copy a ``key, fork, left, right`` attribution dict.
+
+        The copied result shares no tuples or dicts with the source, so it
+        stays detached from the per-call attributions and internal state.
+        """
+        def copy_side(side: dict[str, Any]) -> dict[str, object]:
+            return {
+                "value": side["value"],
+                "cause": side["cause"],
+                "path": tuple(side["path"]),
+                "affected": tuple(side["affected"]),
+            }
+
+        return {
+            "key": record["key"],
+            "fork": record["fork"],
+            "left": copy_side(record["left"]),
+            "right": copy_side(record["right"]),
+        }
+
+    def _divergence_view(
+        self,
+        name_a: str,
+        name_b: str,
+        points: tuple[tuple[str, str], ...],
+        keys: tuple[str, ...],
+    ) -> list[tuple[list[str], list[str], str, str]] | None:
+        """Validate and capture the single read-only divergence view.
+
+        Shared by :meth:`divergence_timeline` and
+        :meth:`divergence_summary` so both apply identical validation
+        order, errors, empty-container handling and branch/node closure
+        rules, and answer every point and key from one historical view.
+        Returns ``None`` when ``points`` is empty (the empty-tuple result
+        case); otherwise one ``(left_order, right_order, node_a, node_b)``
+        entry per point in input order.
+        """
         self._require_nonempty_str(name_a, "name_a")
         self._require_nonempty_str(name_b, "name_b")
         if not isinstance(points, tuple):
@@ -784,7 +976,7 @@ class BranchStore:
             )
 
         if not points:
-            return ()
+            return None
 
         # Capture the single read-only historical view: the current head
         # closures decide node membership for every pair, and the nodes'
@@ -801,26 +993,16 @@ class BranchStore:
             if node_b not in self._graph._at or node_b not in head_closure_b:
                 raise KeyError(node_b)
 
-        ordered_points: list[tuple[list[str], list[str], str, str]] = []
-        for node_a, node_b in points:
-            ordered_points.append(
-                (
-                    self._graph._ordered_ancestors(node_a),
-                    self._graph._ordered_ancestors(node_b),
-                    node_a,
-                    node_b,
-                )
+        return [
+            (
+                self._graph._ordered_ancestors(node_a),
+                self._graph._ordered_ancestors(node_b),
+                node_a,
+                node_b,
             )
+            for node_a, node_b in points
+        ]
 
-        return tuple(
-            tuple(
-                self._attribute_divergence_on_orders(
-                    left_order, right_order, node_a, node_b, key
-                )
-                for key in sorted(keys)
-            )
-            for left_order, right_order, node_a, node_b in ordered_points
-        )
 
     def _attribute_divergence_for(
         self, head_a: str, head_b: str, key: str
