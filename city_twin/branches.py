@@ -744,7 +744,9 @@ class BranchStore:
         """
         # --- Parameters validated in signature order, containers in
         # input order, before any state is consulted. ---
-        ordered_points = self._divergence_view(name_a, name_b, points, keys)
+        ordered_points, keys = self._divergence_inputs(
+            name_a, name_b, points, keys
+        )
         if ordered_points is None:
             return ()
 
@@ -813,13 +815,305 @@ class BranchStore:
         internal state. Success or failure never modifies the graph,
         branch heads, audit or idempotency records.
         """
-        # Same validation, single-view capture and empty handling as
-        # divergence_timeline; with empty points there is no final-point
-        # attribution to copy.
-        ordered_points = self._divergence_view(name_a, name_b, points, keys)
+        ordered_points, keys = self._divergence_inputs(
+            name_a, name_b, points, keys
+        )
         if ordered_points is None:
             return ()
-        if not keys:
+        return self._divergence_summaries(ordered_points, keys)
+
+    def divergence_matrix(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        keys: tuple[str, ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Run :meth:`divergence_summary` for several branches at once.
+
+        Each entry of ``series`` pairs a branch name with its own tuple of
+        ``(reference node, series node)`` points, every point replayed
+        against the same ``reference`` branch -- the left node must live on
+        the reference branch's current head ancestor closure and the right
+        node on the named series branch's.
+
+        ``reference`` is validated first: a non-``str`` value raises
+        :class:`TypeError` and an empty string :class:`ValueError`.
+        ``series`` must be a dict (else :class:`TypeError`); its keys are
+        checked in insertion order, a non-``str`` series name raising
+        :class:`TypeError` and an empty or ``reference``-equal name
+        raising :class:`ValueError`, and each series' points are walked in
+        input order. ``keys`` is checked last, exactly as in
+        :meth:`divergence_summary`: it must be a tuple (else
+        :class:`TypeError`), a non-``str`` element raises :class:`TypeError`,
+        and an empty or duplicated key raises :class:`ValueError`. The rest
+        of the validation, errors, empty-container handling and
+        branch/node closure rules are exactly
+        :meth:`divergence_summary`'s for the corresponding
+        ``(reference, series_name, points, keys)`` call: points must be a
+        tuple of length-2 node-id tuples with no repeated pair, and all
+        inputs finish validating before the branches are looked up,
+        reference first and then the series in ``series`` insertion order
+        (unknown branch :class:`KeyError`, a node absent from the graph or
+        the named branch's current head closure :class:`KeyError`, left
+        before right, pairs in points order).
+
+        Every series, point and key is answered from one shared read-only
+        historical view: the reference branch's and every series branch's
+        current head closures and every node's own closure are taken once
+        before results are built. The returned tuple follows ``series`` in
+        its insertion order; each entry is a fresh dict whose keys are
+        ordered ``branch, summaries, reconverged``: ``branch`` is the
+        series branch name, ``summaries`` is the tuple of fresh summary
+        dicts item-wise equal to :meth:`divergence_summary` for that series
+        (keyed and ordered as there), and ``reconverged`` is a tuple of
+        booleans aligned with ``summaries`` (keys in Unicode code point
+        order) -- each is ``True`` exactly when the summary's
+        ``first_diverged`` is not ``None`` and the two sides' values in its
+        ``last`` attribution are equal. An empty ``series`` still
+        validates ``reference`` and ``keys`` and looks the reference branch
+        up, yielding an empty tuple; empty ``keys`` still validates every
+        node, and each series then contributes empty
+        ``summaries``/``reconverged`` tuples. The tuples and dicts at every
+        level are freshly built, neither sharing objects with each other
+        nor aliasing internal state. Success or failure never modifies the
+        graph, branch heads, audit or idempotency records.
+        """
+        # --- All inputs finish validating before any branch is looked up,
+        # mirroring divergence_summary's reference, branch, points, keys
+        # order with series walked in insertion order. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            per_series.append((series_name, series_points))
+        ordered_keys = self._validate_keys(keys)
+
+        self._require_known_branch(reference)
+
+        # Capture the shared read-only view before any result is built:
+        # the reference head closure serves every series, and each series
+        # branch's own closure plus its nodes' closures are taken once.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views: list[
+            tuple[str, list[tuple[list[str], list[str], str, str]] | None]
+        ] = []
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            ordered_points: list[
+                tuple[list[str], list[str], str, str]
+            ] | None = None
+            if series_points:
+                ordered_points = [
+                    (
+                        self._graph._ordered_ancestors(node_a),
+                        self._graph._ordered_ancestors(node_b),
+                        node_a,
+                        node_b,
+                    )
+                    for node_a, node_b in series_points
+                ]
+            views.append((series_name, ordered_points))
+
+        rows: list[dict[str, object]] = []
+        for series_name, ordered_points in views:
+            summaries = self._divergence_summaries(
+                ordered_points, ordered_keys
+            )
+            reconverged = tuple(
+                summary["first_diverged"] is not None
+                and summary["last"]["left"]["value"]
+                == summary["last"]["right"]["value"]
+                for summary in summaries
+            )
+            rows.append(
+                {
+                    "branch": series_name,
+                    "summaries": summaries,
+                    "reconverged": reconverged,
+                }
+            )
+        return tuple(rows)
+
+    @staticmethod
+    def _copy_attribution(
+        record: dict[str, Any],
+    ) -> dict[str, object]:
+        """Deep-copy a ``key, fork, left, right`` attribution dict.
+
+        The copied result shares no tuples or dicts with the source, so it
+        stays detached from the per-call attributions and internal state.
+        """
+        def copy_side(side: dict[str, Any]) -> dict[str, object]:
+            return {
+                "value": side["value"],
+                "cause": side["cause"],
+                "path": tuple(side["path"]),
+                "affected": tuple(side["affected"]),
+            }
+
+        return {
+            "key": record["key"],
+            "fork": record["fork"],
+            "left": copy_side(record["left"]),
+            "right": copy_side(record["right"]),
+        }
+
+    @staticmethod
+    def _validate_points(points: Any) -> None:
+        """Validate a tuple of length-2, unique node-id pairs.
+
+        Shared by :meth:`divergence_timeline`, :meth:`divergence_summary`
+        and :meth:`divergence_matrix` so points raise identical errors: a
+        non-tuple container or non-length-2-tuple point raises
+        :class:`TypeError`, non-``str`` or empty node ids raise
+        :class:`TypeError`/:class:`ValueError` (left node before right),
+        and a repeated node pair raises :class:`ValueError`.
+        """
+        if not isinstance(points, tuple):
+            raise TypeError(
+                f"points must be a tuple, got {type(points).__name__}"
+            )
+        seen_points: set[tuple[str, str]] = set()
+        for point in points:
+            if not isinstance(point, tuple) or len(point) != 2:
+                raise TypeError(
+                    "each point must be a length-2 tuple of node ids, "
+                    f"got {point!r} ({type(point).__name__})"
+                )
+            node_a, node_b = point
+            EventGraph._require_nonempty_str(node_a, "node_a")
+            EventGraph._require_nonempty_str(node_b, "node_b")
+            pair = (node_a, node_b)
+            if pair in seen_points:
+                raise ValueError(f"duplicate point {pair!r}")
+            seen_points.add(pair)
+
+    @staticmethod
+    def _validate_keys(keys: Any) -> tuple[str, ...]:
+        """Validate ``keys`` and return them in Unicode code point order.
+
+        Shared by the divergence family: a non-tuple raises
+        :class:`TypeError`, a non-``str`` element raises :class:`TypeError`,
+        and an empty or duplicated key raises :class:`ValueError`. Summary
+        and matrix rows always present keys by Unicode code point, so the
+        sorted, duplicate-free tuple is returned once.
+        """
+        if not isinstance(keys, tuple):
+            raise TypeError(
+                f"keys must be a tuple, got {type(keys).__name__}"
+            )
+        seen_keys: set[str] = set()
+        for key in keys:
+            EventGraph._require_nonempty_str(key, "key")
+            if key in seen_keys:
+                raise ValueError(f"duplicate key {key!r}")
+            seen_keys.add(key)
+        return tuple(sorted(keys))
+
+    def _divergence_inputs(
+        self,
+        name_a: str,
+        name_b: str,
+        points: tuple[tuple[str, str], ...],
+        keys: tuple[str, ...],
+    ) -> tuple[
+        list[tuple[list[str], list[str], str, str]] | None,
+        tuple[str, ...],
+    ]:
+        """Validate and capture the single read-only divergence view.
+
+        Shared by :meth:`divergence_timeline` and
+        :meth:`divergence_summary` so both apply identical validation
+        order, errors, empty-container handling and branch/node closure
+        rules, and answer every point and key from one historical view.
+        Returns the keys in Unicode code point order alongside a list of
+        one ``(left_order, right_order, node_a, node_b)`` entry per point
+        in input order; the list is ``None`` when ``points`` is empty (the
+        empty-tuple result case).
+        """
+        self._require_nonempty_str(name_a, "name_a")
+        self._require_nonempty_str(name_b, "name_b")
+        self._validate_points(points)
+        ordered_keys = self._validate_keys(keys)
+
+        self._require_known_branch(name_a)
+        self._require_known_branch(name_b)
+        if name_a == name_b:
+            raise ValueError(
+                f"cannot attribute divergence for branch {name_a!r} "
+                "against itself"
+            )
+
+        if not points:
+            return None, ordered_keys
+
+        # Capture the single read-only historical view: the current head
+        # closures decide node membership for every pair, and the nodes'
+        # own closures answer every key.
+        head_closure_a = set(
+            self._graph._ordered_ancestors(self._heads[name_a])
+        )
+        head_closure_b = set(
+            self._graph._ordered_ancestors(self._heads[name_b])
+        )
+        for node_a, node_b in points:
+            if node_a not in self._graph._at or node_a not in head_closure_a:
+                raise KeyError(node_a)
+            if node_b not in self._graph._at or node_b not in head_closure_b:
+                raise KeyError(node_b)
+
+        return [
+            (
+                self._graph._ordered_ancestors(node_a),
+                self._graph._ordered_ancestors(node_b),
+                node_a,
+                node_b,
+            )
+            for node_a, node_b in points
+        ], ordered_keys
+
+    def _divergence_summaries(
+        self,
+        ordered_points: list[tuple[list[str], list[str], str, str]]
+        | None,
+        ordered_keys: tuple[str, ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Build :meth:`divergence_summary` rows from a captured view.
+
+        ``ordered_points`` is one captured view entry per point in input
+        order, or ``None``/empty when there are no points; ``ordered_keys``
+        are already sorted by Unicode code point. Shared by
+        :meth:`divergence_summary` and :meth:`divergence_matrix`, so a
+        matrix row is item-wise equal to the corresponding standalone
+        summary call. With no points or keys an empty tuple is returned.
+        """
+        if not ordered_points or not ordered_keys:
             return ()
 
         # All attributes per (point, key) come from the captured view.
@@ -828,13 +1122,13 @@ class BranchStore:
                 key: self._attribute_divergence_on_orders(
                     left_order, right_order, node_a, node_b, key
                 )
-                for key in sorted(keys)
+                for key in ordered_keys
             }
             for left_order, right_order, node_a, node_b in ordered_points
         ]
 
         summaries: list[dict[str, object]] = []
-        for key in sorted(keys):
+        for key in ordered_keys:
             first_diverged: int | None = None
             transitions: list[dict[str, object]] = []
             prev_diverged: bool | None = None
@@ -894,114 +1188,6 @@ class BranchStore:
                 }
             )
         return tuple(summaries)
-
-    @staticmethod
-    def _copy_attribution(
-        record: dict[str, Any],
-    ) -> dict[str, object]:
-        """Deep-copy a ``key, fork, left, right`` attribution dict.
-
-        The copied result shares no tuples or dicts with the source, so it
-        stays detached from the per-call attributions and internal state.
-        """
-        def copy_side(side: dict[str, Any]) -> dict[str, object]:
-            return {
-                "value": side["value"],
-                "cause": side["cause"],
-                "path": tuple(side["path"]),
-                "affected": tuple(side["affected"]),
-            }
-
-        return {
-            "key": record["key"],
-            "fork": record["fork"],
-            "left": copy_side(record["left"]),
-            "right": copy_side(record["right"]),
-        }
-
-    def _divergence_view(
-        self,
-        name_a: str,
-        name_b: str,
-        points: tuple[tuple[str, str], ...],
-        keys: tuple[str, ...],
-    ) -> list[tuple[list[str], list[str], str, str]] | None:
-        """Validate and capture the single read-only divergence view.
-
-        Shared by :meth:`divergence_timeline` and
-        :meth:`divergence_summary` so both apply identical validation
-        order, errors, empty-container handling and branch/node closure
-        rules, and answer every point and key from one historical view.
-        Returns ``None`` when ``points`` is empty (the empty-tuple result
-        case); otherwise one ``(left_order, right_order, node_a, node_b)``
-        entry per point in input order.
-        """
-        self._require_nonempty_str(name_a, "name_a")
-        self._require_nonempty_str(name_b, "name_b")
-        if not isinstance(points, tuple):
-            raise TypeError(
-                f"points must be a tuple, got {type(points).__name__}"
-            )
-        seen_points: set[tuple[str, str]] = set()
-        for point in points:
-            if not isinstance(point, tuple) or len(point) != 2:
-                raise TypeError(
-                    "each point must be a length-2 tuple of node ids, "
-                    f"got {point!r} ({type(point).__name__})"
-                )
-            node_a, node_b = point
-            self._require_nonempty_str(node_a, "node_a")
-            self._require_nonempty_str(node_b, "node_b")
-            pair = (node_a, node_b)
-            if pair in seen_points:
-                raise ValueError(f"duplicate point {pair!r}")
-            seen_points.add(pair)
-        if not isinstance(keys, tuple):
-            raise TypeError(
-                f"keys must be a tuple, got {type(keys).__name__}"
-            )
-        seen_keys: set[str] = set()
-        for key in keys:
-            self._require_nonempty_str(key, "key")
-            if key in seen_keys:
-                raise ValueError(f"duplicate key {key!r}")
-            seen_keys.add(key)
-
-        self._require_known_branch(name_a)
-        self._require_known_branch(name_b)
-        if name_a == name_b:
-            raise ValueError(
-                f"cannot attribute divergence for branch {name_a!r} "
-                "against itself"
-            )
-
-        if not points:
-            return None
-
-        # Capture the single read-only historical view: the current head
-        # closures decide node membership for every pair, and the nodes'
-        # own closures answer every key.
-        head_closure_a = set(
-            self._graph._ordered_ancestors(self._heads[name_a])
-        )
-        head_closure_b = set(
-            self._graph._ordered_ancestors(self._heads[name_b])
-        )
-        for node_a, node_b in points:
-            if node_a not in self._graph._at or node_a not in head_closure_a:
-                raise KeyError(node_a)
-            if node_b not in self._graph._at or node_b not in head_closure_b:
-                raise KeyError(node_b)
-
-        return [
-            (
-                self._graph._ordered_ancestors(node_a),
-                self._graph._ordered_ancestors(node_b),
-                node_a,
-                node_b,
-            )
-            for node_a, node_b in points
-        ]
 
 
     def _attribute_divergence_for(
