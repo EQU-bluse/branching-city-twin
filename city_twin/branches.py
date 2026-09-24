@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from city_twin.event_graph import EventGraph
@@ -959,6 +960,218 @@ class BranchStore:
                 }
             )
         return tuple(rows)
+
+    def rank_impacts(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        weights: dict[str, int | float],
+    ) -> tuple[dict[str, object], ...]:
+        """Rank branches by the weighted impact of their unconverged keys.
+
+        The scheduling-impact companion of :meth:`divergence_matrix`: each
+        entry of ``series`` pairs a branch name with its own tuple of
+        ``(reference node, series node)`` points, replayed against the same
+        ``reference`` branch exactly as there, and ``weights`` maps each
+        examined state key to its non-negative weight.
+
+        ``reference`` and ``series`` are validated first, in exactly
+        :meth:`divergence_matrix`'s order and with its errors: a
+        non-``str`` or empty ``reference`` raises :class:`TypeError`/
+        :class:`ValueError`; ``series`` must be a dict (else
+        :class:`TypeError`); its keys are checked in insertion order, a
+        non-``str`` series name raising :class:`TypeError` and an empty or
+        ``reference``-equal name raising :class:`ValueError`; and each
+        series' points are walked in input order (a non-tuple container or
+        non-length-2-tuple point raises :class:`TypeError`, non-``str`` or
+        empty node ids raise :class:`TypeError`/:class:`ValueError`, a
+        repeated node pair raises :class:`ValueError`). ``weights`` is
+        checked last, before any branch is looked up: it must be a dict
+        (else :class:`TypeError`); its entries are walked in insertion
+        order, a non-``str`` key raising :class:`TypeError` and an empty
+        key raising :class:`ValueError`; each weight must be a non-``bool``
+        :class:`int` or :class:`float` (anything else raises
+        :class:`TypeError`), and a negative, NaN or infinite weight raises
+        :class:`ValueError`. The branches are then looked up, reference
+        first and then the series in ``series`` insertion order (unknown
+        branch :class:`KeyError`), and nodes are checked per pair, left
+        before right, pairs in points order (:class:`KeyError` when absent
+        from the graph or the named branch's current head closure).
+
+        Every series, point and key is answered from one shared read-only
+        historical view: the reference branch's and every series branch's
+        current head closures and every node's own closure are taken once
+        before results are built. For each series branch the examined
+        keys are the ``weights`` keys, ordered by Unicode code point; their
+        per-point divergences and final attributions are item-wise equal
+        to :meth:`divergence_summary`'s for the same arguments. Each branch
+        contributes a fresh dict whose keys are ordered ``branch, score,
+        first_impact, unconverged, attributions``:
+
+        ``score`` is the sum, over the keys whose left and right replayed
+        values still differ at the final point, of the absolute value
+        difference times the key's weight -- plain Python arithmetic
+        yielding an :class:`int` or :class:`float` with no rounding, and a
+        zero result is never negative zero. ``first_impact`` is the
+        smallest ``first_diverged`` point index among the keys that
+        diverged at least once, or ``None`` when no examined key ever
+        diverged. ``unconverged`` is the tuple of the still-diverging keys
+        ordered by Unicode code point, and ``attributions`` aligns with it:
+        one fresh ``key, fork, left, right`` attribution dict per
+        unconverged key, item-wise equal to that key's ``last`` attribution
+        in :meth:`divergence_matrix`.
+
+        The rows are sorted by descending ``score``, then ascending
+        ``first_impact`` with ``None`` placed after every integer, then by
+        the Unicode code point of the branch name. An empty ``series``
+        still validates ``reference`` and ``weights`` and looks the
+        reference branch up, yielding an empty tuple; empty ``weights``
+        still validates every branch and node, and each series then
+        contributes a zero score, ``None`` and empty ``unconverged`` and
+        ``attributions`` tuples. The tuples and dicts at every level are
+        freshly built, neither sharing objects with each other nor aliasing
+        internal state. Success or failure never modifies the graph,
+        branch heads, audit or idempotency records.
+        """
+        # --- All inputs finish validating before any branch is looked up,
+        # mirroring divergence_matrix with weights in the keys position. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            per_series.append((series_name, series_points))
+        ordered_keys = self._validate_weights(weights)
+
+        self._require_known_branch(reference)
+
+        # Capture the shared read-only view before any result is built,
+        # exactly as in divergence_matrix.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views: list[
+            tuple[str, list[tuple[list[str], list[str], str, str]] | None]
+        ] = []
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            ordered_points: list[
+                tuple[list[str], list[str], str, str]
+            ] | None = None
+            if series_points:
+                ordered_points = [
+                    (
+                        self._graph._ordered_ancestors(node_a),
+                        self._graph._ordered_ancestors(node_b),
+                        node_a,
+                        node_b,
+                    )
+                    for node_a, node_b in series_points
+                ]
+            views.append((series_name, ordered_points))
+
+        rows: list[dict[str, object]] = []
+        for series_name, ordered_points in views:
+            summaries = self._divergence_summaries(
+                ordered_points, ordered_keys
+            )
+            unconverged: list[str] = []
+            attributions: list[dict[str, object]] = []
+            diverged_indices: list[int] = []
+            score: int | float = 0
+            for summary in summaries:
+                first_diverged = summary["first_diverged"]
+                if first_diverged is not None:
+                    diverged_indices.append(first_diverged)
+                last = summary["last"]
+                left_value = last["left"]["value"]
+                right_value = last["right"]["value"]
+                if left_value == right_value:
+                    continue
+                key = summary["key"]
+                score += abs(left_value - right_value) * weights[key]
+                unconverged.append(key)
+                attributions.append(last)
+            # A zero score must never surface as negative zero.
+            if score == 0:
+                score = 0 if isinstance(score, int) else 0.0
+            rows.append(
+                {
+                    "branch": series_name,
+                    "score": score,
+                    "first_impact": (
+                        min(diverged_indices) if diverged_indices else None
+                    ),
+                    "unconverged": tuple(unconverged),
+                    "attributions": tuple(attributions),
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                -row["score"],
+                row["first_impact"] is None,
+                (
+                    row["first_impact"]
+                    if row["first_impact"] is not None
+                    else 0
+                ),
+                row["branch"],
+            )
+        )
+        return tuple(rows)
+
+    @staticmethod
+    def _validate_weights(weights: Any) -> tuple[str, ...]:
+        """Validate ``weights`` and return its keys in Unicode order.
+
+        The weight-map counterpart of :meth:`_validate_keys`: a non-dict
+        raises :class:`TypeError`; entries are walked in insertion order,
+        a non-``str`` key raising :class:`TypeError` and an empty key
+        raising :class:`ValueError`; each weight must be a non-``bool``
+        :class:`int` or :class:`float` (else :class:`TypeError`) and must
+        not be negative, NaN or infinite (else :class:`ValueError`).
+        """
+        if not isinstance(weights, dict):
+            raise TypeError(
+                f"weights must be a dict, got {type(weights).__name__}"
+            )
+        for key, value in weights.items():
+            EventGraph._require_nonempty_str(key, "weight key")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"weight for {key!r} must be an int or float, got "
+                    f"{type(value).__name__}"
+                )
+            if isinstance(value, float) and (
+                math.isnan(value) or math.isinf(value)
+            ):
+                raise ValueError(f"weight for {key!r} must be finite")
+            if value < 0:
+                raise ValueError(f"weight for {key!r} must be non-negative")
+        return tuple(sorted(weights))
 
     @staticmethod
     def _copy_attribution(
