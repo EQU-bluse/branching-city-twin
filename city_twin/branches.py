@@ -3037,6 +3037,18 @@ class BranchStore:
             exclusive_pairs,
             limit,
         )
+        return self._build_decision_cascade(prepared)
+
+    def _build_decision_cascade(
+        self, prepared: dict[str, object]
+    ) -> dict[str, object]:
+        """Build the frozen cascade nodes, edges and gaps from one view.
+
+        Shared by :meth:`decision_cascade` and :meth:`cascade_slice` so the
+        slice reuses exactly the existing nodes, edges and gaps on the one
+        frozen historical view :meth:`_prepare_frontier_scan` captured,
+        never reinterpreting or widening its historical closure.
+        """
         combos = prepared["combos"]
 
         snapshots = [
@@ -3105,7 +3117,7 @@ class BranchStore:
                     zip(members, attributions)
                 ):
                     side_views = (
-                        ("left", reference, None),
+                        ("left", prepared["reference"], None),
                         ("right", branch, member_index),
                     )
                     for side, side_branch, side_index in side_views:
@@ -3240,6 +3252,237 @@ class BranchStore:
             for gap in gaps
         )
         return {"nodes": nodes, "edges": edges, "gaps": gap_tuple}
+
+    def cascade_slice(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+    ) -> dict[str, object]:
+        """Slice a bounded evidence subgraph out of a decision cascade.
+
+        The read-only slice companion of :meth:`decision_cascade`: it is
+        called with every one of that query's arguments -- none has a
+        default -- followed by the cause-event set, the expansion
+        direction, the edge-count depth and the selected-node cap. The
+        ordinary cascade inputs are validated first in exactly
+        :meth:`decision_cascade`'s order, including the branch and
+        historical-node lookup order, checkpoint alignment and the
+        candidate-count cap; the cascade is then generated on one frozen
+        historical view, and the slice reuses its existing nodes, edges
+        and gaps -- it never reinterprets or widens the historical
+        closure.
+
+        The slice-specific inputs are validated in order after the
+        ordinary ones, all before any cascade node is inspected:
+        ``causes`` must be a tuple (else :class:`TypeError`) of non-empty
+        ``str`` ids walked in input order, a non-``str`` element raising
+        :class:`TypeError` and an empty or duplicated id raising
+        :class:`ValueError`; ``direction`` must be a ``str`` (else
+        :class:`TypeError`) and exactly ``"forward"``, ``"backward"`` or
+        ``"both"`` -- an empty string, any other value and every case
+        variant raise :class:`ValueError`; ``depth`` and ``node_limit``
+        must each be a non-``bool`` :class:`int` (else
+        :class:`TypeError`), a negative ``depth`` or a ``node_limit``
+        below one raising :class:`ValueError`.
+
+        Cause events are handled in input order; when one event is the
+        cause node of several state keys, every such node is a start.
+        After the frozen cascade is built, a cause event absent from the
+        cascade nodes raises :class:`KeyError` (the first absent one in
+        input order). ``"forward"`` follows the directed edges from
+        earlier cause to later cause, ``"backward"`` walks them in
+        reverse, and ``"both"`` does both; cross-branch convergence edges
+        stay usable because the walk follows the cascade's own directed
+        edges, which may cross branches through merges. Depth counts
+        edges: depth zero keeps only the start nodes, and no expansion
+        ever leaves the existing cascade evidence. A node reached from
+        several starts is selected once. The reachable set is counted
+        only after the direction-and-depth expansion; when it exceeds
+        ``node_limit`` a :class:`ValueError` is raised and no partial
+        slice is returned. An empty ``causes`` tuple still completes
+        every validation and the state lookup, then returns three empty
+        tuples without applying the node cap.
+
+        The result is a fresh dict with keys ordered ``nodes, edges,
+        gaps``: nodes keep their full-cascade order (each start and
+        reachable node exactly once), edges keep only records whose two
+        ends are both selected, with endpoints remapped to slice
+        positions while paths and the existing edge order are unchanged,
+        and gaps keep only records whose interval is also an interval of
+        a selected node, in the existing interval and candidate order.
+        Nodes, edges and gaps at every level are freshly built copies
+        that share no objects with each other or with any full-cascade
+        result. The query is read-only: success or failure never modifies
+        the event graph, branch heads, audit or idempotency records, and
+        the existing cascade, turning-point explanation and ``status``
+        entry behavior are unchanged.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # --- Slice inputs validated in signature order, before any state is
+        # queried: branch lookups, historical-node alignment and the
+        # candidate cap all run afterwards. ---
+        if not isinstance(causes, tuple):
+            raise TypeError(
+                f"causes must be a tuple, got {type(causes).__name__}"
+            )
+        seen_causes: set[str] = set()
+        for cause in causes:
+            self._require_nonempty_str(cause, "cause")
+            if cause in seen_causes:
+                raise ValueError(f"duplicate cause {cause!r}")
+            seen_causes.add(cause)
+        if not isinstance(direction, str):
+            raise TypeError(
+                f"direction must be a str, got {type(direction).__name__}"
+            )
+        if direction not in ("forward", "backward", "both"):
+            raise ValueError(
+                "direction must be 'forward', 'backward' or 'both', got "
+                f"{direction!r}"
+            )
+        depth_value = self._require_size_bound(depth, "depth")
+        if depth_value < 0:
+            raise ValueError("depth must be non-negative")
+        node_limit_value = self._require_size_bound(node_limit, "node_limit")
+        if node_limit_value < 1:
+            raise ValueError("node_limit must be >= 1")
+
+        # Only now is state queried: the existing branch/node lookup order,
+        # checkpoint alignment and the candidate cap run on the one frozen
+        # view every result is taken from.
+        prepared = self._capture_frontier_view(validated)
+
+        # Build the full cascade on the frozen view; the slice only
+        # restricts its existing nodes, edges and gaps.
+        cascade = self._build_decision_cascade(prepared)
+        nodes = cascade["nodes"]
+        edges = cascade["edges"]
+        gaps = cascade["gaps"]
+
+        if not causes:
+            # All validation and the state lookup are done; an empty set
+            # never trips the node cap.
+            return {"nodes": (), "edges": (), "gaps": ()}
+
+        # Map every cause event to all of its cascade nodes (one per state
+        # key), in node order; an absent cause event is a KeyError, with
+        # causes checked in their input order.
+        nodes_by_cause: dict[str, list[int]] = {}
+        for index, node in enumerate(nodes):
+            nodes_by_cause.setdefault(node["cause"], []).append(index)
+        starts: list[int] = []
+        for cause in causes:
+            indices = nodes_by_cause.get(cause)
+            if indices is None:
+                raise KeyError(cause)
+            starts.extend(indices)
+
+        # Adjacency comes only from the cascade's existing directed edges,
+        # so the walk cannot leave the existing evidence.
+        forward_neighbors: dict[int, list[int]] = {
+            index: [] for index in range(len(nodes))
+        }
+        backward_neighbors: dict[int, list[int]] = {
+            index: [] for index in range(len(nodes))
+        }
+        for edge in edges:
+            forward_neighbors[edge["source"]].append(edge["target"])
+            backward_neighbors[edge["target"]].append(edge["source"])
+
+        # Level-by-level expansion from every start at once: levels count
+        # edges, a node reached more than once is claimed once, and depth
+        # zero keeps only the starts.
+        selected = set(starts)
+        if depth_value > 0:
+            frontier = set(starts)
+            for _ in range(depth_value):
+                reached: set[int] = set()
+                for index in frontier:
+                    if direction in ("forward", "both"):
+                        reached.update(forward_neighbors[index])
+                    if direction in ("backward", "both"):
+                        reached.update(backward_neighbors[index])
+                reached.difference_update(selected)
+                if not reached:
+                    break
+                selected.update(reached)
+                frontier = reached
+
+        # The cap is checked after the full reachable set is known, before
+        # any slice object is built, so an over-cap call returns nothing.
+        if len(selected) > node_limit_value:
+            raise ValueError(
+                f"cascade slice node limit exceeded: {len(selected)} nodes "
+                f"selected, limit is {node_limit_value}"
+            )
+
+        # Nodes keep the full cascade's order; positions remap densely.
+        selected_positions = sorted(selected)
+        remapped = {
+            old: new for new, old in enumerate(selected_positions)
+        }
+        slice_nodes = tuple(
+            {
+                "cause": nodes[old]["cause"],
+                "key": nodes[old]["key"],
+                "intervals": tuple(nodes[old]["intervals"]),
+                "checkpoints": tuple(nodes[old]["checkpoints"]),
+                "branches": tuple(nodes[old]["branches"]),
+                "affected": tuple(nodes[old]["affected"]),
+            }
+            for old in selected_positions
+        )
+        slice_edges = tuple(
+            {
+                "source": remapped[edge["source"]],
+                "target": remapped[edge["target"]],
+                "path": tuple(edge["path"]),
+            }
+            for edge in edges
+            if edge["source"] in selected and edge["target"] in selected
+        )
+        selected_intervals: set[int] = set()
+        for old in selected_positions:
+            selected_intervals.update(nodes[old]["intervals"])
+        slice_gaps = tuple(
+            {
+                "interval": gap["interval"],
+                "members": tuple(gap["members"]),
+            }
+            for gap in gaps
+            if gap["interval"] in selected_intervals
+        )
+        return {
+            "nodes": slice_nodes,
+            "edges": slice_edges,
+            "gaps": slice_gaps,
+        }
 
     def _cascade_side_order(
         self,
@@ -3442,6 +3685,44 @@ class BranchStore:
         scenario, axis and value tuple, the member constraints, the captured
         per-series checkpoint views and the once-enumerated candidate list.
         """
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+        return self._capture_frontier_view(validated)
+
+    def _validate_frontier_inputs(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> dict[str, object]:
+        """Validate the ordinary breakpoint inputs without touching state.
+
+        The pure-validation half of :meth:`_prepare_frontier_scan`: every
+        ordinary input, the base scenario and the value series are checked
+        in the existing order, but no branch or historical node is looked
+        up and no candidate is enumerated. :meth:`cascade_slice` validates
+        its own extra inputs between this phase and
+        :meth:`_capture_frontier_view`, so its causes, direction, depth and
+        node limit are checked before any state query, while the ordinary
+        inputs keep exactly their existing validation order.
+        """
         # --- Every ordinary input, the base scenario and the value series
         # finish validating before any branch is looked up, mirroring
         # frontier_sensitivity's reference, series, scenario order. ---
@@ -3558,6 +3839,38 @@ class BranchStore:
         if limit_value < 1:
             raise ValueError("limit must be >= 1")
 
+        return {
+            "reference": reference,
+            "per_series": per_series,
+            "ordered_keys": ordered_keys,
+            "weights": weights,
+            "total_budget": total_budget,
+            "key_budgets": key_budgets,
+            "axis": axis,
+            "ordered_values": ordered_values,
+            "min_size_value": min_size_value,
+            "max_size_value": max_size_value,
+            "required_set": required_set,
+            "ordered_pairs": ordered_pairs,
+            "limit_value": limit_value,
+        }
+
+    def _capture_frontier_view(
+        self, validated: dict[str, object]
+    ) -> dict[str, object]:
+        """Look up branches/nodes and capture the one frozen historical view.
+
+        The state-touching half of :meth:`_prepare_frontier_scan`: it applies
+        the existing branch lookup order (reference first, then the series
+        in input order), checks every node against its named branch's
+        current head ancestor closure, captures each checkpoint closure
+        once, and enumerates the candidates with the count cap. It runs
+        only after every ordinary input -- and, for
+        :meth:`cascade_slice`, every slice input -- has been validated.
+        """
+        reference = validated["reference"]
+        per_series = validated["per_series"]
+
         self._require_known_branch(reference)
 
         # Capture the single frozen read-only historical view every value is
@@ -3600,6 +3913,9 @@ class BranchStore:
         pool = tuple(sorted(name for name, _ in per_series))
         combos: list[tuple[str, ...]] = []
         candidate_count = 0
+        min_size_value = validated["min_size_value"]
+        max_size_value = validated["max_size_value"]
+        limit_value = validated["limit_value"]
         for size in range(min_size_value, max_size_value + 1):
             for combo in itertools.combinations(pool, size):
                 candidate_count += 1
@@ -3613,14 +3929,14 @@ class BranchStore:
         return {
             "reference": reference,
             "views_by_name": views_by_name,
-            "ordered_keys": ordered_keys,
-            "weights": weights,
-            "total_budget": total_budget,
-            "key_budgets": key_budgets,
-            "axis": axis,
-            "ordered_values": ordered_values,
-            "required_set": required_set,
-            "ordered_pairs": ordered_pairs,
+            "ordered_keys": validated["ordered_keys"],
+            "weights": validated["weights"],
+            "total_budget": validated["total_budget"],
+            "key_budgets": validated["key_budgets"],
+            "axis": validated["axis"],
+            "ordered_values": validated["ordered_values"],
+            "required_set": validated["required_set"],
+            "ordered_pairs": validated["ordered_pairs"],
             "combos": combos,
         }
 
