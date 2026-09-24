@@ -3837,6 +3837,191 @@ class BranchStore:
             )
         return {"lifetimes": lifetimes}
 
+    def compare_lifetimes(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        left_indices: tuple[int, ...],
+        right_indices: tuple[int, ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+    ) -> dict[str, object]:
+        """Diff the identity lifetimes of two observation windows.
+
+        The read-only two-window companion of
+        :meth:`cascade_slice_lifetimes`: it is called with every argument
+        of that query -- none has a default -- with ``left_indices`` and
+        ``right_indices`` in place of ``indices`` and with ``diff_limit``
+        appended after ``lifetime_limit``. The two windows independently
+        select aligned historical positions; each side summarizes only
+        its own selected snapshots and their adjacent change segments,
+        exactly as :meth:`cascade_slice_lifetimes` does for its one
+        window. Both sides are taken from the same single frozen
+        historical view, so the two windows never read different branch
+        states merely because they are computed one after the other.
+
+        Validation runs in exactly :meth:`cascade_slice_lifetimes`'s
+        order -- the ordinary inputs first -- and then continues with
+        the left window, the right window, the existing slice inputs
+        ``causes``, ``direction``, ``depth`` and ``node_limit``,
+        ``change_limit``, ``lifetime_limit`` and finally
+        ``diff_limit``. Each window is validated exactly like
+        ``indices``: it must be a tuple (else :class:`TypeError`) whose
+        elements, walked in window then input order, are each a
+        non-``bool`` :class:`int` (a :class:`bool` or any
+        non-:class:`int` element raises :class:`TypeError`); a negative
+        or out-of-range index, a duplicated index or a sequence that is
+        not strictly increasing raises :class:`ValueError`.
+        ``diff_limit`` must be a non-``bool`` :class:`int` (else
+        :class:`TypeError`) and at least one (else
+        :class:`ValueError`). Only then do the branch and
+        historical-node lookups, checkpoint alignment and the
+        candidate-count cap run, all on the one frozen view, keeping the
+        existing :class:`KeyError`/:class:`ValueError` contracts and
+        lookup order; the per-position node cap, the total change cap and
+        the per-side lifetime cap are enforced on each side, the left
+        side first, exactly as in :meth:`cascade_slice_lifetimes`.
+
+        Nodes are identified by their cause event and state key, edges
+        solely by the node identities of their two endpoints and gaps by
+        their interval and member combination, exactly the lifetime
+        identity rules. The result is a fresh dict whose keys are ordered
+        ``left, right, changes``: ``left`` and ``right`` are each the
+        isolated tuple of that window's complete lifetime records in the
+        existing lifetime order. ``changes`` is a tuple of fresh dicts,
+        one per identity whose lifetime differs across the windows: an
+        identity only on the right is ``added``, one only on the left is
+        ``removed``, and one present in both whose first or last
+        position, presence intervals or classification differs is
+        ``changed``; identical lifetimes are omitted. Each record's keys
+        are ordered ``kind, identity, before, after``: ``kind`` is
+        ``node_removed``/``node_added``/``node_changed``, ``edge_*`` or
+        ``gap_*``; ``before`` and ``after`` are an isolated copy of the
+        corresponding side's lifetime record, or ``None`` on the missing
+        side. Records run nodes, then edges, then gaps; within each type
+        they run removed, added and changed. Removed and changed
+        records follow the left side's identity order and added records
+        the right side's, so the result is stable and repeatable.
+
+        When the change count exceeds ``diff_limit`` a
+        :class:`ValueError` is raised and no partial result is returned.
+        An empty window still completes every input and state check and
+        yields an empty lifetime tuple for that side; when both windows
+        are empty all three entries are empty tuples. Objects at every
+        level are freshly built and share nothing with each other or
+        internal state, so repeated calls return item-wise equal
+        results. The query is read-only: success or failure never
+        modifies the event graph, branch heads, audit or idempotency
+        records, or any existing query, and the existing slice, diff,
+        timeline, lifetime and ``status`` behavior is unchanged; no CLI
+        command is added.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The two windows come next, left fully before right, each using
+        # the existing indices checks; then the slice inputs and limits
+        # keep their existing order, with diff_limit last -- all before
+        # any state is queried.
+        point_count = self._frontier_point_count(validated)
+        left_values = self._validate_slice_indices(left_indices, point_count)
+        right_values = self._validate_slice_indices(right_indices, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+
+        # Capture the single read-only historical view once; each window's
+        # selected snapshots and adjacent segments are taken from it, so
+        # the two summaries never disagree about branch state.
+        prepared = self._capture_frontier_view(validated)
+        left_snapshots, left_segments = self._cascade_slice_timeline_data(
+            prepared,
+            left_values,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+        )
+        left_lifetimes = self._build_slice_lifetimes(
+            left_snapshots, left_segments
+        )
+        if len(left_lifetimes) > lifetime_limit_value:
+            raise ValueError(
+                f"cascade slice lifetimes lifetime limit exceeded: "
+                f"{len(left_lifetimes)} lifetime records on the left "
+                f"window, limit is {lifetime_limit_value}"
+            )
+        right_snapshots, right_segments = self._cascade_slice_timeline_data(
+            prepared,
+            right_values,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+        )
+        right_lifetimes = self._build_slice_lifetimes(
+            right_snapshots, right_segments
+        )
+        if len(right_lifetimes) > lifetime_limit_value:
+            raise ValueError(
+                f"cascade slice lifetimes lifetime limit exceeded: "
+                f"{len(right_lifetimes)} lifetime records on the right "
+                f"window, limit is {lifetime_limit_value}"
+            )
+
+        changes = self._build_lifetime_changes(
+            left_lifetimes, right_lifetimes
+        )
+        # The full change set is known before the cap is enforced, so an
+        # over-cap call returns no partial diff.
+        if len(changes) > diff_limit_value:
+            raise ValueError(
+                f"compare lifetimes diff limit exceeded: {len(changes)} "
+                f"change records, limit is {diff_limit_value}"
+            )
+        return {
+            "left": left_lifetimes,
+            "right": right_lifetimes,
+            "changes": changes,
+        }
+
     def _cascade_slice_timeline_data(
         self,
         prepared: dict[str, object],
@@ -4083,43 +4268,185 @@ class BranchStore:
         return tuple(lifetimes)
 
     @staticmethod
-    def _validate_slice_indices(indices: Any, point_count: int) -> list[int]:
+    def _copy_lifetime_record(
+        record: dict[str, object],
+    ) -> dict[str, object]:
+        """Build one fully isolated copy of a lifetime record.
+
+        The transitions' evidence is copied again (nodes, edges and gaps
+        use the same shapes as the slice change records), so the copy
+        shares no object with the source record or with the other
+        window's records; identities and intervals are immutable tuples
+        and need no copy.
+        """
+
+        def copy_evidence(evidence: object) -> object:
+            if not isinstance(evidence, dict):
+                return None
+            if "path" in evidence:
+                return {
+                    "source": evidence["source"],
+                    "target": evidence["target"],
+                    "path": tuple(evidence["path"]),
+                }
+            if "members" in evidence:
+                return {
+                    "interval": evidence["interval"],
+                    "members": tuple(evidence["members"]),
+                }
+            return {
+                "cause": evidence["cause"],
+                "key": evidence["key"],
+                "intervals": tuple(evidence["intervals"]),
+                "checkpoints": tuple(evidence["checkpoints"]),
+                "branches": tuple(evidence["branches"]),
+                "affected": tuple(evidence["affected"]),
+            }
+
+        return {
+            "type": record["type"],
+            "identity": record["identity"],
+            "first_seen": record["first_seen"],
+            "last_seen": record["last_seen"],
+            "intervals": tuple(record["intervals"]),
+            "transitions": tuple(
+                {
+                    "kind": transition["kind"],
+                    "before": copy_evidence(transition["before"]),
+                    "after": copy_evidence(transition["after"]),
+                }
+                for transition in record["transitions"]
+            ),
+        }
+
+    @staticmethod
+    def _build_lifetime_changes(
+        left: tuple[dict[str, object], ...],
+        right: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Compare two windows' lifetime tuples by identity.
+
+        Records run nodes, then edges, then gaps; within each type they
+        run removed, added and changed. Removed and changed records keep
+        the left window's identity order and added records the right
+        window's. A shared identity changes when its first or last
+        position, its presence intervals or its transition
+        classification (including either side's evidence) differs;
+        fully identical lifetimes are omitted. Every referenced side is
+        copied again, so the change records share no object with either
+        returned lifetime tuple.
+        """
+
+        def same_lifetime(
+            left_record: dict[str, object], right_record: dict[str, object]
+        ) -> bool:
+            return (
+                left_record["first_seen"] == right_record["first_seen"]
+                and left_record["last_seen"] == right_record["last_seen"]
+                and left_record["intervals"] == right_record["intervals"]
+                and left_record["transitions"] == right_record["transitions"]
+            )
+
+        changes: list[dict[str, object]] = []
+        for type_name in ("node", "edge", "gap"):
+            left_records = [
+                record for record in left if record["type"] == type_name
+            ]
+            right_records = [
+                record for record in right if record["type"] == type_name
+            ]
+            left_by_identity = {
+                record["identity"]: record for record in left_records
+            }
+            right_by_identity = {
+                record["identity"]: record for record in right_records
+            }
+
+            def add_change(
+                kind: str,
+                identity: object,
+                before: object,
+                after: object,
+            ) -> None:
+                changes.append(
+                    {
+                        "kind": kind,
+                        "identity": identity,
+                        "before": before,
+                        "after": after,
+                    }
+                )
+
+            # Removed and changed follow the left window's identity
+            # order; added follows the right window's.
+            for record in left_records:
+                if record["identity"] not in right_by_identity:
+                    add_change(
+                        f"{type_name}_removed",
+                        record["identity"],
+                        BranchStore._copy_lifetime_record(record),
+                        None,
+                    )
+            for record in right_records:
+                if record["identity"] not in left_by_identity:
+                    add_change(
+                        f"{type_name}_added",
+                        record["identity"],
+                        None,
+                        BranchStore._copy_lifetime_record(record),
+                    )
+            for record in left_records:
+                other = right_by_identity.get(record["identity"])
+                if other is None or same_lifetime(record, other):
+                    continue
+                add_change(
+                    f"{type_name}_changed",
+                    record["identity"],
+                    BranchStore._copy_lifetime_record(record),
+                    BranchStore._copy_lifetime_record(other),
+                )
+        return tuple(changes)
+
+    @staticmethod
+    def _validate_slice_indices(
+        indices: Any, point_count: int, name: str = "indices"
+    ) -> list[int]:
         """Validate the ``indices`` checkpoint window of the slice queries.
 
-        Shared by :meth:`cascade_slice_timeline` and
-        :meth:`cascade_slice_lifetimes` so both apply identical checks in
-        the same order: a tuple (else :class:`TypeError`) of non-``bool``
+        Shared by :meth:`cascade_slice_timeline`,
+        :meth:`cascade_slice_lifetimes` and :meth:`compare_lifetimes`
+        (the last passing ``left_indices``/``right_indices`` as
+        ``name``) so every window applies identical checks in the same
+        order: a tuple (else :class:`TypeError`) of non-``bool``
         :class:`int` elements walked in input order, a negative or
         out-of-range index, a duplicate or a non-increasing sequence
         raising :class:`ValueError`.
         """
         if not isinstance(indices, tuple):
             raise TypeError(
-                f"indices must be a tuple, got {type(indices).__name__}"
+                f"{name} must be a tuple, got {type(indices).__name__}"
             )
         index_values: list[int] = []
         seen_indices: set[int] = set()
         previous_index: int | None = None
         for index in indices:
-            index_value = BranchStore._require_checkpoint_index(
-                index, "indices"
-            )
+            index_value = BranchStore._require_checkpoint_index(index, name)
             if index_value < 0:
                 raise ValueError(
-                    "indices checkpoint index must be non-negative"
+                    f"{name} checkpoint index must be non-negative"
                 )
             if index_value >= point_count:
                 raise ValueError(
-                    f"indices checkpoint index {index_value} is out of "
+                    f"{name} checkpoint index {index_value} is out of "
                     f"range for {point_count} checkpoint(s)"
                 )
             if index_value in seen_indices:
                 raise ValueError(
-                    f"duplicate checkpoint index {index_value}"
+                    f"duplicate {name} checkpoint index {index_value}"
                 )
             if previous_index is not None and index_value <= previous_index:
                 raise ValueError(
-                    "indices checkpoint indices must be strictly increasing"
+                    f"{name} checkpoint indices must be strictly increasing"
                 )
             seen_indices.add(index_value)
             previous_index = index_value
