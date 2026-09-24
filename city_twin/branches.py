@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import itertools
 import math
 from typing import Any
@@ -2934,6 +2935,360 @@ class BranchStore:
                     }
                 )
         return tuple(intervals)
+
+    def decision_cascade(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> dict[str, object]:
+        """Chain the causes of consecutive frontier turns into a cascade.
+
+        The read-only chaining companion of
+        :meth:`explain_frontier_breakpoints`: it takes exactly the same
+        arguments -- none has a default -- and parameter validation, the
+        branch/node lookup order, checkpoint alignment, candidate
+        enumeration order and the candidate-count cap are exactly
+        :meth:`frontier_breakpoints`' contract and errors
+        (:class:`TypeError` for wrong container/name/number types, with
+        :class:`bool` never accepted as an :class:`int`/:class:`float`;
+        :class:`ValueError` for empty names, wrong field sets, an unknown
+        axis, non-finite or out-of-order values, member-constraint
+        conflicts, misaligned checkpoints or more than ``limit``
+        candidates; :class:`KeyError` for unknown reference/series
+        branches or nodes, including a node outside its named branch's
+        current head ancestor closure). Exceeding the candidate cap raises
+        before any chaining is built, so no partial cascade or state
+        change is possible.
+
+        All turning-point explanations are first taken on one frozen
+        historical view, exactly as :meth:`explain_frontier_breakpoints`
+        computes them, and the change evidence is then processed in
+        interval order. Every non-empty per-member attribution of a change
+        whose member side names a cause event contributes one occurrence of
+        an evidence node identified by the ``(cause event, state key)``
+        pair: the change's cause key, the change's locating checkpoint and
+        the member side's cause event and affected event range. Occurrences
+        sharing one cause event and state key merge into a single node that
+        aggregates every interval index, checkpoint and associated series
+        branch it appeared in -- a shared cause event keeps one identity
+        whether it surfaces on several branches or again after a merge --
+        with branch names sorted by Unicode code point. A node's affected
+        events are the union of its occurrences' member-side affected
+        ranges, deduplicated and ordered by the replay order of the union
+        of the corresponding historical closures; no event outside those
+        closures ever enters the result.
+
+        Directed edges are only considered between the cause nodes of two
+        adjacent turning-point intervals, pointing from every earlier
+        interval node to every later interval node. An edge exists exactly
+        when the later cause event is a strict descendant of the earlier
+        one in the event graph -- merge events included, so an edge may
+        converge across branches; otherwise both nodes stand as independent
+        evidence chains. Each edge carries the shortest parent-to-child
+        path between the two cause events, both ends included, ties broken
+        by the Unicode code point order of the complete id tuples, and an
+        edge with the same endpoints and path appears at most once.
+
+        A change whose cause key is missing, or whose attributions name no
+        member-side cause event at all, is never fabricated into a node; it
+        is recorded as a gap with its interval index and member tuple
+        instead.
+
+        The result is a fresh dict whose keys are ordered ``nodes, edges,
+        gaps``. ``nodes`` is a tuple of fresh dicts whose keys are ordered
+        ``cause, key, checkpoint, affected, intervals, checkpoints,
+        branches``: the cause event id, the state key, the first locating
+        checkpoint (``None`` when none exists), the affected event tuple,
+        and the occurrence interval indices, checkpoints and branch names.
+        Nodes are sorted by first interval, then first checkpoint with
+        ``None`` placed after every integer, then state key, then cause
+        event id. ``edges`` is a tuple of fresh dicts whose keys are
+        ordered ``source, target, path``, each endpoint the
+        ``(cause, key)`` node identity tuple, sorted by source node order,
+        then target node order, then path. ``gaps`` is a tuple of fresh
+        dicts whose keys are ordered ``interval, members``, following
+        interval order and the existing candidate enumeration order within
+        one interval. With no turning-point intervals all three are empty
+        tuples. Every level is freshly built, shares no objects with the
+        other levels and aliases no internal state. The query is
+        read-only: success or failure never modifies the event graph,
+        branch heads, audit or idempotency records, or any existing
+        search, sensitivity, breakpoint or explanation result.
+        """
+        prepared = self._prepare_frontier_scan(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+        combos = prepared["combos"]
+
+        snapshots = [
+            self._breakpoint_snapshot(prepared, value)
+            for value in prepared["ordered_values"]
+        ]
+
+        # The interval explanations are exactly the turning-point query's,
+        # processed in interval order from the same frozen view.
+        explained: list[list[dict[str, object]]] = []
+        for index in range(len(snapshots) - 1):
+            left_snapshot = snapshots[index]
+            right_snapshot = snapshots[index + 1]
+            changes: list[dict[str, object]] = []
+            for combo in combos:
+                evidence = self._breakpoint_change_evidence(
+                    prepared,
+                    combo,
+                    left_snapshot,
+                    right_snapshot,
+                )
+                if evidence is not None:
+                    changes.append(evidence)
+            if changes:
+                explained.append(changes)
+
+        if not explained:
+            return {"nodes": (), "edges": (), "gaps": ()}
+
+        # --- Collect node occurrences and gaps, intervals in order. ---
+        # occurrences: (cause, key) -> list of
+        # (interval, checkpoint, branch, affected, closure)
+        occurrences: dict[
+            tuple[str, str],
+            list[tuple[int, int | None, str, tuple[str, ...], set[str]]],
+        ] = {}
+        gaps: list[dict[str, object]] = []
+        for interval, changes in enumerate(explained):
+            for change in changes:
+                cause_key = change["cause_key"]
+                checkpoint = change["checkpoint"]
+                members = change["members"]
+                attributions = change["attribution"]
+                found = False
+                if cause_key is not None:
+                    position = self._combo_checkpoint_position(
+                        prepared, members, checkpoint
+                    )
+                    for member, attribution, view in zip(
+                        members, attributions, position
+                    ):
+                        right = attribution["right"]
+                        cause = right["cause"]
+                        if cause is None:
+                            continue
+                        found = True
+                        _, right_order, _, _ = view
+                        occurrences.setdefault(
+                            (cause, cause_key), []
+                        ).append(
+                            (
+                                interval,
+                                checkpoint,
+                                member,
+                                tuple(right["affected"]),
+                                set(right_order),
+                            )
+                        )
+                if not found:
+                    gaps.append(
+                        {"interval": interval, "members": tuple(members)}
+                    )
+
+        # --- Merge occurrences into nodes. ---
+        nodes: list[dict[str, object]] = []
+        for (cause, key), entries in occurrences.items():
+            affected: set[str] = set()
+            union_closure: set[str] = set()
+            for _, _, _, entry_affected, entry_closure in entries:
+                affected.update(entry_affected)
+                union_closure.update(entry_closure)
+            # Affected events keep the replay order of the union of the
+            # historical closures they were taken from; events outside
+            # those closures never enter the result.
+            ordered_affected = tuple(
+                event_id
+                for event_id in self._replay_order_of(union_closure)
+                if event_id in affected
+            )
+            nodes.append(
+                {
+                    "cause": cause,
+                    "key": key,
+                    "checkpoint": entries[0][1],
+                    "affected": ordered_affected,
+                    "intervals": tuple(entry[0] for entry in entries),
+                    "checkpoints": tuple(entry[1] for entry in entries),
+                    "branches": tuple(
+                        sorted({entry[2] for entry in entries})
+                    ),
+                }
+            )
+        nodes.sort(
+            key=lambda node: (
+                node["intervals"][0],
+                node["checkpoint"] is None,
+                (
+                    node["checkpoint"]
+                    if node["checkpoint"] is not None
+                    else 0
+                ),
+                node["key"],
+                node["cause"],
+            )
+        )
+        node_rank = {
+            (node["cause"], node["key"]): rank
+            for rank, node in enumerate(nodes)
+        }
+
+        # Map each interval to the node identities that occur in it, in
+        # first-seen (evidence processing) order.
+        interval_nodes: dict[int, list[tuple[str, str]]] = {}
+        for (cause, key), entries in occurrences.items():
+            identity = (cause, key)
+            for interval, *_ in entries:
+                bucket = interval_nodes.setdefault(interval, [])
+                if identity not in bucket:
+                    bucket.append(identity)
+
+        # --- Chain adjacent intervals' cause nodes. ---
+        # Children adjacency over the whole event graph: the cascade may
+        # follow a cause event's descendants anywhere, including across
+        # branches through merge events.
+        children: dict[str, list[str]] = {
+            event_id: [] for event_id in self._graph._at
+        }
+        for event_id, parents in self._graph._parents.items():
+            for parent in parents:
+                children[parent].append(event_id)
+
+        def shortest_path(
+            source: str, target: str
+        ) -> tuple[str, ...] | None:
+            # Level-by-level breadth-first search gives the fewest-edge
+            # paths; keeping the minimum full id tuple within a level
+            # applies the Unicode code point tie-break, as in
+            # explain_impact. Returns None unless target is a strict
+            # descendant of source.
+            paths: dict[str, tuple[str, ...]] = {source: (source,)}
+            frontier = [source]
+            while frontier:
+                candidates: dict[str, tuple[str, ...]] = {}
+                for current in frontier:
+                    current_path = paths[current]
+                    for child in children[current]:
+                        if child in paths:
+                            continue
+                        candidate = (*current_path, child)
+                        best = candidates.get(child)
+                        if best is None or candidate < best:
+                            candidates[child] = candidate
+                if target in candidates:
+                    return candidates[target]
+                for child, path in candidates.items():
+                    paths[child] = path
+                frontier = list(candidates)
+            return None
+
+        keyed_edges: list[dict[str, object]] = []
+        seen_keyed: set[
+            tuple[tuple[str, str], tuple[str, str], tuple[str, ...]]
+        ] = set()
+        for interval in range(len(explained) - 1):
+            earlier_nodes = interval_nodes.get(interval, ())
+            later_nodes = interval_nodes.get(interval + 1, ())
+            # Cache the reachability/path result per cause-event pair; a
+            # cause event may anchor several keyed nodes, and one event
+            # pair yields the same path regardless of keys.
+            path_cache: dict[tuple[str, str], tuple[str, ...] | None] = {}
+            for source_id in earlier_nodes:
+                for target_id in later_nodes:
+                    source_event, _ = source_id
+                    target_event, _ = target_id
+                    if source_event == target_event:
+                        continue
+                    cache_key = (source_event, target_event)
+                    if cache_key not in path_cache:
+                        path_cache[cache_key] = shortest_path(
+                            source_event, target_event
+                        )
+                    path = path_cache[cache_key]
+                    if path is None:
+                        # The later cause is no strict descendant of the
+                        # earlier one: both stay independent chains.
+                        continue
+                    edge_key = (source_id, target_id, path)
+                    if edge_key in seen_keyed:
+                        # Same endpoints and path already surfaced for
+                        # another adjacent interval pair.
+                        continue
+                    seen_keyed.add(edge_key)
+                    keyed_edges.append(
+                        {
+                            "source": source_id,
+                            "target": target_id,
+                            "path": path,
+                        }
+                    )
+        keyed_edges.sort(
+            key=lambda edge: (
+                node_rank[edge["source"]],
+                node_rank[edge["target"]],
+                edge["path"],
+            )
+        )
+
+        return {
+            "nodes": tuple(nodes),
+            "edges": tuple(keyed_edges),
+            "gaps": tuple(gaps),
+        }
+
+    def _replay_order_of(self, closure: set[str]) -> list[str]:
+        """Return the deterministic replay order of an ancestor-closed set.
+
+        Same parents-before-children, ``(at, id)`` order as
+        :meth:`EventGraph._ordered_ancestors`, for a caller-captured
+        closure (a union of historical closures) rather than a single
+        head's ancestors.
+        """
+        indegree = {event_id: 0 for event_id in closure}
+        children: dict[str, list[str]] = {event_id: [] for event_id in closure}
+        for event_id in closure:
+            for parent in self._graph._parents[event_id]:
+                if parent in closure:
+                    indegree[event_id] += 1
+                    children[parent].append(event_id)
+
+        ready = [
+            (self._graph._at[event_id], event_id)
+            for event_id, degree in indegree.items()
+            if degree == 0
+        ]
+        heapq.heapify(ready)
+        order: list[str] = []
+        while ready:
+            _, event_id = heapq.heappop(ready)
+            order.append(event_id)
+            for child in children[event_id]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    heapq.heappush(ready, (self._graph._at[child], child))
+        return order
 
     def _prepare_frontier_scan(
         self,
