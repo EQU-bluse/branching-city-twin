@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import heapq
 import itertools
 import math
+import secrets
+import threading
 from typing import Any
 
 from city_twin.event_graph import EventGraph
@@ -32,6 +35,9 @@ class BranchStore:
         self._sources: dict[str, str] = {}
         self._appends: dict[str, dict[str, tuple[int, dict[str, int]]]] = {}
         self._merges: dict[str, tuple[str, str, int, dict[str, int]]] = {}
+        # Snapshot token -> {"view": frozen BranchStore, "remaining": int}.
+        self._snapshots: dict[str, dict[str, Any]] = {}
+        self._snapshot_lock = threading.Lock()
 
     @staticmethod
     def _require_nonempty_str(value: Any, name: str) -> None:
@@ -269,6 +275,122 @@ class BranchStore:
             key=lambda record: (record["at"], record["event_id"])
         )
         return tuple(records)
+
+    _MAX_SNAPSHOTS = 32
+
+    @staticmethod
+    def _copy_event_graph(graph: EventGraph) -> EventGraph:
+        """Return a detached copy of ``graph``'s recorded events."""
+        copied = EventGraph()
+        copied._at = dict(graph._at)
+        copied._parents = dict(graph._parents)
+        copied._changes = {
+            event_id: dict(changes)
+            for event_id, changes in graph._changes.items()
+        }
+        return copied
+
+    def create_snapshot(self, max_reads: int) -> str:
+        """Freeze the store's current state behind a reusable token.
+
+        ``max_reads`` must be a non-``bool`` :class:`int` (else
+        :class:`TypeError`) and at least one (else :class:`ValueError`).
+        The returned token is a fresh non-empty string naming a snapshot
+        that holds detached copies of the event graph, the branch heads,
+        the audit records and the idempotency records as of this call;
+        later appends, merges or new branches never enter the snapshot's
+        view. Each of :meth:`lifetime_evolution`,
+        :meth:`compare_lifetimes` and :meth:`cascade_slice_lifetimes`
+        accepts the token as its final optional argument and answers
+        from the frozen view, consuming one of the ``max_reads`` reads
+        per successful query.
+
+        A store keeps at most 32 unreleased tokens; creating a further
+        one raises :class:`RuntimeError` and never evicts an existing
+        token. The call is read-only with respect to the live store:
+        the event graph, branch heads, audit and idempotency records are
+        never modified, and a failed call leaves the token capacity and
+        every token's read allowance unchanged.
+        """
+        if isinstance(max_reads, bool) or not isinstance(max_reads, int):
+            raise TypeError(
+                f"max_reads must be an int, got {type(max_reads).__name__}"
+            )
+        if max_reads < 1:
+            raise ValueError("max_reads must be >= 1")
+        with self._snapshot_lock:
+            if len(self._snapshots) >= self._MAX_SNAPSHOTS:
+                raise RuntimeError(
+                    f"snapshot limit exceeded: {self._MAX_SNAPSHOTS} "
+                    "unreleased snapshots"
+                )
+            view = object.__new__(BranchStore)
+            view._graph = self._copy_event_graph(self._graph)
+            view._heads = copy.deepcopy(self._heads)
+            view._sources = copy.deepcopy(self._sources)
+            view._appends = copy.deepcopy(self._appends)
+            view._merges = copy.deepcopy(self._merges)
+            view._snapshots = {}
+            view._snapshot_lock = threading.Lock()
+            token = secrets.token_hex(16)
+            while token in self._snapshots:
+                token = secrets.token_hex(16)
+            self._snapshots[token] = {
+                "view": view,
+                "remaining": max_reads,
+            }
+        return token
+
+    def release_snapshot(self, token: str) -> None:
+        """Release the snapshot behind ``token`` and free its capacity.
+
+        ``token`` must be a :class:`str` (else :class:`TypeError`) and
+        non-empty (else :class:`ValueError`); an unknown, already
+        released or foreign-store token raises :class:`KeyError`.
+        Releasing a valid or an expired token succeeds and returns
+        ``None``, immediately freeing one slot of the store's snapshot
+        capacity; a released token is never restored. The event graph,
+        branch heads, audit and idempotency records are never modified,
+        and a failed call leaves the token capacity and every token's
+        read allowance unchanged.
+        """
+        self._require_nonempty_str(token, "token")
+        with self._snapshot_lock:
+            if token not in self._snapshots:
+                raise KeyError(token)
+            del self._snapshots[token]
+        return None
+
+    def _claim_snapshot(self, token: Any) -> dict[str, Any]:
+        """Validate ``token`` and atomically reserve one read.
+
+        Runs after the calling query's own input validation and before
+        any state check: a non-:class:`str` token raises
+        :class:`TypeError`, an empty string :class:`ValueError`, and an
+        unknown, released or foreign-store token :class:`KeyError`. A
+        token whose reads are exhausted has expired and raises
+        :class:`RuntimeError`. The reservation itself is atomic under
+        the store's snapshot lock, so concurrent queries on one token
+        never succeed more than its ``max_reads`` times; a failed query
+        refunds its reservation via :meth:`_refund_snapshot_read`.
+        """
+        self._require_nonempty_str(token, "token")
+        with self._snapshot_lock:
+            record = self._snapshots.get(token)
+            if record is None:
+                raise KeyError(token)
+            if record["remaining"] <= 0:
+                raise RuntimeError(
+                    f"snapshot token {token!r} has expired: "
+                    "no reads remaining"
+                )
+            record["remaining"] -= 1
+            return record
+
+    def _refund_snapshot_read(self, record: dict[str, Any]) -> None:
+        """Return one reserved read after a failed snapshot query."""
+        with self._snapshot_lock:
+            record["remaining"] += 1
 
     def trace(self, name: str, key: str) -> tuple[str, ...]:
         """Return ids of events on ``name``'s head closure touching ``key``.
@@ -3720,6 +3842,7 @@ class BranchStore:
         node_limit: int,
         change_limit: int,
         lifetime_limit: int,
+        token: str | None = None,
     ) -> dict[str, object]:
         """Summarize evidence identity lifetimes over a slice timeline.
 
@@ -3744,6 +3867,22 @@ class BranchStore:
         contracts and lookup order; the per-position node cap and the
         total change cap are enforced exactly as in
         :meth:`cascade_slice_timeline`.
+
+        The optional trailing ``token`` names a snapshot created by
+        :meth:`create_snapshot`. When it is given, every input above is
+        validated first in the same order, then the token is checked --
+        a non-:class:`str` token raises :class:`TypeError`, an empty
+        string :class:`ValueError`, an unknown, released or
+        foreign-store token :class:`KeyError`, and an expired token
+        :class:`RuntimeError` -- and only then do the existing state
+        checks run, entirely within the snapshot's frozen view: branches
+        appended, merged or created after the snapshot are invisible to
+        it, and branches or nodes absent from the snapshot keep raising
+        :class:`KeyError` exactly as the live query would. A successful
+        token query consumes one of the snapshot's reads; a failed one
+        consumes none. Omitting ``token`` (or passing ``None``) keeps
+        the existing live-state behavior, validation order and return
+        structure unchanged.
 
         Nodes are identified by their cause event and state key, edges
         solely by the node identities of their two endpoints and gaps by
@@ -3812,6 +3951,55 @@ class BranchStore:
             lifetime_limit, "lifetime_limit"
         )
 
+        if token is None:
+            return self._cascade_slice_lifetimes_on(
+                validated,
+                index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+            )
+
+        # Every ordinary input is validated; the token is checked next,
+        # then the existing state checks run inside the snapshot's view.
+        record = self._claim_snapshot(token)
+        try:
+            return record["view"]._cascade_slice_lifetimes_on(
+                validated,
+                index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+            )
+        except Exception:
+            self._refund_snapshot_read(record)
+            raise
+
+    def _cascade_slice_lifetimes_on(
+        self,
+        validated: dict[str, object],
+        index_values: list[int],
+        causes: tuple[str, ...],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+        change_limit_value: int,
+        lifetime_limit_value: int,
+    ) -> dict[str, object]:
+        """Run the lifetime query's state checks and build its result.
+
+        The state-touching half of :meth:`cascade_slice_lifetimes`,
+        shared by the live query and snapshot-token queries: it runs on
+        whichever store view -- live or frozen snapshot -- the caller
+        selected, so both apply identical state checks, caps and result
+        assembly.
+        """
         # Capture the single read-only historical view once; the selected
         # snapshots and adjacent segments are taken from it, so the
         # lifetimes never read different branch states per position.
@@ -3858,6 +4046,7 @@ class BranchStore:
         change_limit: int,
         lifetime_limit: int,
         diff_limit: int,
+        token: str | None = None,
     ) -> dict[str, object]:
         """Diff the identity lifetimes of two slice-timeline windows.
 
@@ -3893,6 +4082,22 @@ class BranchStore:
         are enforced per window exactly as in
         :meth:`cascade_slice_timeline`, and ``lifetime_limit`` caps each
         window's record count, the left window first.
+
+        The optional trailing ``token`` names a snapshot created by
+        :meth:`create_snapshot`. When it is given, every input above is
+        validated first in the same order, then the token is checked --
+        a non-:class:`str` token raises :class:`TypeError`, an empty
+        string :class:`ValueError`, an unknown, released or
+        foreign-store token :class:`KeyError`, and an expired token
+        :class:`RuntimeError` -- and only then do the existing state
+        checks run, entirely within the snapshot's frozen view: branches
+        appended, merged or created after the snapshot are invisible to
+        it, and branches or nodes absent from the snapshot keep raising
+        :class:`KeyError` exactly as the live query would. A successful
+        token query consumes one of the snapshot's reads; a failed one
+        consumes none. Omitting ``token`` (or passing ``None``) keeps
+        the existing live-state behavior, validation order and return
+        structure unchanged.
 
         Nodes are identified by their cause event and state key, edges
         solely by the node identities of their two endpoints and gaps by
@@ -3970,6 +4175,60 @@ class BranchStore:
             diff_limit, "diff_limit"
         )
 
+        if token is None:
+            return self._compare_lifetimes_on(
+                validated,
+                left_index_values,
+                right_index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+                diff_limit_value,
+            )
+
+        # Every ordinary input is validated; the token is checked next,
+        # then the existing state checks run inside the snapshot's view.
+        record = self._claim_snapshot(token)
+        try:
+            return record["view"]._compare_lifetimes_on(
+                validated,
+                left_index_values,
+                right_index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+                diff_limit_value,
+            )
+        except Exception:
+            self._refund_snapshot_read(record)
+            raise
+
+    def _compare_lifetimes_on(
+        self,
+        validated: dict[str, object],
+        left_index_values: list[int],
+        right_index_values: list[int],
+        causes: tuple[str, ...],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+        change_limit_value: int,
+        lifetime_limit_value: int,
+        diff_limit_value: int,
+    ) -> dict[str, object]:
+        """Run the window comparison's state checks and build its result.
+
+        The state-touching half of :meth:`compare_lifetimes`, shared by
+        the live query and snapshot-token queries: it runs on whichever
+        store view -- live or frozen snapshot -- the caller selected, so
+        both apply identical state checks, caps and result assembly.
+        """
         # Capture the single read-only historical view once; both windows
         # select their snapshots and adjacent segments from it, so the two
         # sides never disagree about history.
@@ -4055,6 +4314,7 @@ class BranchStore:
         diff_limit: int,
         window_limit: int,
         total_diff_limit: int,
+        token: str | None = None,
     ) -> dict[str, object]:
         """Follow identity-lifetime evolution across many slice windows.
 
@@ -4095,6 +4355,22 @@ class BranchStore:
         are enforced per window exactly as in
         :meth:`cascade_slice_timeline`, and ``lifetime_limit`` caps each
         window's record count.
+
+        The optional trailing ``token`` names a snapshot created by
+        :meth:`create_snapshot`. When it is given, every input above is
+        validated first in the same order, then the token is checked --
+        a non-:class:`str` token raises :class:`TypeError`, an empty
+        string :class:`ValueError`, an unknown, released or
+        foreign-store token :class:`KeyError`, and an expired token
+        :class:`RuntimeError` -- and only then do the existing state
+        checks run, entirely within the snapshot's frozen view: branches
+        appended, merged or created after the snapshot are invisible to
+        it, and branches or nodes absent from the snapshot keep raising
+        :class:`KeyError` exactly as the live query would. A successful
+        token query consumes one of the snapshot's reads; a failed one
+        consumes none. Omitting ``token`` (or passing ``None``) keeps
+        the existing live-state behavior, validation order and return
+        structure unchanged.
 
         The result is a fresh dict whose keys are ordered ``windows,
         segments``, both fresh tuples. Each window contributes a fresh
@@ -4174,6 +4450,60 @@ class BranchStore:
                 f"{window_limit_value}"
             )
 
+        if token is None:
+            return self._lifetime_evolution_on(
+                validated,
+                index_windows,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+                diff_limit_value,
+                total_diff_limit_value,
+            )
+
+        # Every ordinary input is validated; the token is checked next,
+        # then the existing state checks run inside the snapshot's view.
+        record = self._claim_snapshot(token)
+        try:
+            return record["view"]._lifetime_evolution_on(
+                validated,
+                index_windows,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+                diff_limit_value,
+                total_diff_limit_value,
+            )
+        except Exception:
+            self._refund_snapshot_read(record)
+            raise
+
+    def _lifetime_evolution_on(
+        self,
+        validated: dict[str, object],
+        index_windows: list[list[int]],
+        causes: tuple[str, ...],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+        change_limit_value: int,
+        lifetime_limit_value: int,
+        diff_limit_value: int,
+        total_diff_limit_value: int,
+    ) -> dict[str, object]:
+        """Run the evolution batch's state checks and build its result.
+
+        The state-touching half of :meth:`lifetime_evolution`, shared by
+        the live query and snapshot-token queries: it runs on whichever
+        store view -- live or frozen snapshot -- the caller selected, so
+        both apply identical state checks, caps and result assembly.
+        """
         # Capture the single read-only historical view once; every window
         # selects its snapshots and adjacent segments from it, so the batch
         # never reads different branch states per window.

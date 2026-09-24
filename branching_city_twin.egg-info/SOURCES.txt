@@ -25,6 +25,7 @@ tests/test_explain_frontier_breakpoints.py
 tests/test_frontier_breakpoints.py
 tests/test_frontier_sensitivity.py
 tests/test_impact_budget.py
+tests/test_lifetime_evolution.py
 tests/test_rank_impacts.py
 tests/test_replay_at.py
 tests/test_search_combinations.py
