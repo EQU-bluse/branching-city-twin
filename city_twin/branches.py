@@ -3031,6 +3031,475 @@ class BranchStore:
 
         return {"points": points, "breakpoints": tuple(breakpoints)}
 
+    def explain_frontier_breakpoints(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> tuple[dict[str, object], ...]:
+        """Explain which historical node and state key causes each turn.
+
+        The read-only explanatory companion of :meth:`frontier_breakpoints`:
+        it is called with exactly that method's arguments and no defaults,
+        validates them in the same order with the same errors, captures the
+        same single frozen read-only historical view, enumerates candidates
+        in the same ascending-size/code-point order under the same limit,
+        and first obtains exactly :meth:`frontier_breakpoints`' turning
+        intervals. Each such interval is then explained: every combination
+        that enters, exits or is affected by the turn appears exactly once,
+        in candidate enumeration order, and nothing is reported for
+        adjacent value pairs with completely equal results (an empty tuple
+        is returned when there are no turning intervals).
+
+        Each change's type is judged in the order feasibility, domination
+        and frontier membership only: a feasibility change locates the
+        first checkpoint whose left- and right-value budget verdicts
+        differ (the combination passing every total/per-key budget test on
+        the prefix through that checkpoint), while a domination or
+        frontier-membership-only change uses the last checkpoint, the one
+        that decides the final risk. With a total-budget axis the cause
+        key is the non-zero state key whose contribution has the largest
+        absolute aggregate at that checkpoint, ties broken by the smallest
+        Unicode code point; a weight axis names the perturbed key itself,
+        but only when that key has a non-zero difference for at least one
+        involved member -- otherwise the cause key is ``None``. A
+        ``None`` cause key yields an empty ``attributions`` tuple;
+        otherwise one independent copy of that checkpoint's existing
+        historical divergence attribution for the cause key is returned
+        per member, in member order.
+
+        The result is a tuple of fresh interval-record dicts in interval
+        order, each with keys ordered ``left_bound, right_bound, changes``;
+        ``changes`` follows candidate enumeration order, and each evidence
+        dict has keys ordered ``members, change_type, checkpoint,
+        cause_key, attributions, left, right``. ``change_type`` is one of
+        ``"feasibility"``, ``"domination"`` or ``"frontier_membership"``;
+        ``checkpoint`` is the checkpoint index, or ``None`` when no
+        checkpoint exists, and ``cause_key`` is ``None`` as above. Each
+        side dict has keys ordered ``feasible, risk, dominators,
+        overrun``: the feasibility verdict, the final-checkpoint risk
+        (``None`` when infeasible), the dominating feasible combinations
+        in the existing deterministic frontier order (descending member
+        count, ascending risk, ascending member tuple; an empty tuple for
+        an infeasible or non-dominated side), and the rejected row's
+        overrun magnitude (``None`` when feasible). Risk, budget or
+        checkpoint evidence that does not exist is reported as ``None``,
+        never as zero or an empty string. Every returned level is freshly
+        built and detached from internal state and from the other levels.
+        Success or failure never modifies the event graph, branch heads,
+        audit or idempotency records, nor any existing search or
+        sensitivity result, and no existing interface changes.
+        """
+        # --- Validation, view capture and candidate enumeration mirror
+        # frontier_breakpoints exactly: reference, series, base scenario,
+        # axis and values, then the size window, member constraints and
+        # limit, before any branch is looked up. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        anchor_points: tuple[tuple[str, str], ...] | None = None
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            if anchor_points is None:
+                anchor_points = series_points
+            elif len(series_points) != len(anchor_points) or any(
+                point[0] != anchor_point[0]
+                for point, anchor_point in zip(
+                    series_points, anchor_points
+                )
+            ):
+                raise ValueError(
+                    "all series must share checkpoint count and reference "
+                    "nodes"
+                )
+            per_series.append((series_name, series_points))
+
+        weights, total_budget, key_budgets = (
+            self._validate_breakpoint_scenario(base_scenario)
+        )
+        ordered_keys = tuple(sorted(weights))
+
+        self._require_nonempty_str(axis, "axis")
+        if axis != "total_budget" and axis not in weights:
+            raise ValueError(f"unknown perturbation axis {axis!r}")
+        ordered_values = self._validate_breakpoint_values(values)
+
+        min_size_value = self._require_size_bound(min_size, "min_size")
+        if min_size_value < 0:
+            raise ValueError("min_size must be non-negative")
+        max_size_value = self._require_size_bound(max_size, "max_size")
+        if max_size_value < min_size_value:
+            raise ValueError("max_size must be >= min_size")
+        if max_size_value > len(per_series):
+            raise ValueError("max_size must not exceed the number of series")
+
+        if not isinstance(required, tuple):
+            raise TypeError(
+                f"required must be a tuple, got {type(required).__name__}"
+            )
+        required_members: list[str] = []
+        seen_required: set[str] = set()
+        for member in required:
+            self._require_nonempty_str(member, "required member")
+            if member in seen_required:
+                raise ValueError(f"duplicate required member {member!r}")
+            seen_required.add(member)
+            if member not in series:
+                raise ValueError(
+                    f"required member {member!r} is absent from series"
+                )
+            required_members.append(member)
+
+        if not isinstance(exclusive_pairs, tuple):
+            raise TypeError(
+                "exclusive_pairs must be a tuple, got "
+                f"{type(exclusive_pairs).__name__}"
+            )
+        ordered_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for pair in exclusive_pairs:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(
+                    "each exclusive pair must be a length-2 tuple of "
+                    f"member names, got {pair!r} ({type(pair).__name__})"
+                )
+            member_a, member_b = pair
+            self._require_nonempty_str(member_a, "exclusive member")
+            self._require_nonempty_str(member_b, "exclusive member")
+            if member_a == member_b:
+                raise ValueError(
+                    f"member {member_a!r} cannot be mutually exclusive "
+                    "with itself"
+                )
+            if member_a not in series:
+                raise ValueError(
+                    f"exclusive member {member_a!r} is absent from series"
+                )
+            if member_b not in series:
+                raise ValueError(
+                    f"exclusive member {member_b!r} is absent from series"
+                )
+            normalized = tuple(sorted(pair))
+            if normalized in seen_pairs:
+                raise ValueError(f"duplicate exclusive pair {normalized!r}")
+            seen_pairs.add(normalized)
+            ordered_pairs.append((member_a, member_b))
+        required_set = set(required_members)
+        for member_a, member_b in ordered_pairs:
+            if member_a in required_set and member_b in required_set:
+                raise ValueError(
+                    f"required members {member_a!r} and {member_b!r} are "
+                    "mutually exclusive"
+                )
+
+        limit_value = self._require_size_bound(limit, "limit")
+        if limit_value < 1:
+            raise ValueError("limit must be >= 1")
+
+        self._require_known_branch(reference)
+
+        # The single frozen read-only historical view every value is
+        # answered from, exactly as in frontier_breakpoints.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views_by_name: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ] = {}
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            views_by_name[series_name] = [
+                (
+                    self._graph._ordered_ancestors(node_a),
+                    self._graph._ordered_ancestors(node_b),
+                    node_a,
+                    node_b,
+                )
+                for node_a, node_b in series_points
+            ]
+
+        # Candidates are enumerated once in the existing search order; the
+        # count cap runs before any evaluation and raises with no partial
+        # explanation and no internal change.
+        pool = tuple(sorted(name for name, _ in per_series))
+        combos: list[tuple[str, ...]] = []
+        candidate_count = 0
+        for size in range(min_size_value, max_size_value + 1):
+            for combo in itertools.combinations(pool, size):
+                candidate_count += 1
+                if candidate_count > limit_value:
+                    raise ValueError(
+                        "search candidate limit exceeded: more than "
+                        f"{limit_value} candidates in size window"
+                    )
+                combos.append(combo)
+
+        # At each value only the one axis number is replaced; the snapshot
+        # keeps that point's own weights and budgets alongside the same
+        # feasibility, frontier, domination and rejection accounting the
+        # turning-point query uses.
+        snapshots: list[dict[str, object]] = []
+        for value in ordered_values:
+            if axis == "total_budget":
+                point_weights = dict(weights)
+                point_total = value
+            else:
+                point_weights = dict(weights)
+                point_weights[axis] = value
+                point_total = total_budget
+            point_key_budgets = dict(key_budgets)
+            frontier_rows, rejected_rows, feasible_stats = (
+                self._frontier_search_once(
+                    combos,
+                    views_by_name,
+                    ordered_keys,
+                    point_weights,
+                    point_key_budgets,
+                    point_total,
+                    required_set,
+                    ordered_pairs,
+                )
+            )
+            frontier_set = {
+                tuple(row["members"]) for row in frontier_rows
+            }
+            feasible_set = set(feasible_stats)
+            dominators: dict[
+                tuple[str, ...], tuple[tuple[str, ...], ...]
+            ] = {}
+            for combo in combos:
+                if combo not in feasible_stats:
+                    dominators[combo] = ()
+                    continue
+                risk = feasible_stats[combo][0]
+                dominated_by = [
+                    other
+                    for other in feasible_stats
+                    if len(other) >= len(combo)
+                    and feasible_stats[other][0] <= risk
+                    and (
+                        len(other) > len(combo)
+                        or feasible_stats[other][0] < risk
+                    )
+                ]
+                dominated_by.sort(
+                    key=lambda other: (
+                        -len(other),
+                        feasible_stats[other][0],
+                        other,
+                    )
+                )
+                dominators[combo] = tuple(dominated_by)
+            rejected_map = {
+                tuple(row["members"]): (
+                    row["checkpoint"],
+                    row["key"],
+                    row["overrun"],
+                )
+                for row in rejected_rows
+            }
+            snapshots.append(
+                {
+                    "value": value,
+                    "weights": point_weights,
+                    "total": point_total,
+                    "key_budgets": point_key_budgets,
+                    "feasible": feasible_set,
+                    "frontier": frontier_set,
+                    "dominators": dominators,
+                    "stats": feasible_stats,
+                    "rejected_map": rejected_map,
+                }
+            )
+
+        point_count = len(anchor_points) if anchor_points is not None else 0
+
+        records: list[dict[str, object]] = []
+        for index in range(len(snapshots) - 1):
+            left_snapshot = snapshots[index]
+            right_snapshot = snapshots[index + 1]
+            changes: list[dict[str, object]] = []
+            for combo in combos:
+                feasible_left = combo in left_snapshot["feasible"]
+                feasible_right = combo in right_snapshot["feasible"]
+                frontier_left = combo in left_snapshot["frontier"]
+                frontier_right = combo in right_snapshot["frontier"]
+                dominators_left = left_snapshot["dominators"][combo]
+                dominators_right = right_snapshot["dominators"][combo]
+                feasibility_changed = feasible_left != feasible_right
+                domination_changed = dominators_left != dominators_right
+                frontier_changed = frontier_left != frontier_right
+                if not (
+                    feasibility_changed
+                    or domination_changed
+                    or frontier_changed
+                ):
+                    continue
+
+                # Type precedence: feasibility, then domination, then a
+                # frontier-membership change alone.
+                if feasibility_changed:
+                    change_type = "feasibility"
+                elif domination_changed:
+                    change_type = "domination"
+                else:
+                    change_type = "frontier_membership"
+
+                member_views = [
+                    views_by_name[member] for member in combo
+                ]
+                left_states = self._checkpoint_budget_verdicts(
+                    member_views,
+                    point_count,
+                    ordered_keys,
+                    left_snapshot["weights"],
+                    left_snapshot["key_budgets"],
+                    left_snapshot["total"],
+                )
+                right_states = self._checkpoint_budget_verdicts(
+                    member_views,
+                    point_count,
+                    ordered_keys,
+                    right_snapshot["weights"],
+                    right_snapshot["key_budgets"],
+                    right_snapshot["total"],
+                )
+
+                if change_type == "feasibility":
+                    checkpoint: int | None = None
+                    for checkpoint_index in range(point_count):
+                        if (
+                            left_states[checkpoint_index][2]
+                            != right_states[checkpoint_index][2]
+                        ):
+                            checkpoint = checkpoint_index
+                            break
+                else:
+                    checkpoint = point_count - 1 if point_count else None
+
+                cause_key: str | None = None
+                if checkpoint is not None:
+                    aggregate, member_diffs, _ = left_states[checkpoint]
+                    if axis == "total_budget":
+                        # The aggregate per-key contribution is history
+                        # only, so it is identical on both sides.
+                        nonzero_keys = [
+                            key
+                            for key in ordered_keys
+                            if aggregate[key] != 0
+                        ]
+                        if nonzero_keys:
+                            cause_key = sorted(
+                                nonzero_keys,
+                                key=lambda key: (
+                                    -abs(aggregate[key]),
+                                    key,
+                                ),
+                            )[0]
+                    elif any(
+                        member_diff[axis] != 0
+                        for member_diff in member_diffs
+                    ):
+                        cause_key = axis
+
+                if cause_key is None or checkpoint is None:
+                    attributions: tuple[dict[str, object], ...] = ()
+                else:
+                    attributions = tuple(
+                        self._copy_attribution(
+                            self._attribute_divergence_on_orders(
+                                views_by_name[member][checkpoint][0],
+                                views_by_name[member][checkpoint][1],
+                                views_by_name[member][checkpoint][2],
+                                views_by_name[member][checkpoint][3],
+                                cause_key,
+                            )
+                        )
+                        for member in combo
+                    )
+
+                def side_evidence(
+                    snapshot: dict[str, object],
+                    feasible: bool,
+                ) -> dict[str, object]:
+                    risk = (
+                        snapshot["stats"][combo][0] if feasible else None
+                    )
+                    overrun = None
+                    if not feasible:
+                        overrun = snapshot["rejected_map"].get(
+                            combo, (None, None, None)
+                        )[2]
+                    return {
+                        "feasible": feasible,
+                        "risk": risk,
+                        "dominators": tuple(
+                            tuple(other)
+                            for other in snapshot["dominators"][combo]
+                        ),
+                        "overrun": overrun,
+                    }
+
+                changes.append(
+                    {
+                        "members": tuple(combo),
+                        "change_type": change_type,
+                        "checkpoint": checkpoint,
+                        "cause_key": cause_key,
+                        "attributions": attributions,
+                        "left": side_evidence(
+                            left_snapshot, feasible_left
+                        ),
+                        "right": side_evidence(
+                            right_snapshot, feasible_right
+                        ),
+                    }
+                )
+
+            # An interval with no changed combination is not a turning
+            # interval; the turning-point query skips it and so does this.
+            if not changes:
+                continue
+            records.append(
+                {
+                    "left_bound": left_snapshot["value"],
+                    "right_bound": right_snapshot["value"],
+                    "changes": tuple(changes),
+                }
+            )
+
+        return tuple(records)
+
     @staticmethod
     def _validate_breakpoint_scenario(
         scenario: Any,
@@ -3533,6 +4002,64 @@ class BranchStore:
             final_member_diffs,
             final_position,
         )
+
+    def _checkpoint_budget_verdicts(
+        self,
+        member_views: list[list[tuple[list[str], list[str], str, str]]],
+        point_count: int,
+        ordered_keys: tuple[str, ...],
+        weights: dict[str, int | float],
+        key_budgets: dict[str, int | float],
+        total_budget: int | float,
+    ) -> list[tuple[dict[str, int], list[dict[str, int]], bool]]:
+        """Replay one subset's per-checkpoint aggregates and budget verdicts.
+
+        One entry per checkpoint in checkpoint order: the signed aggregate
+        per state key, each member's signed differences in member order,
+        and whether the subset passes every total and per-key budget test
+        at that checkpoint. Accounting and the strictly-greater breach
+        tests match :meth:`_evaluate_subset_view` exactly; unlike that
+        method this keeps every checkpoint instead of stopping at the
+        first breach, so an explanation can locate the first checkpoint
+        whose verdict differs between two values. ``point_count`` is the
+        shared checkpoint count, so the member-less empty subset still
+        yields one all-zero, always-feasible verdict per checkpoint.
+        """
+        verdicts: list[
+            tuple[dict[str, int], list[dict[str, int]], bool]
+        ] = []
+        for index in range(point_count):
+            position = [views[index] for views in member_views]
+            reference_order = position[0][0] if position else []
+            reference_values = {
+                key: self._replayed_value(reference_order, key)
+                for key in ordered_keys
+            }
+            aggregate: dict[str, int] = {key: 0 for key in ordered_keys}
+            member_diffs: list[dict[str, int]] = []
+            for _, right_order, _, _ in position:
+                diffs: dict[str, int] = {}
+                for key in ordered_keys:
+                    diff = (
+                        self._replayed_value(right_order, key)
+                        - reference_values[key]
+                    )
+                    diffs[key] = diff
+                    aggregate[key] += diff
+                member_diffs.append(diffs)
+
+            risk: int | float = 0
+            for key in ordered_keys:
+                risk += abs(aggregate[key]) * weights[key]
+            feasible = risk <= total_budget
+            if feasible:
+                feasible = not any(
+                    key in key_budgets
+                    and abs(aggregate[key]) > key_budgets[key]
+                    for key in ordered_keys
+                )
+            verdicts.append((aggregate, member_diffs, feasible))
+        return verdicts
 
     @staticmethod
     def _require_size_bound(value: Any, name: str) -> int:
