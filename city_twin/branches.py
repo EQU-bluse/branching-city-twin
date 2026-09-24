@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from city_twin.event_graph import EventGraph
@@ -878,9 +879,193 @@ class BranchStore:
         nor aliasing internal state. Success or failure never modifies the
         graph, branch heads, audit or idempotency records.
         """
-        # --- All inputs finish validating before any branch is looked up,
-        # mirroring divergence_summary's reference, branch, points, keys
-        # order with series walked in insertion order. ---
+        per_series = self._validate_series(reference, series)
+        ordered_keys = self._validate_keys(keys)
+        views = self._capture_matrix_views(reference, per_series)
+
+        rows: list[dict[str, object]] = []
+        for series_name, ordered_points in views:
+            summaries = self._divergence_summaries(
+                ordered_points, ordered_keys
+            )
+            reconverged = tuple(
+                summary["first_diverged"] is not None
+                and summary["last"]["left"]["value"]
+                == summary["last"]["right"]["value"]
+                for summary in summaries
+            )
+            rows.append(
+                {
+                    "branch": series_name,
+                    "summaries": summaries,
+                    "reconverged": reconverged,
+                }
+            )
+        return tuple(rows)
+
+    def rank_impacts(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        weights: dict[str, int | float],
+    ) -> tuple[dict[str, object], ...]:
+        """Rank series branches by their weighted, still-open impact risk.
+
+        Shares :meth:`divergence_matrix`'s ``reference`` and ``series``
+        parameters, validation order and errors, empty-container handling
+        and branch/node closure rules exactly; ``weights`` stands where
+        ``divergence_matrix`` takes ``keys``. ``weights`` must be a dict
+        (else :class:`TypeError`); its entries are checked in insertion
+        order, a non-``str`` key raising :class:`TypeError`, an empty key
+        :class:`ValueError`, and a weight that is a :class:`bool` or
+        neither an :class:`int` nor a :class:`float` raising
+        :class:`TypeError`, while a negative, NaN or infinite weight
+        raises :class:`ValueError`. The weight keys -- Unicode-sorted --
+        are exactly the state keys the ranking inspects. All inputs
+        finish validating before the branches are looked up, reference
+        first and then the series in ``series`` insertion order (unknown
+        branch :class:`KeyError`, a node absent from the graph or the
+        named branch's current head closure :class:`KeyError`, left
+        before right, pairs in points order).
+
+        Every series, point and key is answered from one shared read-only
+        historical view, captured exactly as in
+        :meth:`divergence_matrix`. Each series contributes a fresh dict
+        whose keys are ordered ``branch, score, first_impact,
+        unresolved, attributions``: ``branch`` is the series branch name.
+        ``score`` is the weighted risk at the final checkpoint -- the
+        sum, over keys whose final left and right values differ, of the
+        absolute value difference times the key's weight, produced by
+        ordinary Python arithmetic (an :class:`int` when every term is,
+        otherwise a :class:`float`), never rounded and never a negative
+        zero. ``first_impact`` is the smallest point index at which any
+        inspected key has ever diverged (the minimum non-``None``
+        ``first_diverged`` across the key summaries), or ``None`` when the
+        sides never diverge on any key. ``unresolved`` is the tuple of
+        keys whose final left and right values differ, ordered by Unicode
+        code point. ``attributions`` is a tuple aligned with
+        ``unresolved``; each entry is a fresh, detached deep copy of the
+        matrix's final-point attribution for that key -- the
+        ``key, fork, left, right`` dict found in
+        :meth:`divergence_matrix`'s summary ``last`` -- item-wise equal
+        to it: the final left and right replayed values and cause events
+        appear in ``left``/``right`` as ``value`` and ``cause``, the two
+        sides' causal paths as ``path``, alongside ``affected``.
+
+        Rows are ordered by ``score`` descending, then ``first_impact``
+        ascending with ``None`` sorting after every integer, then the
+        branch name by Unicode code point. An empty ``series`` still
+        validates ``reference`` and ``weights`` and looks the reference
+        branch up, yielding an empty tuple; empty ``weights`` still
+        validates every branch and historical node, and each series then
+        contributes a zero ``score``, ``None`` ``first_impact`` and empty
+        ``unresolved``/``attributions``. The tuples and dicts at every
+        level are freshly built, neither sharing objects with each other
+        nor aliasing internal state. Success or failure never modifies
+        the graph, branch heads, audit or idempotency records.
+        """
+        per_series = self._validate_series(reference, series)
+        accepted_weights = self._validate_weights(weights)
+        ordered_keys = tuple(sorted(accepted_weights))
+        views = self._capture_matrix_views(reference, per_series)
+
+        rows: list[dict[str, object]] = []
+        for series_name, ordered_points in views:
+            summaries = self._divergence_summaries(
+                ordered_points, ordered_keys
+            )
+            firsts = [
+                summary["first_diverged"]
+                for summary in summaries
+                if summary["first_diverged"] is not None
+            ]
+            first_impact: int | None = min(firsts) if firsts else None
+
+            score: int | float = 0
+            unresolved_keys: list[str] = []
+            attributions: list[dict[str, object]] = []
+            # ordered_keys and summaries share Unicode code point order, so
+            # a single zip pass already visits unresolved keys in order.
+            for key, summary in zip(ordered_keys, summaries):
+                last = summary["last"]
+                left_value = last["left"]["value"]
+                right_value = last["right"]["value"]
+                if left_value == right_value:
+                    continue
+                unresolved_keys.append(key)
+                score += abs(left_value - right_value) * accepted_weights[key]
+                # Item-wise equal to the matrix's final-point attribution
+                # for this key (key, fork, left, right), freshly detached.
+                attributions.append(self._copy_attribution(last))
+            # A float summation can land on a signed -0.0 (e.g. a -0.0
+            # weight); adding positive zero normalizes the sign while
+            # keeping the float type arithmetic produced.
+            if isinstance(score, float):
+                score += 0.0
+
+            rows.append(
+                {
+                    "branch": series_name,
+                    "score": score,
+                    "first_impact": first_impact,
+                    "unresolved": tuple(unresolved_keys),
+                    "attributions": tuple(attributions),
+                }
+            )
+
+        rows.sort(
+            key=lambda row: (
+                -row["score"],
+                row["first_impact"] is None,
+                row["first_impact"] if row["first_impact"] is not None else 0,
+                row["branch"],
+            )
+        )
+        return tuple(rows)
+
+    @staticmethod
+    def _copy_side(side: dict[str, Any]) -> dict[str, object]:
+        """Copy one ``value, cause, path, affected`` attribution side."""
+        return {
+            "value": side["value"],
+            "cause": side["cause"],
+            "path": tuple(side["path"]),
+            "affected": tuple(side["affected"]),
+        }
+
+    @classmethod
+    def _copy_attribution(
+        cls,
+        record: dict[str, Any],
+    ) -> dict[str, object]:
+        """Deep-copy a ``key, fork, left, right`` attribution dict.
+
+        The copied result shares no tuples or dicts with the source, so it
+        stays detached from the per-call attributions and internal state.
+        """
+        return {
+            "key": record["key"],
+            "fork": record["fork"],
+            "left": cls._copy_side(record["left"]),
+            "right": cls._copy_side(record["right"]),
+        }
+
+    def _validate_series(
+        self,
+        reference: Any,
+        series: Any,
+    ) -> list[tuple[str, tuple[tuple[str, str], ...]]]:
+        """Validate ``reference`` and a ``series`` dict for the matrix family.
+
+        Shared by :meth:`divergence_matrix` and :meth:`rank_impacts` so
+        both apply identical validation, in the same order, before any
+        branch is looked up: ``reference`` is checked first (non-``str``
+        :class:`TypeError`, empty :class:`ValueError`), then ``series``
+        must be a dict (else :class:`TypeError`), its keys walked in
+        insertion order (non-``str`` :class:`TypeError`, empty or
+        ``reference``-equal :class:`ValueError`), and each series' points
+        validated via :meth:`_validate_points`.
+        """
         self._require_nonempty_str(reference, "reference")
         if not isinstance(series, dict):
             raise TypeError(
@@ -896,13 +1081,27 @@ class BranchStore:
                 )
             self._validate_points(series_points)
             per_series.append((series_name, series_points))
-        ordered_keys = self._validate_keys(keys)
+        return per_series
 
+    def _capture_matrix_views(
+        self,
+        reference: str,
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]],
+    ) -> list[
+        tuple[str, list[tuple[list[str], list[str], str, str]] | None]
+    ]:
+        """Look branches up and capture the shared matrix read-only view.
+
+        Shared by :meth:`divergence_matrix` and :meth:`rank_impacts`: the
+        reference branch is looked up first, then each series branch in
+        insertion order with its nodes checked left before right, pairs
+        in points order -- an unknown branch or a node absent from the
+        graph or the named branch's current head closure raises
+        :class:`KeyError`. The reference head closure and every series
+        branch's and node's own closure are taken once, before results
+        are built.
+        """
         self._require_known_branch(reference)
-
-        # Capture the shared read-only view before any result is built:
-        # the reference head closure serves every series, and each series
-        # branch's own closure plus its nodes' closures are taken once.
         reference_head_closure = set(
             self._graph._ordered_ancestors(self._heads[reference])
         )
@@ -939,50 +1138,47 @@ class BranchStore:
                     for node_a, node_b in series_points
                 ]
             views.append((series_name, ordered_points))
-
-        rows: list[dict[str, object]] = []
-        for series_name, ordered_points in views:
-            summaries = self._divergence_summaries(
-                ordered_points, ordered_keys
-            )
-            reconverged = tuple(
-                summary["first_diverged"] is not None
-                and summary["last"]["left"]["value"]
-                == summary["last"]["right"]["value"]
-                for summary in summaries
-            )
-            rows.append(
-                {
-                    "branch": series_name,
-                    "summaries": summaries,
-                    "reconverged": reconverged,
-                }
-            )
-        return tuple(rows)
+        return views
 
     @staticmethod
-    def _copy_attribution(
-        record: dict[str, Any],
-    ) -> dict[str, object]:
-        """Deep-copy a ``key, fork, left, right`` attribution dict.
+    def _validate_weights(
+        weights: Any,
+    ) -> dict[str, int | float]:
+        """Validate a state-key weights dict and return a detached copy.
 
-        The copied result shares no tuples or dicts with the source, so it
-        stays detached from the per-call attributions and internal state.
+        Used by :meth:`rank_impacts` in the position the rest of the
+        divergence family validates ``keys``: a non-dict raises
+        :class:`TypeError`; entries are walked in insertion order, a
+        non-``str`` key raising :class:`TypeError`, an empty key
+        :class:`ValueError`, and a :class:`bool` or non-``int``/non-
+        ``float`` weight raising :class:`TypeError`, while a negative,
+        NaN or (positive or negative) infinite weight raises
+        :class:`ValueError`. The returned dict is a caller-independent
+        copy with the accepted weights, keys present for later Unicode
+        sorting.
         """
-        def copy_side(side: dict[str, Any]) -> dict[str, object]:
-            return {
-                "value": side["value"],
-                "cause": side["cause"],
-                "path": tuple(side["path"]),
-                "affected": tuple(side["affected"]),
-            }
-
-        return {
-            "key": record["key"],
-            "fork": record["fork"],
-            "left": copy_side(record["left"]),
-            "right": copy_side(record["right"]),
-        }
+        if not isinstance(weights, dict):
+            raise TypeError(
+                f"weights must be a dict, got {type(weights).__name__}"
+            )
+        accepted: dict[str, int | float] = {}
+        for key, weight in weights.items():
+            EventGraph._require_nonempty_str(key, "weight key")
+            # bool is a subclass of int, but must not be accepted as one.
+            if isinstance(weight, bool) or not isinstance(
+                weight, (int, float)
+            ):
+                raise TypeError(
+                    f"weight for {key!r} must be an int or float, got "
+                    f"{type(weight).__name__}"
+                )
+            if weight < 0 or not math.isfinite(weight):
+                raise ValueError(
+                    f"weight for {key!r} must be a finite, non-negative "
+                    "number"
+                )
+            accepted[key] = weight
+        return accepted
 
     @staticmethod
     def _validate_points(points: Any) -> None:
