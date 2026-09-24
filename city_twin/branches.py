@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from typing import Any
 
@@ -1802,6 +1803,555 @@ class BranchStore:
             )
         )
         return tuple(rows)
+
+    def search_combinations(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        weights: dict[str, int | float],
+        total_budget: int | float,
+        key_budgets: dict[str, int | float],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> dict[str, object]:
+        """Search budget-feasible subsets of series branches, read-only.
+
+        Where :meth:`combination_budget` judges given combinations, this
+        method actively enumerates subsets of the ``series`` pool within a
+        size window and keeps the budget-feasible Pareto frontier.
+        ``series``, ``weights``, ``total_budget`` and ``key_budgets`` keep
+        exactly :meth:`combination_budget`'s numeric conventions, node
+        closure rules and error types: series points are
+        ``(reference node, series node)`` checkpoints, and every pool
+        member must have the same checkpoint count with the same reference
+        node at each position (else :class:`ValueError`).
+
+        ``reference`` and ``series`` are validated first, in exactly
+        :meth:`combination_budget`'s order and with its errors, followed by
+        ``weights``, ``total_budget`` and ``key_budgets``. The search
+        parameters are then validated in signature order: ``min_size`` and
+        ``max_size`` must be non-``bool`` :class:`int` values (anything
+        else, including :class:`bool`, raises :class:`TypeError`), with a
+        negative ``min_size`` or a ``max_size`` smaller than ``min_size``
+        or larger than the pool size raising :class:`ValueError`;
+        ``required`` and ``exclusive_pairs`` must be tuples (else
+        :class:`TypeError`), each exclusive entry a length-2 tuple (else
+        :class:`TypeError`), and their member names are walked in input
+        order -- a non-``str`` name raises :class:`TypeError`, and an empty
+        name, a duplicate or pool-unknown member, a self-exclusive pair, a
+        duplicate unordered exclusive pair, or two required members that
+        are mutually exclusive raises :class:`ValueError`; ``limit`` comes
+        last and must be a non-``bool`` :class:`int` no smaller than ``1``
+        (else :class:`TypeError`/:class:`ValueError`). Only after every
+        input has validated are branches looked up -- reference first,
+        then the series in ``series`` insertion order (unknown branch
+        :class:`KeyError`) -- and nodes checked per series, left before
+        right, pairs in points order (:class:`KeyError` when absent from
+        the graph or the named branch's current head closure).
+
+        Subsets are enumerated by ascending member count and, within a
+        size, by the Unicode code point order of the sorted member-name
+        tuple. Enumerating more than ``limit`` candidates raises
+        :class:`ValueError`; no partial result is returned. An empty pool
+        accepts only the zero-to-zero size window, and the empty subset's
+        risk is zero. Each candidate reuses the combination-budget
+        accounting -- per-checkpoint signed member differences summed per
+        key, total risk as the sum of absolute aggregates times weights,
+        the same strictly-greater total/per-key breach tests -- all from
+        one shared read-only historical view. The rejection first causes,
+        in order, are: a missing required member
+        (``reason="missing_required"``), a hit exclusive pair
+        (``reason="exclusive_pair"``), the earliest checkpoint whose total
+        risk is over budget (``reason="total_budget"``), and at that
+        checkpoint the first key in Unicode order over its per-key budget
+        (``reason="key_budget"``).
+
+        The result is a fresh dict whose keys are ordered
+        ``frontier, rejected``. Each rejected item is a fresh dict with
+        keys ordered ``members, reason, checkpoint, key, overrun``: the
+        sorted member-name tuple, the reason code, the breaching checkpoint
+        index, the breaching state key and the overrun magnitude (total
+        risk above the total budget, or the key's excess aggregate
+        difference times its weight); values not applicable to the reason
+        are ``None``. Rejected items keep enumeration order. Each feasible
+        item is a fresh dict with keys ordered ``members, risk,
+        contributions, attributions``: the sorted member tuple, the final
+        checkpoint's risk, each member's marginal contribution at that
+        checkpoint (full risk minus risk with that member removed, in
+        member order), and the independent per-member attributions -- one
+        fresh ``key, fork, left, right`` historical divergence attribution
+        per member per weight key (members outer, keys in Unicode order
+        inner), each detached from every other returned object; both
+        tuples are empty for the empty subset and the no-checkpoint case.
+        The frontier keeps exactly the feasible subsets no other feasible
+        subset weakly dominates -- none with no fewer members and no higher
+        risk that is strictly better on at least one -- and is sorted by
+        descending member count, ascending final risk, then ascending
+        member-name tuple. Every returned level is freshly built and
+        detached from internal state. Success or failure never modifies
+        the graph, branch heads, audit or idempotency records, and no
+        existing combination-budget or divergence interface changes.
+        """
+        # --- All inputs finish validating before any branch is looked up,
+        # mirroring combination_budget's reference, series, weights and
+        # budget order. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        anchor_points: tuple[tuple[str, str], ...] | None = None
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            if anchor_points is None:
+                anchor_points = series_points
+            elif len(series_points) != len(anchor_points) or any(
+                point[0] != anchor_point[0]
+                for point, anchor_point in zip(
+                    series_points, anchor_points
+                )
+            ):
+                raise ValueError(
+                    "all series must share checkpoint count and reference "
+                    "nodes"
+                )
+            per_series.append((series_name, series_points))
+        ordered_keys = self._validate_weights(weights)
+        self._require_finite_budget(total_budget, "total budget")
+        if not isinstance(key_budgets, dict):
+            raise TypeError(
+                "key_budgets must be a dict, got "
+                f"{type(key_budgets).__name__}"
+            )
+        for budget_key, budget_limit in key_budgets.items():
+            EventGraph._require_nonempty_str(
+                budget_key, "per-key budget key"
+            )
+            self._require_finite_budget(
+                budget_limit, f"per-key budget for {budget_key!r}"
+            )
+            if budget_key not in weights:
+                raise ValueError(
+                    f"per-key budget key {budget_key!r} is absent from weights"
+                )
+
+        # Size bounds, required members and exclusive pairs are validated
+        # in signature order; limit is last. Each integer parameter shares
+        # the non-bool int contract, with its range checked in place.
+        min_size_value = self._require_size_bound(min_size, "min_size")
+        if min_size_value < 0:
+            raise ValueError("min_size must be non-negative")
+        max_size_value = self._require_size_bound(max_size, "max_size")
+        if max_size_value < min_size_value:
+            raise ValueError("max_size must be >= min_size")
+        if max_size_value > len(per_series):
+            raise ValueError("max_size must not exceed the number of series")
+
+        if not isinstance(required, tuple):
+            raise TypeError(
+                f"required must be a tuple, got {type(required).__name__}"
+            )
+        required_members: list[str] = []
+        seen_required: set[str] = set()
+        for member in required:
+            self._require_nonempty_str(member, "required member")
+            if member in seen_required:
+                raise ValueError(f"duplicate required member {member!r}")
+            seen_required.add(member)
+            if member not in series:
+                raise ValueError(
+                    f"required member {member!r} is absent from series"
+                )
+            required_members.append(member)
+
+        if not isinstance(exclusive_pairs, tuple):
+            raise TypeError(
+                "exclusive_pairs must be a tuple, got "
+                f"{type(exclusive_pairs).__name__}"
+            )
+        ordered_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for pair in exclusive_pairs:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(
+                    "each exclusive pair must be a length-2 tuple of "
+                    f"member names, got {pair!r} ({type(pair).__name__})"
+                )
+            member_a, member_b = pair
+            self._require_nonempty_str(member_a, "exclusive member")
+            self._require_nonempty_str(member_b, "exclusive member")
+            if member_a == member_b:
+                raise ValueError(
+                    f"member {member_a!r} cannot be mutually exclusive "
+                    "with itself"
+                )
+            if member_a not in series:
+                raise ValueError(
+                    f"exclusive member {member_a!r} is absent from series"
+                )
+            if member_b not in series:
+                raise ValueError(
+                    f"exclusive member {member_b!r} is absent from series"
+                )
+            normalized = tuple(sorted(pair))
+            if normalized in seen_pairs:
+                raise ValueError(f"duplicate exclusive pair {normalized!r}")
+            seen_pairs.add(normalized)
+            ordered_pairs.append((member_a, member_b))
+        required_set = set(required_members)
+        for member_a, member_b in ordered_pairs:
+            if member_a in required_set and member_b in required_set:
+                raise ValueError(
+                    f"required members {member_a!r} and {member_b!r} are "
+                    "mutually exclusive"
+                )
+
+        limit_value = self._require_size_bound(limit, "limit")
+        if limit_value < 1:
+            raise ValueError("limit must be >= 1")
+
+        self._require_known_branch(reference)
+
+        # Capture the single read-only historical view before any subset is
+        # evaluated, exactly as in combination_budget.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views_by_name: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ] = {}
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            views_by_name[series_name] = [
+                (
+                    self._graph._ordered_ancestors(node_a),
+                    self._graph._ordered_ancestors(node_b),
+                    node_a,
+                    node_b,
+                )
+                for node_a, node_b in series_points
+            ]
+
+        # The Unicode-sorted pool fixes the canonical member tuple and the
+        # code point enumeration order within each size.
+        pool = tuple(sorted(name for name, _ in per_series))
+
+        rejected: list[dict[str, object]] = []
+        feasible: list[
+            tuple[
+                tuple[str, ...],
+                int | float,
+                tuple[int | float, ...],
+                tuple[tuple[dict[str, object], ...], ...],
+            ]
+        ] = []
+        candidate_count = 0
+        for size in range(min_size_value, max_size_value + 1):
+            for combo in itertools.combinations(pool, size):
+                candidate_count += 1
+                if candidate_count > limit_value:
+                    raise ValueError(
+                        "search candidate limit exceeded: more than "
+                        f"{limit_value} candidates in size window"
+                    )
+                combo_set = set(combo)
+
+                # Rejection first causes: required coverage, then an
+                # exclusive pair, before any budget work is done.
+                if not required_set.issubset(combo_set):
+                    rejected.append(
+                        {
+                            "members": combo,
+                            "reason": "missing_required",
+                            "checkpoint": None,
+                            "key": None,
+                            "overrun": None,
+                        }
+                    )
+                    continue
+                hit_pair = next(
+                    (
+                        pair
+                        for pair in ordered_pairs
+                        if pair[0] in combo_set and pair[1] in combo_set
+                    ),
+                    None,
+                )
+                if hit_pair is not None:
+                    rejected.append(
+                        {
+                            "members": combo,
+                            "reason": "exclusive_pair",
+                            "checkpoint": None,
+                            "key": None,
+                            "overrun": None,
+                        }
+                    )
+                    continue
+
+                outcome = self._evaluate_subset_view(
+                    [views_by_name[member] for member in combo],
+                    ordered_keys,
+                    weights,
+                    key_budgets,
+                    total_budget,
+                )
+                if outcome[0] == "reject":
+                    _, checkpoint, reason, breach_key, overrun = outcome
+                    rejected.append(
+                        {
+                            "members": combo,
+                            "reason": reason,
+                            "checkpoint": checkpoint,
+                            "key": breach_key,
+                            "overrun": overrun,
+                        }
+                    )
+                    continue
+
+                # Feasible: the last checkpoint's aggregate answers the
+                # final risk and the marginal contributions.
+                (
+                    _,
+                    final_risk,
+                    final_aggregate,
+                    final_member_diffs,
+                    final_position,
+                ) = outcome
+                contributions: list[int | float] = []
+                for member_index in range(len(combo)):
+                    if final_position is None:
+                        contributions.append(0)
+                        continue
+                    excluded_risk: int | float = 0
+                    for key in ordered_keys:
+                        excluded = (
+                            final_aggregate[key]
+                            - final_member_diffs[member_index][key]
+                        )
+                        excluded_risk += abs(excluded) * weights[key]
+                    if excluded_risk == 0:
+                        excluded_risk = (
+                            0
+                            if isinstance(excluded_risk, int)
+                            else 0.0
+                        )
+                    contribution = final_risk - excluded_risk
+                    if contribution == 0:
+                        contribution = (
+                            0
+                            if isinstance(contribution, int)
+                            else 0.0
+                        )
+                    contributions.append(contribution)
+
+                attributions: tuple[
+                    tuple[dict[str, object], ...], ...
+                ] = ()
+                if final_position is not None:
+                    # Independent copies of the historical divergence
+                    # attribution at the final checkpoint, member outer and
+                    # key inner, detached from one another and the store.
+                    attributions = tuple(
+                        tuple(
+                            self._copy_attribution(
+                                self._attribute_divergence_on_orders(
+                                    left_order,
+                                    right_order,
+                                    node_a,
+                                    node_b,
+                                    key,
+                                )
+                            )
+                            for key in ordered_keys
+                        )
+                        for (
+                            left_order,
+                            right_order,
+                            node_a,
+                            node_b,
+                        ) in final_position
+                    )
+
+                feasible.append(
+                    (
+                        combo,
+                        final_risk,
+                        tuple(contributions),
+                        attributions,
+                    )
+                )
+
+        # Pareto frontier: drop a feasible subset when another has no fewer
+        # members and no higher risk and is strictly better on one of them.
+        frontier_entries: list[
+            tuple[
+                tuple[str, ...],
+                int | float,
+                tuple[int | float, ...],
+                tuple[tuple[dict[str, object], ...], ...],
+            ]
+        ] = []
+        for entry in feasible:
+            members, risk, _, _ = entry
+            dominated = any(
+                len(other_members) >= len(members)
+                and other_risk <= risk
+                and (
+                    len(other_members) > len(members)
+                    or other_risk < risk
+                )
+                for other_members, other_risk, _, _ in feasible
+            )
+            if not dominated:
+                frontier_entries.append(entry)
+        frontier_entries.sort(
+            key=lambda entry: (-len(entry[0]), entry[1], entry[0])
+        )
+
+        frontier = [
+            {
+                "members": members,
+                "risk": risk,
+                "contributions": tuple(contributions),
+                "attributions": tuple(
+                    tuple(member_attributions)
+                    for member_attributions in attributions
+                ),
+            }
+            for members, risk, contributions, attributions in frontier_entries
+        ]
+        return {"frontier": tuple(frontier), "rejected": tuple(rejected)}
+
+    def _evaluate_subset_view(
+        self,
+        member_views: list[list[tuple[list[str], list[str], str, str]]],
+        ordered_keys: tuple[str, ...],
+        weights: dict[str, int | float],
+        key_budgets: dict[str, int | float],
+        total_budget: int | float,
+    ) -> tuple[object, ...]:
+        """Apply the combination-budget accounting to one enumerated subset.
+
+        Returns a reject tuple ``("reject", checkpoint, reason, key,
+        overrun)`` at the earliest breaching checkpoint -- the total budget
+        before the first per-key breach in Unicode key order -- or a
+        feasible tuple carrying the final checkpoint's risk, per-key
+        aggregate, per-member signed differences and captured positions.
+        An empty subset (or a pool without checkpoints) is feasible with
+        zero risk. All inputs come from the caller's captured read-only
+        view.
+        """
+        point_count = len(member_views[0]) if member_views else 0
+        final_risk: int | float = 0
+        final_aggregate: dict[str, int] = {}
+        final_member_diffs: list[dict[str, int]] = []
+        final_position: list[
+            tuple[list[str], list[str], str, str]
+        ] | None = None
+
+        for index in range(point_count):
+            position = [views[index] for views in member_views]
+            # Pool alignment guarantees every member shares this checkpoint's
+            # reference node, so its values are replayed once per point.
+            reference_order = position[0][0]
+            reference_values = {
+                key: self._replayed_value(reference_order, key)
+                for key in ordered_keys
+            }
+            aggregate: dict[str, int] = {key: 0 for key in ordered_keys}
+            member_diffs: list[dict[str, int]] = []
+            for _, right_order, _, _ in position:
+                diffs: dict[str, int] = {}
+                for key in ordered_keys:
+                    diff = (
+                        self._replayed_value(right_order, key)
+                        - reference_values[key]
+                    )
+                    diffs[key] = diff
+                    aggregate[key] += diff
+                member_diffs.append(diffs)
+
+            risk: int | float = 0
+            for key in ordered_keys:
+                risk += abs(aggregate[key]) * weights[key]
+            if risk == 0:
+                risk = 0 if isinstance(risk, int) else 0.0
+
+            # At one checkpoint the total breach outranks every per-key
+            # breach; the first breaching key by Unicode order is reported.
+            if risk > total_budget:
+                return (
+                    "reject",
+                    index,
+                    "total_budget",
+                    None,
+                    risk - total_budget,
+                )
+            for key in ordered_keys:
+                if (
+                    key in key_budgets
+                    and abs(aggregate[key]) > key_budgets[key]
+                ):
+                    return (
+                        "reject",
+                        index,
+                        "key_budget",
+                        key,
+                        (abs(aggregate[key]) - key_budgets[key])
+                        * weights[key],
+                    )
+
+            final_risk = risk
+            final_aggregate = aggregate
+            final_member_diffs = member_diffs
+            final_position = position
+
+        return (
+            "feasible",
+            final_risk,
+            final_aggregate,
+            final_member_diffs,
+            final_position,
+        )
+
+    @staticmethod
+    def _require_size_bound(value: Any, name: str) -> int:
+        """Validate one non-``bool`` integer size/search parameter.
+
+        ``min_size``, ``max_size`` and ``limit`` share the contract: a
+        :class:`bool` or any non-:class:`int` value raises
+        :class:`TypeError`; the value's range is the caller's concern.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                f"{name} must be an int, got {type(value).__name__}"
+            )
+        return value
 
     @staticmethod
     def _require_finite_budget(value: Any, name: str) -> None:
