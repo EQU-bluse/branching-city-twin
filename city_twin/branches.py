@@ -3377,31 +3377,315 @@ class BranchStore:
         # checkpoint alignment and the candidate cap run on the one frozen
         # view every result is taken from.
         prepared = self._capture_frontier_view(validated)
+        return self._slice_cascade(
+            prepared,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+        )
 
-        # Build the full cascade on the frozen view; the slice only
-        # restricts its existing nodes, edges and gaps.
+    def cascade_slice_diff(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        before: int,
+        after: int,
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+    ) -> dict[str, object]:
+        """Diff two read-only frozen cascade slices at historical checkpoints.
+
+        The read-only two-checkpoint companion of :meth:`cascade_slice`: it is
+        called with every one of that query's ordinary arguments -- none has a
+        default -- then two checkpoint indices ``before`` and ``after`` placed
+        immediately before the existing cause set, and finally that query's
+        ``causes``, ``direction``, ``depth`` and ``node_limit``. The ordinary
+        inputs are validated first in exactly :meth:`cascade_slice`'s order;
+        ``before`` and ``after`` are then validated before the existing slice
+        range inputs, all before any state is queried. Each index must be a
+        non-``bool`` :class:`int` (else :class:`TypeError`); a negative
+        index, an out-of-range index, or ``before`` greater than ``after``
+        raises :class:`ValueError`. The branch and historical-node lookup
+        order, checkpoint alignment, the candidate-count cap and the slice
+        node cap keep exactly :meth:`cascade_slice`'s
+        :class:`KeyError`/:class:`ValueError` contracts and lookup order; any
+        cap breach raises before any result is returned, so no partial diff is
+        ever produced.
+
+        The two indices select common, aligned historical positions: each side
+        uses only the prefix of the checkpoint series from the first point up
+        to and including that index to build its frozen slice, and both
+        prefixes are taken from one read-only historical view captured once.
+        Each side's slice reuses the existing cause, direction, depth and
+        node-cap semantics exactly. A cause event absent from a frozen slice
+        raises :class:`KeyError`: the causes are walked in their input order,
+        the ``before`` side checked before the ``after`` side. An empty
+        ``causes`` tuple still completes every input and state check and
+        returns two empty slices and an empty change set.
+
+        The result is a fresh dict whose keys are ordered
+        ``before, after, changes``: the ``before`` and ``after`` entries are
+        each item-wise equal to the existing slice result on its prefix (the
+        ``nodes, edges, gaps`` structure). ``changes`` groups records by
+        category -- nodes, then edges, then gaps -- and within each category
+        lists removals, additions and content changes in that order. Each
+        record is a fresh dict whose keys are ordered ``kind, identity,
+        before, after``; ``kind`` is the category joined by an underscore
+        to ``removed``, ``added`` or ``changed`` (``node_removed``,
+        ``edge_added``, ``gap_changed`` ...). A node is identified by the
+        pairing of its cause event id and state key; an edge by the node
+        identities (cause/key pairs) of its two ends, never by the
+        endpoint positions inside a slice -- positions are remapped back to node
+        identities before comparison; a gap by its interval and its member
+        combination. The missing side of a removal or addition is ``None``;
+        the present side and both sides of a change are fully isolated
+        copies. Every returned level is freshly built and detached from
+        internal state and shares no objects across levels. The query is
+        read-only: success or failure never modifies the event graph, branch
+        heads, audit or idempotency records, or any existing query.
+        """
+        # Ordinary inputs are validated first, in exactly the existing order,
+        # but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # --- The two checkpoint indices are checked next, before the existing
+        # slice range parameters and before any state is queried. ---
+        before_value = self._require_size_bound(before, "before")
+        if before_value < 0:
+            raise ValueError("before must be non-negative")
+        after_value = self._require_size_bound(after, "after")
+        if after_value < 0:
+            raise ValueError("after must be non-negative")
+        if before_value > after_value:
+            raise ValueError("before must be <= after")
+
+        # --- Existing slice inputs, exactly cascade_slice's order. ---
+        if not isinstance(causes, tuple):
+            raise TypeError(
+                f"causes must be a tuple, got {type(causes).__name__}"
+            )
+        seen_causes: set[str] = set()
+        for cause in causes:
+            self._require_nonempty_str(cause, "cause")
+            if cause in seen_causes:
+                raise ValueError(f"duplicate cause {cause!r}")
+            seen_causes.add(cause)
+        if not isinstance(direction, str):
+            raise TypeError(
+                f"direction must be a str, got {type(direction).__name__}"
+            )
+        if direction not in ("forward", "backward", "both"):
+            raise ValueError(
+                "direction must be 'forward', 'backward' or 'both', got "
+                f"{direction!r}"
+            )
+        depth_value = self._require_size_bound(depth, "depth")
+        if depth_value < 0:
+            raise ValueError("depth must be non-negative")
+        node_limit_value = self._require_size_bound(node_limit, "node_limit")
+        if node_limit_value < 1:
+            raise ValueError("node_limit must be >= 1")
+
+        # The shared frozen view decides checkpoint membership, alignment and the
+        # candidate cap exactly as in cascade_slice; its checkpoint count sets
+        # the two indices' bounds.
+        prepared = self._capture_frontier_view(validated)
+        checkpoint_count = self._prepared_checkpoint_count(prepared)
+        if before_value >= checkpoint_count:
+            raise ValueError(
+                f"before checkpoint {before_value} out of range for "
+                f"{checkpoint_count} checkpoints"
+            )
+        if after_value >= checkpoint_count:
+            raise ValueError(
+                f"after checkpoint {after_value} out of range for "
+                f"{checkpoint_count} checkpoints"
+            )
+
+        before_cascade = self._build_decision_cascade(
+            self._prefix_frontier_view(prepared, before_value)
+        )
+        after_cascade = self._build_decision_cascade(
+            self._prefix_frontier_view(prepared, after_value)
+        )
+
+        if not causes:
+            # All validation and the state lookup are done; an empty set
+            # never trips either node cap.
+            return {
+                "before": {"nodes": (), "edges": (), "gaps": ()},
+                "after": {"nodes": (), "edges": (), "gaps": ()},
+                "changes": (),
+            }
+
+        # Cause presence is checked in cause-input order, the before side
+        # before the after side for each cause, before any expansion runs.
+        before_nodes = before_cascade["nodes"]
+        after_nodes = after_cascade["nodes"]
+        before_by_cause = self._nodes_by_cause(before_nodes)
+        after_by_cause = self._nodes_by_cause(after_nodes)
+        before_starts: list[int] = []
+        after_starts: list[int] = []
+        for cause in causes:
+            before_indices = before_by_cause.get(cause)
+            if before_indices is None:
+                raise KeyError(cause)
+            after_indices = after_by_cause.get(cause)
+            if after_indices is None:
+                raise KeyError(cause)
+            before_starts.extend(before_indices)
+            after_starts.extend(after_indices)
+
+        # Expand both reachable sets before either cap is enforced or any
+        # result object is built, so an over-cap side returns nothing.
+        before_positions = self._slice_positions(
+            before_cascade,
+            before_starts,
+            direction,
+            depth_value,
+            node_limit_value,
+        )
+        after_positions = self._slice_positions(
+            after_cascade,
+            after_starts,
+            direction,
+            depth_value,
+            node_limit_value,
+        )
+
+        before_slice = self._build_slice(before_cascade, before_positions)
+        after_slice = self._build_slice(after_cascade, after_positions)
+        changes = self._diff_cascade_slices(before_slice, after_slice)
+        return {
+            "before": before_slice,
+            "after": after_slice,
+            "changes": changes,
+        }
+
+    @staticmethod
+    def _prepared_checkpoint_count(prepared: dict[str, object]) -> int:
+        """Return the common aligned checkpoint count of a captured view."""
+        views_by_name = prepared["views_by_name"]
+        if not views_by_name:
+            # Pool alignment guarantees one checkpoint count; with no series
+            # every series shares the empty points tuple.
+            return 0
+        first_views = next(iter(views_by_name.values()))
+        return len(first_views)
+
+    @staticmethod
+    def _prefix_frontier_view(
+        prepared: dict[str, object], checkpoint: int
+    ) -> dict[str, object]:
+        """Return a prepared view restricted to its first ``checkpoint+1`` points.
+
+        The one frozen read-only historical view is shared: only the captured
+        checkpoint entries are trimmed to the prefix ending at ``checkpoint``;
+        the closures, nodes, enumerated candidates and scenario figures are the
+        same objects. Building a cascade on the returned view is therefore
+        exactly the existing slice over the prefix inputs -- the search reads
+        each combination's checkpoint views only, and the candidate set never
+        depends on checkpoint count.
+        """
+        prefix_views: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ] = {
+            name: views[: checkpoint + 1]
+            for name, views in prepared["views_by_name"].items()
+        }
+        prefix_prepared = dict(prepared)
+        prefix_prepared["views_by_name"] = prefix_views
+        return prefix_prepared
+
+    def _slice_cascade(
+        self,
+        prepared: dict[str, object],
+        causes: tuple[str, ...],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+    ) -> dict[str, object]:
+        """Build the existing frozen slice from an already validated view.
+
+        Shared by :meth:`cascade_slice` and :meth:`cascade_slice_diff` so
+        both apply the same cause-presence, direction/depth expansion and
+        node-cap semantics. All inputs and the view are already validated;
+        the returned dict and every level are freshly built copies of the
+        cascade's existing nodes, edges and gaps.
+        """
         cascade = self._build_decision_cascade(prepared)
-        nodes = cascade["nodes"]
-        edges = cascade["edges"]
-        gaps = cascade["gaps"]
 
         if not causes:
             # All validation and the state lookup are done; an empty set
             # never trips the node cap.
             return {"nodes": (), "edges": (), "gaps": ()}
 
-        # Map every cause event to all of its cascade nodes (one per state
-        # key), in node order; an absent cause event is a KeyError, with
-        # causes checked in their input order.
-        nodes_by_cause: dict[str, list[int]] = {}
-        for index, node in enumerate(nodes):
-            nodes_by_cause.setdefault(node["cause"], []).append(index)
         starts: list[int] = []
+        by_cause = self._nodes_by_cause(cascade["nodes"])
         for cause in causes:
-            indices = nodes_by_cause.get(cause)
+            indices = by_cause.get(cause)
             if indices is None:
                 raise KeyError(cause)
             starts.extend(indices)
+
+        positions = self._slice_positions(
+            cascade,
+            starts,
+            direction,
+            depth_value,
+            node_limit_value,
+        )
+        return self._build_slice(cascade, positions)
+
+    @staticmethod
+    def _nodes_by_cause(
+        nodes: tuple[dict[str, object], ...]
+    ) -> dict[str, list[int]]:
+        """Map each cause event id to all of its node positions, in order."""
+        by_cause: dict[str, list[int]] = {}
+        for index, node in enumerate(nodes):
+            by_cause.setdefault(node["cause"], []).append(index)
+        return by_cause
+
+    def _slice_positions(
+        self,
+        cascade: dict[str, object],
+        starts: list[int],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+    ) -> list[int]:
+        """Return the sorted selected node positions after the bounded walk.
+
+        Adjacency comes only from the cascade's existing directed edges, so
+        the walk cannot leave the existing evidence. The cap is checked after
+        the full reachable set is known; an over-cap call raises
+        :class:`ValueError` before any slice object is built.
+        """
+        nodes = cascade["nodes"]
+        edges = cascade["edges"]
 
         # Adjacency comes only from the cascade's existing directed edges,
         # so the walk cannot leave the existing evidence.
@@ -3441,22 +3725,27 @@ class BranchStore:
                 f"cascade slice node limit exceeded: {len(selected)} nodes "
                 f"selected, limit is {node_limit_value}"
             )
+        return sorted(selected)
 
-        # Nodes keep the full cascade's order; positions remap densely.
-        selected_positions = sorted(selected)
+    def _build_slice(
+        self, cascade: dict[str, object], selected_positions: list[int]
+    ) -> dict[str, object]:
+        """Project a cascade onto selected node positions, remapping edges.
+
+        Nodes keep the full cascade's order; edge endpoints remap densely;
+        edges keep only records whose two ends are both selected, paths and
+        the existing edge order unchanged; gaps keep only records whose
+        interval is also an interval of a selected node. Every level is a
+        fresh isolated copy.
+        """
+        nodes = cascade["nodes"]
+        edges = cascade["edges"]
+        gaps = cascade["gaps"]
         remapped = {
             old: new for new, old in enumerate(selected_positions)
         }
         slice_nodes = tuple(
-            {
-                "cause": nodes[old]["cause"],
-                "key": nodes[old]["key"],
-                "intervals": tuple(nodes[old]["intervals"]),
-                "checkpoints": tuple(nodes[old]["checkpoints"]),
-                "branches": tuple(nodes[old]["branches"]),
-                "affected": tuple(nodes[old]["affected"]),
-            }
-            for old in selected_positions
+            self._copy_slice_node(nodes[old]) for old in selected_positions
         )
         slice_edges = tuple(
             {
@@ -3465,7 +3754,7 @@ class BranchStore:
                 "path": tuple(edge["path"]),
             }
             for edge in edges
-            if edge["source"] in selected and edge["target"] in selected
+            if edge["source"] in remapped and edge["target"] in remapped
         )
         selected_intervals: set[int] = set()
         for old in selected_positions:
@@ -3483,6 +3772,271 @@ class BranchStore:
             "edges": slice_edges,
             "gaps": slice_gaps,
         }
+
+    @staticmethod
+    def _copy_slice_node(node: dict[str, object]) -> dict[str, object]:
+        """Fresh isolated copy of one slice node record."""
+        return {
+            "cause": node["cause"],
+            "key": node["key"],
+            "intervals": tuple(node["intervals"]),
+            "checkpoints": tuple(node["checkpoints"]),
+            "branches": tuple(node["branches"]),
+            "affected": tuple(node["affected"]),
+        }
+
+    @staticmethod
+    def _copy_slice_edge(edge: dict[str, object]) -> dict[str, object]:
+        """Fresh isolated copy of one slice edge record (positions kept)."""
+        return {
+            "source": edge["source"],
+            "target": edge["target"],
+            "path": tuple(edge["path"]),
+        }
+
+    @staticmethod
+    def _copy_slice_gap(gap: dict[str, object]) -> dict[str, object]:
+        """Fresh isolated copy of one slice gap record."""
+        return {
+            "interval": gap["interval"],
+            "members": tuple(gap["members"]),
+        }
+
+    def _diff_cascade_slices(
+        self,
+        before: dict[str, object],
+        after: dict[str, object],
+    ) -> tuple[dict[str, object], ...]:
+        """Classify the changes between two frozen slices.
+
+        Nodes are keyed by the (cause event, state key) pairing, edges by
+        the node identities of their two ends (positions are first mapped
+        back to those identities, never compared by slice position), and
+        gaps by their (interval, members) combination. Within each category
+        removals, additions and content changes are emitted in that order.
+        Every record and side value is a freshly isolated copy.
+        """
+        before_nodes = before["nodes"]
+        after_nodes = after["nodes"]
+        node_identity = lambda node: (node["cause"], node["key"])
+        before_node_map = {
+            node_identity(node): node for node in before_nodes
+        }
+        after_node_map = {
+            node_identity(node): node for node in after_nodes
+        }
+        before_node_ids = set(before_node_map)
+        after_node_ids = set(after_node_map)
+
+        def node_change(
+            kind: str,
+            identity: tuple[str, str],
+            before_node: object,
+            after_node: object,
+        ) -> dict[str, object]:
+            return {
+                "kind": kind,
+                "identity": identity,
+                "before": (
+                    None
+                    if before_node is None
+                    else self._copy_slice_node(before_node)
+                ),
+                "after": (
+                    None
+                    if after_node is None
+                    else self._copy_slice_node(after_node)
+                ),
+            }
+
+        node_removed = [
+            node_change(
+                "node_removed",
+                identity,
+                before_node_map[identity],
+                None,
+            )
+            for identity in sorted(before_node_ids - after_node_ids)
+        ]
+        node_added = [
+            node_change(
+                "node_added",
+                identity,
+                None,
+                after_node_map[identity],
+            )
+            for identity in sorted(after_node_ids - before_node_ids)
+        ]
+        node_changed = [
+            node_change(
+                "node_changed",
+                identity,
+                before_node_map[identity],
+                after_node_map[identity],
+            )
+            for identity in sorted(before_node_ids & after_node_ids)
+            if before_node_map[identity] != after_node_map[identity]
+        ]
+
+        # Edges are compared by endpoint node identities only, never by
+        # slice position: positions are remapped back to (cause, key)
+        # node identities first. The path stays content, so the same
+        # endpoints with a different path (or different remapped
+        # positions) is an edge change, not a different edge.
+        def edge_identity(
+            edge: dict[str, object],
+            slice_nodes: tuple[dict[str, object], ...],
+        ) -> tuple[tuple[str, str], tuple[str, str]]:
+            # Endpoint positions are first restored to node identities
+            # (cause event, state key) before any comparison.
+            source = node_identity(slice_nodes[edge["source"]])
+            target = node_identity(slice_nodes[edge["target"]])
+            return (source, target)
+
+        before_edges: dict[
+            tuple[object, ...], dict[str, object]
+        ] = {}
+        for edge in before["edges"]:
+            before_edges[edge_identity(edge, before_nodes)] = edge
+        after_edges: dict[
+            tuple[object, ...], dict[str, object]
+        ] = {}
+        for edge in after["edges"]:
+            after_edges[edge_identity(edge, after_nodes)] = edge
+        before_edge_ids = set(before_edges)
+        after_edge_ids = set(after_edges)
+
+        def edge_record(
+            kind: str,
+            identity: tuple[object, ...],
+            edge_before: object,
+            edge_after: object,
+        ) -> dict[str, object]:
+            # The identity is only the two endpoint node identities
+            # (source first), independent of either slice's positions.
+            return {
+                "kind": kind,
+                "identity": identity,
+                "before": (
+                    None
+                    if edge_before is None
+                    else self._copy_slice_edge(edge_before)
+                ),
+                "after": (
+                    None
+                    if edge_after is None
+                    else self._copy_slice_edge(edge_after)
+                ),
+            }
+
+        edge_removed = [
+            edge_record(
+                "edge_removed",
+                identity,
+                before_edges[identity],
+                None,
+            )
+            for identity in sorted(before_edge_ids - after_edge_ids)
+        ]
+        edge_added = [
+            edge_record(
+                "edge_added",
+                identity,
+                None,
+                after_edges[identity],
+            )
+            for identity in sorted(after_edge_ids - before_edge_ids)
+        ]
+        # Common endpoint/path identities always carry equal content (the path
+        # is part of the identity); a kept edge still changes record when
+        # its endpoints' slice positions differ.
+        edge_changed = [
+            edge_record(
+                "edge_changed",
+                identity,
+                before_edges[identity],
+                after_edges[identity],
+            )
+            for identity in sorted(before_edge_ids & after_edge_ids)
+            if before_edges[identity] != after_edges[identity]
+        ]
+
+        # Gaps are identified by interval and member combination only.
+        def gap_identity(
+            gap: dict[str, object]
+        ) -> tuple[int, tuple[str, ...]]:
+            return (gap["interval"], tuple(gap["members"]))
+
+        before_gap_map = {
+            gap_identity(gap): gap for gap in before["gaps"]
+        }
+        after_gap_map = {
+            gap_identity(gap): gap for gap in after["gaps"]
+        }
+        before_gap_ids = set(before_gap_map)
+        after_gap_ids = set(after_gap_map)
+
+        def gap_record(
+            kind: str,
+            identity: tuple[int, tuple[str, ...]],
+            gap_before: object,
+            gap_after: object,
+        ) -> dict[str, object]:
+            return {
+                "kind": kind,
+                "identity": identity,
+                "before": (
+                    None
+                    if gap_before is None
+                    else self._copy_slice_gap(gap_before)
+                ),
+                "after": (
+                    None
+                    if gap_after is None
+                    else self._copy_slice_gap(gap_after)
+                ),
+            }
+
+        gap_removed = [
+            gap_record(
+                "gap_removed",
+                identity,
+                before_gap_map[identity],
+                None,
+            )
+            for identity in sorted(before_gap_ids - after_gap_ids)
+        ]
+        gap_added = [
+            gap_record(
+                "gap_added",
+                identity,
+                None,
+                after_gap_map[identity],
+            )
+            for identity in sorted(after_gap_ids - before_gap_ids)
+        ]
+        gap_changed = [
+            gap_record(
+                "gap_changed",
+                identity,
+                before_gap_map[identity],
+                after_gap_map[identity],
+            )
+            for identity in sorted(before_gap_ids & after_gap_ids)
+            if before_gap_map[identity] != after_gap_map[identity]
+        ]
+
+        return tuple(
+            node_removed
+            + node_added
+            + node_changed
+            + edge_removed
+            + edge_added
+            + edge_changed
+            + gap_removed
+            + gap_added
+            + gap_changed
+        )
 
     def _cascade_side_order(
         self,
