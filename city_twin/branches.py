@@ -2631,6 +2631,484 @@ class BranchStore:
             "combinations": tuple(combination_rows),
         }
 
+    def frontier_breakpoints(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> dict[str, object]:
+        """Locate the perturbation intervals where the frontier changes.
+
+        The read-only breakpoint companion of :meth:`frontier_sensitivity`:
+        instead of several independent scenarios, one ``base_scenario`` is
+        perturbed along a single ``axis`` -- either ``"total_budget"`` or
+        one of its weight keys -- through an ordered ``values`` sequence,
+        and every adjacent pair of values whose search outcomes differ
+        yields one breakpoint record. The pool, size window, required
+        members, exclusive pairs and candidate limit keep exactly
+        :meth:`search_combinations`' contract, and every value is answered
+        from one shared frozen historical view.
+
+        Parameters are validated in signature order (``reference``,
+        ``series``, ``base_scenario``, ``axis``, ``values``, ``min_size``,
+        ``max_size``, ``required``, ``exclusive_pairs``, ``limit``); none
+        has a default. ``reference`` and ``series`` keep exactly
+        :meth:`search_combinations`' contract, including the
+        shared-checkpoint/reference-node alignment error. ``base_scenario``
+        must be a dict (else :class:`TypeError`) containing exactly the
+        keys ``name``, ``weights``, ``total_budget`` and ``key_budgets``
+        -- a missing or extra key raises :class:`ValueError`; its ``name``
+        must be a non-empty ``str`` (a non-``str`` raises
+        :class:`TypeError`, an empty one :class:`ValueError`), and its
+        ``weights``, ``total_budget`` and ``key_budgets`` reuse
+        :meth:`frontier_sensitivity`'s per-scenario numeric, finiteness
+        and key-set rules and error types. ``axis`` must be a ``str``
+        (else :class:`TypeError`); an empty string raises
+        :class:`ValueError`, and anything other than ``"total_budget"`` or
+        an existing base weight key raises :class:`ValueError`. ``values``
+        must be a tuple (else :class:`TypeError`) of at least two
+        strictly increasing numbers: walked in input order, a ``bool`` or
+        non-:class:`int`/:class:`float` value raises :class:`TypeError`,
+        and a negative, NaN, infinite, out-of-order or duplicated value
+        raises :class:`ValueError`. ``min_size``, ``max_size``,
+        ``required``, ``exclusive_pairs`` and ``limit`` then keep exactly
+        the existing search's validation order and errors. Only after
+        every ordinary input has validated are branches looked up --
+        reference first, then the series in ``series`` insertion order
+        (unknown branch :class:`KeyError`) -- and nodes checked per
+        series, left before right, pairs in points order (:class:`KeyError`
+        when absent from the graph or the named branch's current head
+        closure).
+
+        Candidates are enumerated exactly once, by ascending member count
+        and, within a size, by the Unicode code point order of the sorted
+        member-name tuple, exactly as in :meth:`search_combinations`;
+        enumerating more than ``limit`` candidates raises
+        :class:`ValueError` and no partial result is returned. Each value
+        replaces exactly one number of the base scenario -- the total
+        budget when ``axis`` is ``"total_budget"``, otherwise that weight
+        key's weight -- leaving every other input untouched, and is
+        evaluated with the existing deterministic search on the same
+        frozen read-only historical view. An empty pool still runs the
+        size-window, branch, node and candidate-count checks.
+
+        The result is a fresh dict whose keys are ordered ``points,
+        breakpoints``. ``points`` follows ``values`` in input order; each
+        entry is a fresh dict whose keys are ordered ``value, frontier,
+        rejected``, with independent copies of exactly the frontier and
+        rejected row structures :meth:`search_combinations` returns.
+        ``breakpoints`` holds one fresh dict per adjacent value pair whose
+        outcomes differ, in ``values`` order, keyed ``left, right,
+        left_result, right_result, entered, exited, affected,
+        member_delta``: ``left`` and ``right`` are the half-open
+        interval's boundary values; ``left_result`` and ``right_result``
+        are independent deep copies of the two sides' complete point
+        results; ``entered`` and ``exited`` are the combinations joining
+        or leaving the frontier between the two sides; and ``affected``
+        is the combinations whose feasibility or dominator set changed
+        without a frontier-membership change. All three combination lists
+        follow candidate enumeration order and each combination appears in
+        at most one of them per record. ``member_delta`` maps each
+        affected combination's member tuple to its per-member marginal
+        contribution change (right side minus left side, in member order,
+        never negative zero), or to ``None`` when the combination is
+        infeasible on either side. Adjacent values with identical outcomes
+        -- feasibility, dominators and frontier membership all unchanged
+        -- generate no record, and every change is attributed to exactly
+        one adjacent interval. Every returned level is freshly built,
+        independent of the others and detached from internal state.
+        Success or failure never modifies the graph, branch heads, audit
+        or idempotency records, and no existing interface changes.
+        """
+        # --- Ordinary inputs finish validating before any branch is
+        # looked up, mirroring frontier_sensitivity's order. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        anchor_points: tuple[tuple[str, str], ...] | None = None
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            if anchor_points is None:
+                anchor_points = series_points
+            elif len(series_points) != len(anchor_points) or any(
+                point[0] != anchor_point[0]
+                for point, anchor_point in zip(
+                    series_points, anchor_points
+                )
+            ):
+                raise ValueError(
+                    "all series must share checkpoint count and reference "
+                    "nodes"
+                )
+            per_series.append((series_name, series_points))
+
+        # The base scenario reuses the sensitivity scenario contract
+        # exactly: exactly the four public keys, a non-empty name and the
+        # existing numeric, finiteness and key-set rules.
+        (
+            _base_name,
+            base_weights,
+            base_total_budget,
+            base_key_budgets,
+            ordered_keys,
+        ) = self._validate_sensitivity_scenarios((base_scenario,))[0]
+
+        if not isinstance(axis, str):
+            raise TypeError(
+                f"axis must be a str, got {type(axis).__name__}"
+            )
+        if not axis:
+            raise ValueError("axis must be a non-empty str")
+        if axis != "total_budget" and axis not in base_weights:
+            raise ValueError(
+                f"axis {axis!r} is neither 'total_budget' nor a weight key"
+            )
+
+        if not isinstance(values, tuple):
+            raise TypeError(
+                f"values must be a tuple, got {type(values).__name__}"
+            )
+        if len(values) < 2:
+            raise ValueError("values must contain at least two numbers")
+        previous_value: int | float | None = None
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(
+                    "each value must be an int or float, got "
+                    f"{type(value).__name__}"
+                )
+            if isinstance(value, float) and (
+                math.isnan(value) or math.isinf(value)
+            ):
+                raise ValueError("each value must be finite")
+            if value < 0:
+                raise ValueError("each value must be non-negative")
+            if previous_value is not None and value <= previous_value:
+                raise ValueError(
+                    "values must be strictly increasing without duplicates"
+                )
+            previous_value = value
+
+        # The size window, member constraints and limit reuse the existing
+        # search's checks exactly.
+        min_size_value = self._require_size_bound(min_size, "min_size")
+        if min_size_value < 0:
+            raise ValueError("min_size must be non-negative")
+        max_size_value = self._require_size_bound(max_size, "max_size")
+        if max_size_value < min_size_value:
+            raise ValueError("max_size must be >= min_size")
+        if max_size_value > len(per_series):
+            raise ValueError("max_size must not exceed the number of series")
+
+        if not isinstance(required, tuple):
+            raise TypeError(
+                f"required must be a tuple, got {type(required).__name__}"
+            )
+        required_members: list[str] = []
+        seen_required: set[str] = set()
+        for member in required:
+            self._require_nonempty_str(member, "required member")
+            if member in seen_required:
+                raise ValueError(f"duplicate required member {member!r}")
+            seen_required.add(member)
+            if member not in series:
+                raise ValueError(
+                    f"required member {member!r} is absent from series"
+                )
+            required_members.append(member)
+
+        if not isinstance(exclusive_pairs, tuple):
+            raise TypeError(
+                "exclusive_pairs must be a tuple, got "
+                f"{type(exclusive_pairs).__name__}"
+            )
+        ordered_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for pair in exclusive_pairs:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(
+                    "each exclusive pair must be a length-2 tuple of "
+                    f"member names, got {pair!r} ({type(pair).__name__})"
+                )
+            member_a, member_b = pair
+            self._require_nonempty_str(member_a, "exclusive member")
+            self._require_nonempty_str(member_b, "exclusive member")
+            if member_a == member_b:
+                raise ValueError(
+                    f"member {member_a!r} cannot be mutually exclusive "
+                    "with itself"
+                )
+            if member_a not in series:
+                raise ValueError(
+                    f"exclusive member {member_a!r} is absent from series"
+                )
+            if member_b not in series:
+                raise ValueError(
+                    f"exclusive member {member_b!r} is absent from series"
+                )
+            normalized = tuple(sorted(pair))
+            if normalized in seen_pairs:
+                raise ValueError(f"duplicate exclusive pair {normalized!r}")
+            seen_pairs.add(normalized)
+            ordered_pairs.append((member_a, member_b))
+        required_set = set(required_members)
+        for member_a, member_b in ordered_pairs:
+            if member_a in required_set and member_b in required_set:
+                raise ValueError(
+                    f"required members {member_a!r} and {member_b!r} are "
+                    "mutually exclusive"
+                )
+
+        limit_value = self._require_size_bound(limit, "limit")
+        if limit_value < 1:
+            raise ValueError("limit must be >= 1")
+
+        self._require_known_branch(reference)
+
+        # Capture the single frozen read-only historical view every value
+        # is answered from, exactly as in frontier_sensitivity.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views_by_name: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ] = {}
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            views_by_name[series_name] = [
+                (
+                    self._graph._ordered_ancestors(node_a),
+                    self._graph._ordered_ancestors(node_b),
+                    node_a,
+                    node_b,
+                )
+                for node_a, node_b in series_points
+            ]
+
+        # Candidates are enumerated once in the existing search order and
+        # shared by every per-value evaluation. The count cap is a search
+        # constraint, so it runs even with an empty pool.
+        pool = tuple(sorted(name for name, _ in per_series))
+        combos: list[tuple[str, ...]] = []
+        candidate_count = 0
+        for size in range(min_size_value, max_size_value + 1):
+            for combo in itertools.combinations(pool, size):
+                candidate_count += 1
+                if candidate_count > limit_value:
+                    raise ValueError(
+                        "search candidate limit exceeded: more than "
+                        f"{limit_value} candidates in size window"
+                    )
+                combos.append(combo)
+
+        # Each value perturbs exactly one number of the base scenario; the
+        # frozen view, enumeration and search accounting are shared.
+        points: list[dict[str, object]] = []
+        tables: list[dict[str, object]] = []
+        for value in values:
+            if axis == "total_budget":
+                point_weights = base_weights
+                point_total_budget = value
+            else:
+                point_weights = dict(base_weights)
+                point_weights[axis] = value
+                point_total_budget = base_total_budget
+            frontier_rows, rejected_rows, feasible_stats = (
+                self._frontier_search_once(
+                    combos,
+                    views_by_name,
+                    ordered_keys,
+                    point_weights,
+                    base_key_budgets,
+                    point_total_budget,
+                    required_set,
+                    ordered_pairs,
+                )
+            )
+            points.append(
+                {
+                    "value": value,
+                    "frontier": tuple(frontier_rows),
+                    "rejected": tuple(rejected_rows),
+                }
+            )
+            # Dominators per candidate under the existing member-count and
+            # final-risk weak-domination rule, in frontier order; an
+            # infeasible or non-dominated candidate gets an empty tuple.
+            dominators: dict[tuple[str, ...], tuple[tuple[str, ...], ...]] = {}
+            for combo in combos:
+                members = tuple(combo)
+                if members not in feasible_stats:
+                    dominators[members] = ()
+                    continue
+                risk = feasible_stats[members][0]
+                dominated_by = [
+                    other
+                    for other in feasible_stats
+                    if len(other) >= len(members)
+                    and feasible_stats[other][0] <= risk
+                    and (
+                        len(other) > len(members)
+                        or feasible_stats[other][0] < risk
+                    )
+                ]
+                dominated_by.sort(
+                    key=lambda other: (
+                        -len(other),
+                        feasible_stats[other][0],
+                        other,
+                    )
+                )
+                dominators[members] = tuple(
+                    tuple(other) for other in dominated_by
+                )
+            tables.append(
+                {
+                    "frontier": {row["members"] for row in frontier_rows},
+                    "feasible": feasible_stats,
+                    "dominators": dominators,
+                }
+            )
+
+        # One record per adjacent pair whose feasibility, dominator or
+        # frontier-membership state changed for at least one candidate.
+        breakpoints: list[dict[str, object]] = []
+        for index in range(len(values) - 1):
+            left_table = tables[index]
+            right_table = tables[index + 1]
+            entered: list[tuple[str, ...]] = []
+            exited: list[tuple[str, ...]] = []
+            affected: list[tuple[str, ...]] = []
+            member_delta: dict[
+                tuple[str, ...], tuple[int | float, ...] | None
+            ] = {}
+            for combo in combos:
+                members = tuple(combo)
+                on_left = members in left_table["frontier"]
+                on_right = members in right_table["frontier"]
+                if not on_left and on_right:
+                    entered.append(members)
+                    continue
+                if on_left and not on_right:
+                    exited.append(members)
+                    continue
+                feasible_left = members in left_table["feasible"]
+                feasible_right = members in right_table["feasible"]
+                if (
+                    feasible_left == feasible_right
+                    and left_table["dominators"][members]
+                    == right_table["dominators"][members]
+                ):
+                    continue
+                affected.append(members)
+                if feasible_left and feasible_right:
+                    left_contributions = left_table["feasible"][members][1]
+                    right_contributions = right_table["feasible"][members][1]
+                    changes: list[int | float] = []
+                    for member_index in range(len(members)):
+                        change = (
+                            right_contributions[member_index]
+                            - left_contributions[member_index]
+                        )
+                        # A zero change must never surface as negative zero.
+                        if change == 0:
+                            change = 0 if isinstance(change, int) else 0.0
+                        changes.append(change)
+                    member_delta[members] = tuple(changes)
+                else:
+                    member_delta[members] = None
+            if entered or exited or affected:
+                breakpoints.append(
+                    {
+                        "left": values[index],
+                        "right": values[index + 1],
+                        "left_result": self._copy_point_result(points[index]),
+                        "right_result": self._copy_point_result(
+                            points[index + 1]
+                        ),
+                        "entered": tuple(entered),
+                        "exited": tuple(exited),
+                        "affected": tuple(affected),
+                        "member_delta": dict(member_delta),
+                    }
+                )
+
+        return {
+            "points": tuple(points),
+            "breakpoints": tuple(breakpoints),
+        }
+
+    @staticmethod
+    def _copy_point_result(point: dict[str, Any]) -> dict[str, object]:
+        """Deep-copy one ``value, frontier, rejected`` point result.
+
+        The copied frontier and rejected rows share no dicts or tuples
+        with the source, so breakpoint records stay detached from the
+        per-point results and from one another.
+        """
+        frontier = []
+        for row in point["frontier"]:
+            frontier.append(
+                {
+                    "members": tuple(row["members"]),
+                    "risk": row["risk"],
+                    "contributions": tuple(row["contributions"]),
+                    "attributions": tuple(
+                        tuple(
+                            BranchStore._copy_attribution(attribution)
+                            for attribution in member_attributions
+                        )
+                        for member_attributions in row["attributions"]
+                    ),
+                }
+            )
+        rejected = []
+        for row in point["rejected"]:
+            rejected.append(
+                {
+                    "members": tuple(row["members"]),
+                    "reason": row["reason"],
+                    "checkpoint": row["checkpoint"],
+                    "key": row["key"],
+                    "overrun": row["overrun"],
+                }
+            )
+        return {
+            "value": point["value"],
+            "frontier": tuple(frontier),
+            "rejected": tuple(rejected),
+        }
+
     @staticmethod
     def _validate_sensitivity_scenarios(
         scenarios: Any,
