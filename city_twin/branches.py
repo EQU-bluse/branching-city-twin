@@ -2721,6 +2721,243 @@ class BranchStore:
         modifies the graph, branch heads, audit or idempotency records,
         and no existing interface changes.
         """
+        # Every ordinary input, the base scenario and the value series
+        # finish validating before any branch is looked up; the frozen
+        # historical view and the once-enumerated candidates are shared by
+        # both frontier_breakpoints and explain_frontier_breakpoints.
+        prepared = self._prepare_frontier_scan(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+        combos = prepared["combos"]
+
+        snapshots = [
+            self._breakpoint_snapshot(prepared, value)
+            for value in prepared["ordered_values"]
+        ]
+
+        # Independent point results first; breakpoint copies are built
+        # separately so no object is shared between or within the levels.
+        points = tuple(
+            self._copy_breakpoint_point(snapshot) for snapshot in snapshots
+        )
+
+        breakpoints: list[dict[str, object]] = []
+        for index in range(len(snapshots) - 1):
+            left_snapshot = snapshots[index]
+            right_snapshot = snapshots[index + 1]
+            entered: list[tuple[str, ...]] = []
+            exited: list[tuple[str, ...]] = []
+            affected: list[tuple[str, ...]] = []
+            member_deltas: list[dict[str, object]] = []
+            for combo in combos:
+                feasible_left = combo in left_snapshot["feasible"]
+                feasible_right = combo in right_snapshot["feasible"]
+                frontier_left = combo in left_snapshot["frontier"]
+                frontier_right = combo in right_snapshot["frontier"]
+                dominators_left = left_snapshot["dominators"][combo]
+                dominators_right = right_snapshot["dominators"][combo]
+                feasibility_changed = feasible_left != feasible_right
+                domination_changed = dominators_left != dominators_right
+                frontier_changed = frontier_left != frontier_right
+                if not (
+                    feasibility_changed
+                    or domination_changed
+                    or frontier_changed
+                ):
+                    continue
+
+                if frontier_right and not frontier_left:
+                    entered.append(combo)
+                if frontier_left and not frontier_right:
+                    exited.append(combo)
+                if feasibility_changed or domination_changed:
+                    affected.append(combo)
+
+                if feasible_left and feasible_right:
+                    left_contributions = left_snapshot["stats"][combo][1]
+                    right_contributions = right_snapshot["stats"][combo][1]
+                    changes: list[int | float] = []
+                    for member_index in range(len(combo)):
+                        change = (
+                            right_contributions[member_index]
+                            - left_contributions[member_index]
+                        )
+                        if change == 0:
+                            change = (
+                                0
+                                if isinstance(change, int)
+                                else 0.0
+                            )
+                        changes.append(change)
+                    delta: tuple[int | float, ...] | None = tuple(changes)
+                else:
+                    delta = None
+                member_deltas.append(
+                    {"members": tuple(combo), "delta": delta}
+                )
+
+            if not entered and not exited and not affected:
+                continue
+            breakpoints.append(
+                {
+                    "left_bound": left_snapshot["value"],
+                    "right_bound": right_snapshot["value"],
+                    "left": self._copy_breakpoint_point(left_snapshot),
+                    "right": self._copy_breakpoint_point(right_snapshot),
+                    "entered": tuple(tuple(combo) for combo in entered),
+                    "exited": tuple(tuple(combo) for combo in exited),
+                    "affected": tuple(tuple(combo) for combo in affected),
+                    "member_deltas": tuple(member_deltas),
+                }
+            )
+
+        return {"points": points, "breakpoints": tuple(breakpoints)}
+
+    def explain_frontier_breakpoints(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> tuple[dict[str, object], ...]:
+        """Explain which historical node and state key drives each frontier turn.
+
+        The read-only attribution companion of :meth:`frontier_breakpoints`:
+        it answers from the exact same arguments -- none has a default, and
+        parameter validation, the branch/node lookup order, checkpoint
+        alignment, candidate enumeration order and the candidate-count cap
+        are exactly :meth:`frontier_breakpoints`' contract and errors
+        (:class:`TypeError` for wrong container/name/number types, with
+        :class:`bool` never accepted as an :class:`int`/:class:`float`;
+        :class:`ValueError` for empty names, wrong field sets, an unknown
+        axis, non-finite or out-of-order values, member-constraint conflicts,
+        misaligned checkpoints or more than ``limit`` candidates;
+        :class:`KeyError` for unknown reference/series branches or nodes,
+        including a node outside its named branch's current head ancestor
+        closure). Exceeding the candidate cap raises before any explanation
+        is built, so no partial result or state change is possible.
+
+        The existing turning-point result is first taken on one frozen
+        historical view; every breakpoint interval is then explained for
+        every combination that enters, exits or is otherwise affected. Each
+        combination appears once per interval, in the existing candidate
+        enumeration order (ascending member count, then the Unicode code
+        point order of the sorted member tuple). The change type is decided
+        in order: ``"feasibility"`` when feasibility flips, otherwise
+        ``"domination"`` when the dominator set changes, otherwise
+        ``"membership"`` for a frontier-membership-only change. A feasibility
+        change is located at the first checkpoint whose budget verdict
+        differs between the two sides; every other change uses the last
+        checkpoint, the one deciding final risk.
+
+        The returned tuple has one fresh dict per interval with keys ordered
+        ``left_bound, right_bound, changes`` (the same interval bounds as
+        :meth:`frontier_breakpoints`' records). ``changes`` holds one fresh
+        evidence dict per changed combination, keys ordered ``members, kind,
+        checkpoint, cause_key, attribution, left, right``: ``members`` is
+        the member tuple; ``kind`` is the change type; ``checkpoint`` is the
+        locating checkpoint index, or ``None`` when no checkpoint exists;
+        ``cause_key`` is the responsible state key -- for the total-budget
+        axis the non-zero key with the largest absolute contribution at that
+        checkpoint (ties broken by the smallest Unicode code point), and for
+        a weight axis the perturbed key itself, or ``None`` when that key has
+        no contribution in any relevant member; ``attribution`` is an empty
+        tuple when ``cause_key`` is ``None``, otherwise the per-member copies
+        of the existing historical divergence attribution at that
+        checkpoint, in member order. ``left`` and ``right`` are fresh dicts
+        with keys ordered ``feasible, risk, dominators, overrun``: the
+        feasibility flag, the final-checkpoint risk (``None`` when
+        infeasible), the dominators in the existing deterministic frontier
+        order, and the locating checkpoint's budget overrun (``None`` when
+        no budget evidence exists; a zero is never substituted). With no
+        turning-point intervals an empty tuple is returned. Every dict keeps
+        the documented key order, and all levels are freshly built, share no
+        objects with one another and alias no internal state. The query is
+        read-only: success or failure never modifies the event graph,
+        branch heads, audit or idempotency records, or any existing search,
+        sensitivity or breakpoint result.
+        """
+        prepared = self._prepare_frontier_scan(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+        combos = prepared["combos"]
+
+        snapshots = [
+            self._breakpoint_snapshot(prepared, value)
+            for value in prepared["ordered_values"]
+        ]
+
+        intervals: list[dict[str, object]] = []
+        for index in range(len(snapshots) - 1):
+            left_snapshot = snapshots[index]
+            right_snapshot = snapshots[index + 1]
+            changes: list[dict[str, object]] = []
+            for combo in combos:
+                evidence = self._breakpoint_change_evidence(
+                    prepared,
+                    combo,
+                    left_snapshot,
+                    right_snapshot,
+                )
+                if evidence is not None:
+                    changes.append(evidence)
+            if changes:
+                intervals.append(
+                    {
+                        "left_bound": left_snapshot["value"],
+                        "right_bound": right_snapshot["value"],
+                        "changes": tuple(changes),
+                    }
+                )
+        return tuple(intervals)
+
+    def _prepare_frontier_scan(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> dict[str, object]:
+        """Validate the shared breakpoint inputs and capture one frozen view.
+
+        Shared by :meth:`frontier_breakpoints` and
+        :meth:`explain_frontier_breakpoints` so both apply identical
+        validation order, errors, branch/node lookup order, checkpoint
+        alignment, enumeration order and the candidate-count cap, and answer
+        from one frozen read-only historical view. Returns the parsed base
+        scenario, axis and value tuple, the member constraints, the captured
+        per-series checkpoint views and the once-enumerated candidate list.
+        """
         # --- Every ordinary input, the base scenario and the value series
         # finish validating before any branch is looked up, mirroring
         # frontier_sensitivity's reference, series, scenario order. ---
@@ -2889,147 +3126,430 @@ class BranchStore:
                     )
                 combos.append(combo)
 
-        # At each value only the one axis number is replaced; the other
-        # weights and both budgets stay at their base-scenario values.
-        snapshots: list[dict[str, object]] = []
-        for value in ordered_values:
-            if axis == "total_budget":
-                point_weights = dict(weights)
-                point_total = value
-            else:
-                point_weights = dict(weights)
-                point_weights[axis] = value
-                point_total = total_budget
-            point_key_budgets = dict(key_budgets)
-            frontier_rows, rejected_rows, feasible_stats = (
-                self._frontier_search_once(
-                    combos,
-                    views_by_name,
-                    ordered_keys,
-                    point_weights,
-                    point_key_budgets,
-                    point_total,
-                    required_set,
-                    ordered_pairs,
-                )
-            )
-            frontier_set = {
-                tuple(row["members"]) for row in frontier_rows
-            }
-            feasible_set = set(feasible_stats)
-            dominators: dict[tuple[str, ...], tuple[tuple[str, ...], ...]] = {}
-            for combo in combos:
-                if combo not in feasible_stats:
-                    dominators[combo] = ()
-                    continue
-                risk = feasible_stats[combo][0]
-                dominated_by = [
-                    other
-                    for other in feasible_stats
-                    if len(other) >= len(combo)
-                    and feasible_stats[other][0] <= risk
-                    and (
-                        len(other) > len(combo)
-                        or feasible_stats[other][0] < risk
-                    )
-                ]
-                dominated_by.sort(
-                    key=lambda other: (
-                        -len(other),
-                        feasible_stats[other][0],
-                        other,
-                    )
-                )
-                dominators[combo] = tuple(dominated_by)
-            snapshots.append(
-                {
-                    "value": value,
-                    "frontier_rows": frontier_rows,
-                    "rejected_rows": rejected_rows,
-                    "feasible": feasible_set,
-                    "frontier": frontier_set,
-                    "dominators": dominators,
-                    "stats": feasible_stats,
-                }
-            )
+        return {
+            "reference": reference,
+            "views_by_name": views_by_name,
+            "ordered_keys": ordered_keys,
+            "weights": weights,
+            "total_budget": total_budget,
+            "key_budgets": key_budgets,
+            "axis": axis,
+            "ordered_values": ordered_values,
+            "required_set": required_set,
+            "ordered_pairs": ordered_pairs,
+            "combos": combos,
+        }
 
-        # Independent point results first; breakpoint copies are built
-        # separately so no object is shared between or within the levels.
-        points = tuple(
-            self._copy_breakpoint_point(snapshot) for snapshot in snapshots
+    def _breakpoint_snapshot(
+        self, prepared: dict[str, object], value: int | float
+    ) -> dict[str, object]:
+        """Evaluate one perturbation value on the shared frozen view.
+
+        Only the one number the axis names is replaced; every other weight
+        and both budgets keep their base-scenario values. Returns the
+        frontier and rejected rows, the feasible/frontier sets, the
+        deterministic dominator tuples and the per-combination
+        ``(risk, contributions)`` stats, plus the per-combination checkpoint
+        evidence used to explain a turn.
+        """
+        weights = prepared["weights"]
+        total_budget = prepared["total_budget"]
+        axis = prepared["axis"]
+        if axis == "total_budget":
+            point_weights = dict(weights)
+            point_total = value
+        else:
+            point_weights = dict(weights)
+            point_weights[axis] = value
+            point_total = total_budget
+        point_key_budgets = dict(prepared["key_budgets"])
+        frontier_rows, rejected_rows, feasible_stats = (
+            self._frontier_search_once(
+                prepared["combos"],
+                prepared["views_by_name"],
+                prepared["ordered_keys"],
+                point_weights,
+                point_key_budgets,
+                point_total,
+                prepared["required_set"],
+                prepared["ordered_pairs"],
+            )
+        )
+        frontier_set = {tuple(row["members"]) for row in frontier_rows}
+        dominators: dict[
+            tuple[str, ...], tuple[tuple[str, ...], ...]
+        ] = {}
+        for combo in prepared["combos"]:
+            if combo not in feasible_stats:
+                dominators[combo] = ()
+                continue
+            risk = feasible_stats[combo][0]
+            dominated_by = [
+                other
+                for other in feasible_stats
+                if len(other) >= len(combo)
+                and feasible_stats[other][0] <= risk
+                and (
+                    len(other) > len(combo)
+                    or feasible_stats[other][0] < risk
+                )
+            ]
+            dominated_by.sort(
+                key=lambda other: (
+                    -len(other),
+                    feasible_stats[other][0],
+                    other,
+                )
+            )
+            dominators[combo] = tuple(dominated_by)
+
+        return {
+            "value": value,
+            "weights": point_weights,
+            "total_budget": point_total,
+            "key_budgets": point_key_budgets,
+            "frontier_rows": frontier_rows,
+            "rejected_rows": rejected_rows,
+            "feasible": set(feasible_stats),
+            "frontier": frontier_set,
+            "dominators": dominators,
+            "stats": feasible_stats,
+        }
+
+    def _breakpoint_change_evidence(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        left_snapshot: dict[str, object],
+        right_snapshot: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Build one combination's explanation for an interval, or ``None``.
+
+        The change type is decided in order -- feasibility, then domination,
+        then frontier membership -- exactly as the breakpoint record groups
+        entered/exited/affected combinations.
+        """
+        feasible_left = combo in left_snapshot["feasible"]
+        feasible_right = combo in right_snapshot["feasible"]
+        frontier_left = combo in left_snapshot["frontier"]
+        frontier_right = combo in right_snapshot["frontier"]
+        dominators_left = left_snapshot["dominators"][combo]
+        dominators_right = right_snapshot["dominators"][combo]
+        feasibility_changed = feasible_left != feasible_right
+        domination_changed = dominators_left != dominators_right
+        frontier_changed = frontier_left != frontier_right
+        if not (
+            feasibility_changed
+            or domination_changed
+            or frontier_changed
+        ):
+            return None
+
+        if feasibility_changed:
+            kind = "feasibility"
+        elif domination_changed:
+            kind = "domination"
+        else:
+            kind = "membership"
+
+        point_count = self._combo_point_count(prepared, combo)
+        checkpoint: int | None
+        if point_count == 0:
+            checkpoint = None
+        elif kind == "feasibility":
+            checkpoint = self._first_verdict_diff_checkpoint(
+                prepared,
+                combo,
+                left_snapshot,
+                right_snapshot,
+            )
+        else:
+            checkpoint = point_count - 1
+
+        overrun_left, overrun_right = (
+            self._checkpoint_overrun(
+                prepared, combo, left_snapshot, checkpoint
+            ),
+            self._checkpoint_overrun(
+                prepared, combo, right_snapshot, checkpoint
+            ),
         )
 
-        breakpoints: list[dict[str, object]] = []
-        for index in range(len(snapshots) - 1):
-            left_snapshot = snapshots[index]
-            right_snapshot = snapshots[index + 1]
-            entered: list[tuple[str, ...]] = []
-            exited: list[tuple[str, ...]] = []
-            affected: list[tuple[str, ...]] = []
-            member_deltas: list[dict[str, object]] = []
-            for combo in combos:
-                feasible_left = combo in left_snapshot["feasible"]
-                feasible_right = combo in right_snapshot["feasible"]
-                frontier_left = combo in left_snapshot["frontier"]
-                frontier_right = combo in right_snapshot["frontier"]
-                dominators_left = left_snapshot["dominators"][combo]
-                dominators_right = right_snapshot["dominators"][combo]
-                feasibility_changed = feasible_left != feasible_right
-                domination_changed = dominators_left != dominators_right
-                frontier_changed = frontier_left != frontier_right
-                if not (
-                    feasibility_changed
-                    or domination_changed
-                    or frontier_changed
-                ):
-                    continue
-
-                if frontier_right and not frontier_left:
-                    entered.append(combo)
-                if frontier_left and not frontier_right:
-                    exited.append(combo)
-                if feasibility_changed or domination_changed:
-                    affected.append(combo)
-
-                if feasible_left and feasible_right:
-                    left_contributions = left_snapshot["stats"][combo][1]
-                    right_contributions = right_snapshot["stats"][combo][1]
-                    changes: list[int | float] = []
-                    for member_index in range(len(combo)):
-                        change = (
-                            right_contributions[member_index]
-                            - left_contributions[member_index]
-                        )
-                        if change == 0:
-                            change = (
-                                0
-                                if isinstance(change, int)
-                                else 0.0
-                            )
-                        changes.append(change)
-                    delta: tuple[int | float, ...] | None = tuple(changes)
-                else:
-                    delta = None
-                member_deltas.append(
-                    {"members": tuple(combo), "delta": delta}
-                )
-
-            if not entered and not exited and not affected:
-                continue
-            breakpoints.append(
-                {
-                    "left_bound": left_snapshot["value"],
-                    "right_bound": right_snapshot["value"],
-                    "left": self._copy_breakpoint_point(left_snapshot),
-                    "right": self._copy_breakpoint_point(right_snapshot),
-                    "entered": tuple(tuple(combo) for combo in entered),
-                    "exited": tuple(tuple(combo) for combo in exited),
-                    "affected": tuple(tuple(combo) for combo in affected),
-                    "member_deltas": tuple(member_deltas),
-                }
+        # Aggregate signed differences are weight-independent, and for the
+        # total-budget axis both sides share the base weights; for a weight
+        # axis the perturbed key is returned directly, so either side's
+        # snapshot names the same cause.
+        cause_key = (
+            self._checkpoint_cause_key(
+                prepared, combo, left_snapshot, checkpoint
+            )
+            if checkpoint is not None
+            else None
+        )
+        attribution: tuple[dict[str, object], ...] = ()
+        if cause_key is not None:
+            attribution = self._checkpoint_attributions(
+                prepared, combo, checkpoint, cause_key
             )
 
-        return {"points": points, "breakpoints": tuple(breakpoints)}
+        risk_left = (
+            left_snapshot["stats"][combo][0] if feasible_left else None
+        )
+        risk_right = (
+            right_snapshot["stats"][combo][0] if feasible_right else None
+        )
+        return {
+            "members": tuple(combo),
+            "kind": kind,
+            "checkpoint": checkpoint,
+            "cause_key": cause_key,
+            "attribution": attribution,
+            "left": {
+                "feasible": feasible_left,
+                "risk": risk_left,
+                "dominators": tuple(
+                    tuple(other) for other in dominators_left
+                ),
+                "overrun": overrun_left,
+            },
+            "right": {
+                "feasible": feasible_right,
+                "risk": risk_right,
+                "dominators": tuple(
+                    tuple(other) for other in dominators_right
+                ),
+                "overrun": overrun_right,
+            },
+        }
+
+    def _combo_point_count(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+    ) -> int:
+        """Return the shared checkpoint count behind one combination."""
+        views_by_name = prepared["views_by_name"]
+        if not combo:
+            # The empty subset has no member views; the pool alignment
+            # guarantees every series shares one checkpoint count.
+            views = next(iter(views_by_name.values()), None)
+            return 0 if views is None else len(views)
+        return len(views_by_name[combo[0]])
+
+    def _combo_checkpoint_position(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        checkpoint: int,
+    ) -> list[tuple[list[str], list[str], str, str]]:
+        """Capture every member's frozen view at one checkpoint.
+
+        One ``(left_order, right_order, node_a, node_b)`` entry per member
+        in member order. The empty subset contributes no entries; pool
+        alignment guarantees that a checkpoint exists for every member.
+        """
+        views_by_name = prepared["views_by_name"]
+        return [
+            views_by_name[member][checkpoint] for member in combo
+        ]
+
+    def _checkpoint_accounting(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        snapshot: dict[str, object],
+        checkpoint: int,
+    ) -> dict[str, object]:
+        """Recompute one combination's accounting at one checkpoint.
+
+        Returns the per-key signed aggregate, the per-member per-key signed
+        differences, the weighted total risk and the total/per-key budget
+        breach magnitudes under the snapshot's own weights and budgets.
+        """
+        ordered_keys = prepared["ordered_keys"]
+        weights = snapshot["weights"]
+        key_budgets = snapshot["key_budgets"]
+        total_budget = snapshot["total_budget"]
+        position = self._combo_checkpoint_position(
+            prepared, combo, checkpoint
+        )
+        aggregate: dict[str, int | float] = {
+            key: 0 for key in ordered_keys
+        }
+        member_diffs: list[dict[str, int | float]] = []
+        if position:
+            reference_order = position[0][0]
+            reference_values = {
+                key: self._replayed_value(reference_order, key)
+                for key in ordered_keys
+            }
+            for _, right_order, _, _ in position:
+                diffs: dict[str, int | float] = {}
+                for key in ordered_keys:
+                    diff = (
+                        self._replayed_value(right_order, key)
+                        - reference_values[key]
+                    )
+                    diffs[key] = diff
+                    aggregate[key] += diff
+                member_diffs.append(diffs)
+        risk: int | float = 0
+        for key in ordered_keys:
+            risk += abs(aggregate[key]) * weights[key]
+        if risk == 0:
+            risk = 0 if isinstance(risk, int) else 0.0
+        total_overrun: int | float | None = (
+            risk - total_budget if risk > total_budget else None
+        )
+        key_overruns: dict[str, int | float] = {}
+        for key in ordered_keys:
+            if (
+                key in key_budgets
+                and abs(aggregate[key]) > key_budgets[key]
+            ):
+                key_overruns[key] = (
+                    abs(aggregate[key]) - key_budgets[key]
+                ) * weights[key]
+        return {
+            "aggregate": aggregate,
+            "member_diffs": member_diffs,
+            "risk": risk,
+            "total_overrun": total_overrun,
+            "key_overruns": key_overruns,
+        }
+
+    def _first_verdict_diff_checkpoint(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        left_snapshot: dict[str, object],
+        right_snapshot: dict[str, object],
+    ) -> int | None:
+        """Return the first checkpoint whose budget verdict differs.
+
+        A checkpoint's verdict is its feasible/rejected outcome under each
+        side's own weights and budgets; the comparison uses the same
+        strictly-greater total and per-key breach tests as the existing
+        search. Returns ``None`` only when no checkpoint verdict differs.
+        """
+        point_count = self._combo_point_count(prepared, combo)
+        for checkpoint in range(point_count):
+            left_accounting = self._checkpoint_accounting(
+                prepared, combo, left_snapshot, checkpoint
+            )
+            right_accounting = self._checkpoint_accounting(
+                prepared, combo, right_snapshot, checkpoint
+            )
+            left_breach = (
+                left_accounting["total_overrun"] is not None
+                or bool(left_accounting["key_overruns"])
+            )
+            right_breach = (
+                right_accounting["total_overrun"] is not None
+                or bool(right_accounting["key_overruns"])
+            )
+            if left_breach != right_breach:
+                return checkpoint
+        return None
+
+    def _checkpoint_overrun(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        snapshot: dict[str, object],
+        checkpoint: int | None,
+    ) -> int | float | None:
+        """Return the locating checkpoint's breach magnitude for one side.
+
+        Mirrors the existing rejected-row ``overrun``: the total risk above
+        the total budget when the total budget is breached (the total test
+        outranks per-key breaches), otherwise the first breaching key's
+        weighted excess in Unicode key order. A checkpoint that holds, or no
+        checkpoint at all, has no breach evidence and yields ``None`` rather
+        than a substituted zero.
+        """
+        if checkpoint is None:
+            return None
+        accounting = self._checkpoint_accounting(
+            prepared, combo, snapshot, checkpoint
+        )
+        if accounting["total_overrun"] is not None:
+            return accounting["total_overrun"]
+        key_overruns = accounting["key_overruns"]
+        if key_overruns:
+            return key_overruns[min(key_overruns)]
+        return None
+
+    def _checkpoint_cause_key(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        snapshot: dict[str, object],
+        checkpoint: int,
+    ) -> str | None:
+        """Pick the state key responsible at one checkpoint.
+
+        For the total-budget axis this is the non-zero key with the largest
+        absolute weighted contribution to the combination at the checkpoint,
+        ties broken by the smallest Unicode code point; for a weight axis
+        the perturbed key is used directly, unless it contributes nothing
+        in every relevant member, in which case the result is ``None``.
+        """
+        axis = prepared["axis"]
+        accounting = self._checkpoint_accounting(
+            prepared, combo, snapshot, checkpoint
+        )
+        weights = snapshot["weights"]
+        if axis != "total_budget":
+            if any(
+                member_diffs[axis] != 0
+                for member_diffs in accounting["member_diffs"]
+            ):
+                return axis
+            return None
+        candidates = [
+            key
+            for key in prepared["ordered_keys"]
+            if accounting["aggregate"][key] != 0
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda key: (
+                -abs(accounting["aggregate"][key]) * weights[key],
+                key,
+            ),
+        )
+
+    def _checkpoint_attributions(
+        self,
+        prepared: dict[str, object],
+        combo: tuple[str, ...],
+        checkpoint: int,
+        cause_key: str,
+    ) -> tuple[dict[str, object], ...]:
+        """Copy the existing divergence attribution at one checkpoint.
+
+        One independent copy per member in member order, reusing
+        :meth:`attribute_divergence_at`' ``key, fork, left, right`` result
+        between the shared reference node and that member's node.
+        """
+        position = self._combo_checkpoint_position(
+            prepared, combo, checkpoint
+        )
+        return tuple(
+            self._copy_attribution(
+                self._attribute_divergence_on_orders(
+                    left_order,
+                    right_order,
+                    node_a,
+                    node_b,
+                    cause_key,
+                )
+            )
+            for left_order, right_order, node_a, node_b in position
+        )
 
     @staticmethod
     def _validate_breakpoint_scenario(
