@@ -2247,6 +2247,669 @@ class BranchStore:
         ]
         return {"frontier": tuple(frontier), "rejected": tuple(rejected)}
 
+    def frontier_sensitivity(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        scenarios: tuple[dict[str, object], ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+    ) -> dict[str, object]:
+        """Judge how stable the budget frontier is across budget scenarios.
+
+        The read-only sensitivity companion of :meth:`search_combinations`:
+        the same pool, size window, required members, exclusive pairs and
+        candidate limit are searched once, but under several ordered
+        ``scenarios`` -- each its own weights, total budget and per-key
+        budgets -- answered from one shared frozen historical view.
+
+        Parameters are validated in signature order (``reference``,
+        ``series``, ``scenarios``, ``min_size``, ``max_size``, ``required``,
+        ``exclusive_pairs``, ``limit``); none has a default. ``reference``
+        and ``series`` keep exactly :meth:`search_combinations`' contract,
+        including the shared-checkpoint/reference-node alignment error.
+        ``scenarios`` must be a tuple (else :class:`TypeError`) of dicts
+        (a non-dict item raises :class:`TypeError`), each containing
+        exactly the keys ``name``, ``weights``, ``total_budget`` and
+        ``key_budgets`` -- a missing or extra key raises
+        :class:`ValueError`. A scenario ``name`` that is not a ``str``
+        raises :class:`TypeError`; an empty or duplicated name (scenarios
+        walked in input order) raises :class:`ValueError`. Each scenario's
+        ``weights``, ``total_budget`` and ``key_budgets`` reuse
+        :meth:`search_combinations`' numeric, finiteness and key-set rules
+        and error types, scoped to that scenario's own weight keys.
+        ``min_size``, ``max_size``, ``required``, ``exclusive_pairs`` and
+        ``limit`` then keep exactly the existing search's validation order
+        and errors. Only after every ordinary input and every scenario has
+        validated are branches looked up -- reference first, then the
+        series in ``series`` insertion order (unknown branch
+        :class:`KeyError`) -- and nodes checked per series, left before
+        right, pairs in points order (:class:`KeyError` when absent from
+        the graph or the named branch's current head closure).
+
+        Candidates are enumerated exactly once, by ascending member count
+        and, within a size, by the Unicode code point order of the sorted
+        member-name tuple, exactly as in :meth:`search_combinations`;
+        enumerating more than ``limit`` candidates raises
+        :class:`ValueError` and no partial result is returned. Each
+        scenario evaluates every candidate on the same frozen read-only
+        historical view with that scenario's budgets and weights; its
+        frontier and rejection accounting are identical to one existing
+        search with the same arguments. With an empty ``scenarios`` tuple
+        the search-parameter validation, branch lookups and node closure
+        checks still all run, and empty scenario and combination summaries
+        are returned.
+
+        The result is a fresh dict whose keys are ordered
+        ``scenarios, combinations``. ``scenarios`` follows scenario input
+        order; each entry is a fresh dict whose keys are ordered
+        ``name, frontier, rejected``, with independent copies of exactly
+        the frontier and rejected row structures
+        :meth:`search_combinations` returns (frontier rows keyed
+        ``members, risk, contributions, attributions`` and rejected rows
+        keyed ``members, reason, checkpoint, key, overrun``).
+        ``combinations`` follows candidate enumeration order; each row is a
+        fresh dict whose keys are ordered ``members, first_entry,
+        first_exit, dominators, risk_delta, member_delta``:
+        ``first_entry`` is the index of the first scenario whose frontier
+        contains the combination (``0`` when the first scenario does), or
+        ``None`` when it never makes a frontier; ``first_exit`` is the
+        index of the first later scenario whose frontier no longer
+        contains it, or ``None`` when it never entered or stays on the
+        frontier through the last scenario. ``dominators`` aligns one
+        tuple per scenario: the feasible combinations that dominate this
+        combination under the existing member-count and final-risk weak-
+        domination rule, sorted in frontier order (descending member
+        count, ascending risk, ascending member tuple); an infeasible or
+        non-dominated scenario contributes an empty tuple. ``risk_delta``
+        aligns one value per scenario: the final-risk difference from the
+        previous scenario, or ``None`` at the first scenario or whenever
+        this combination is infeasible in either scenario.
+        ``member_delta`` mirrors it per member (member order): the marginal
+        contribution differences between adjacent scenarios, or ``None``
+        under the same conditions. Every returned level is freshly built,
+        independent of the others and detached from internal state.
+        Success or failure never modifies the graph, branch heads, audit
+        or idempotency records, and no existing interface changes.
+        """
+        # --- Ordinary inputs and every scenario finish validating before
+        # any branch is looked up. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        anchor_points: tuple[tuple[str, str], ...] | None = None
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            if anchor_points is None:
+                anchor_points = series_points
+            elif len(series_points) != len(anchor_points) or any(
+                point[0] != anchor_point[0]
+                for point, anchor_point in zip(
+                    series_points, anchor_points
+                )
+            ):
+                raise ValueError(
+                    "all series must share checkpoint count and reference "
+                    "nodes"
+                )
+            per_series.append((series_name, series_points))
+
+        parsed_scenarios = self._validate_sensitivity_scenarios(scenarios)
+
+        # The size window, member constraints and limit reuse the existing
+        # search's checks exactly.
+        min_size_value = self._require_size_bound(min_size, "min_size")
+        if min_size_value < 0:
+            raise ValueError("min_size must be non-negative")
+        max_size_value = self._require_size_bound(max_size, "max_size")
+        if max_size_value < min_size_value:
+            raise ValueError("max_size must be >= min_size")
+        if max_size_value > len(per_series):
+            raise ValueError("max_size must not exceed the number of series")
+
+        if not isinstance(required, tuple):
+            raise TypeError(
+                f"required must be a tuple, got {type(required).__name__}"
+            )
+        required_members: list[str] = []
+        seen_required: set[str] = set()
+        for member in required:
+            self._require_nonempty_str(member, "required member")
+            if member in seen_required:
+                raise ValueError(f"duplicate required member {member!r}")
+            seen_required.add(member)
+            if member not in series:
+                raise ValueError(
+                    f"required member {member!r} is absent from series"
+                )
+            required_members.append(member)
+
+        if not isinstance(exclusive_pairs, tuple):
+            raise TypeError(
+                "exclusive_pairs must be a tuple, got "
+                f"{type(exclusive_pairs).__name__}"
+            )
+        ordered_pairs: list[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for pair in exclusive_pairs:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(
+                    "each exclusive pair must be a length-2 tuple of "
+                    f"member names, got {pair!r} ({type(pair).__name__})"
+                )
+            member_a, member_b = pair
+            self._require_nonempty_str(member_a, "exclusive member")
+            self._require_nonempty_str(member_b, "exclusive member")
+            if member_a == member_b:
+                raise ValueError(
+                    f"member {member_a!r} cannot be mutually exclusive "
+                    "with itself"
+                )
+            if member_a not in series:
+                raise ValueError(
+                    f"exclusive member {member_a!r} is absent from series"
+                )
+            if member_b not in series:
+                raise ValueError(
+                    f"exclusive member {member_b!r} is absent from series"
+                )
+            normalized = tuple(sorted(pair))
+            if normalized in seen_pairs:
+                raise ValueError(f"duplicate exclusive pair {normalized!r}")
+            seen_pairs.add(normalized)
+            ordered_pairs.append((member_a, member_b))
+        required_set = set(required_members)
+        for member_a, member_b in ordered_pairs:
+            if member_a in required_set and member_b in required_set:
+                raise ValueError(
+                    f"required members {member_a!r} and {member_b!r} are "
+                    "mutually exclusive"
+                )
+
+        limit_value = self._require_size_bound(limit, "limit")
+        if limit_value < 1:
+            raise ValueError("limit must be >= 1")
+
+        self._require_known_branch(reference)
+
+        # Capture the single frozen read-only historical view every
+        # scenario is answered from, exactly as in search_combinations.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views_by_name: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ] = {}
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            views_by_name[series_name] = [
+                (
+                    self._graph._ordered_ancestors(node_a),
+                    self._graph._ordered_ancestors(node_b),
+                    node_a,
+                    node_b,
+                )
+                for node_a, node_b in series_points
+            ]
+
+        # Candidates are enumerated once in the existing search order and
+        # shared by every scenario evaluation. The count cap is a search
+        # constraint, so it runs even with no scenarios.
+        pool = tuple(sorted(name for name, _ in per_series))
+        combos: list[tuple[str, ...]] = []
+        candidate_count = 0
+        for size in range(min_size_value, max_size_value + 1):
+            for combo in itertools.combinations(pool, size):
+                candidate_count += 1
+                if candidate_count > limit_value:
+                    raise ValueError(
+                        "search candidate limit exceeded: more than "
+                        f"{limit_value} candidates in size window"
+                    )
+                combos.append(combo)
+
+        # Empty scenarios still ran the full search-parameter, branch,
+        # node and candidate-count checks above; nothing drives a
+        # scenario evaluation.
+        if not parsed_scenarios:
+            return {"scenarios": (), "combinations": ()}
+
+        scenario_results: list[dict[str, object]] = []
+        scenario_tables: list[dict[str, object]] = []
+        for (
+            name,
+            weights,
+            total_budget,
+            key_budgets,
+            ordered_keys,
+        ) in parsed_scenarios:
+            frontier_rows, rejected_rows, feasible_stats = (
+                self._frontier_search_once(
+                    combos,
+                    views_by_name,
+                    ordered_keys,
+                    weights,
+                    key_budgets,
+                    total_budget,
+                    required_set,
+                    ordered_pairs,
+                )
+            )
+            frontier_order = [row["members"] for row in frontier_rows]
+            scenario_tables.append(
+                {
+                    "frontier": set(frontier_order),
+                    "feasible": feasible_stats,
+                }
+            )
+            scenario_results.append(
+                {
+                    "name": name,
+                    "frontier": tuple(frontier_rows),
+                    "rejected": tuple(rejected_rows),
+                }
+            )
+
+        scenario_count = len(parsed_scenarios)
+        combination_rows: list[dict[str, object]] = []
+        for combo in combos:
+            members = tuple(combo)
+            first_entry: int | None = None
+            for index in range(scenario_count):
+                if members in scenario_tables[index]["frontier"]:
+                    first_entry = index
+                    break
+            first_exit: int | None = None
+            if first_entry is not None:
+                for index in range(first_entry + 1, scenario_count):
+                    if members not in scenario_tables[index]["frontier"]:
+                        first_exit = index
+                        break
+
+            dominators: list[tuple[tuple[str, ...], ...]] = []
+            risk_delta: list[int | float | None] = []
+            member_delta: list[tuple[int | float, ...] | None] = []
+            for index in range(scenario_count):
+                table = scenario_tables[index]
+                feasible_stats = table["feasible"]
+                if members in feasible_stats:
+                    risk = feasible_stats[members][0]
+                    dominated_by = [
+                        other
+                        for other in feasible_stats
+                        if len(other) >= len(members)
+                        and feasible_stats[other][0] <= risk
+                        and (
+                            len(other) > len(members)
+                            or feasible_stats[other][0] < risk
+                        )
+                    ]
+                    dominated_by.sort(
+                        key=lambda other: (
+                            -len(other),
+                            feasible_stats[other][0],
+                            other,
+                        )
+                    )
+                    dominators.append(
+                        tuple(tuple(other) for other in dominated_by)
+                    )
+                else:
+                    dominators.append(())
+
+                if (
+                    index == 0
+                    or members not in feasible_stats
+                    or members
+                    not in scenario_tables[index - 1]["feasible"]
+                ):
+                    risk_delta.append(None)
+                    member_delta.append(None)
+                    continue
+
+                previous_stats = scenario_tables[index - 1]["feasible"]
+                risk_change = risk - previous_stats[members][0]
+                if risk_change == 0:
+                    risk_change = (
+                        0
+                        if isinstance(risk_change, int)
+                        else 0.0
+                    )
+                risk_delta.append(risk_change)
+                contribution_change: list[int | float] = []
+                contributions = feasible_stats[members][1]
+                previous_contributions = previous_stats[members][1]
+                for member_index in range(len(members)):
+                    change = (
+                        contributions[member_index]
+                        - previous_contributions[member_index]
+                    )
+                    if change == 0:
+                        change = 0 if isinstance(change, int) else 0.0
+                    contribution_change.append(change)
+                member_delta.append(tuple(contribution_change))
+
+            combination_rows.append(
+                {
+                    "members": members,
+                    "first_entry": first_entry,
+                    "first_exit": first_exit,
+                    "dominators": tuple(dominators),
+                    "risk_delta": tuple(risk_delta),
+                    "member_delta": tuple(member_delta),
+                }
+            )
+
+        return {
+            "scenarios": tuple(scenario_results),
+            "combinations": tuple(combination_rows),
+        }
+
+    @staticmethod
+    def _validate_sensitivity_scenarios(
+        scenarios: Any,
+    ) -> list[tuple[str, dict, int | float, dict, tuple[str, ...]]]:
+        """Validate the ordered ``scenarios`` tuple of frontier_sensitivity.
+
+        Returns one parsed tuple per scenario in input order:
+        ``(name, weights, total_budget, key_budgets, ordered_weight_keys)``.
+        The container and each item's type raise :class:`TypeError`; a
+        scenario whose keys are not exactly ``name``, ``weights``,
+        ``total_budget`` and ``key_budgets`` raises :class:`ValueError`. A
+        name that is not a ``str`` raises :class:`TypeError`; an empty or
+        duplicate name raises :class:`ValueError`. Numeric, finiteness and
+        key-set rules mirror :meth:`search_combinations` per scenario.
+        """
+        if not isinstance(scenarios, tuple):
+            raise TypeError(
+                f"scenarios must be a tuple, got {type(scenarios).__name__}"
+            )
+        expected_keys = {"name", "weights", "total_budget", "key_budgets"}
+        parsed: list[
+            tuple[str, dict, int | float, dict, tuple[str, ...]]
+        ] = []
+        seen_names: set[str] = set()
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                raise TypeError(
+                    "each scenario must be a dict, got "
+                    f"{type(scenario).__name__}"
+                )
+            if set(scenario.keys()) != expected_keys:
+                raise ValueError(
+                    "each scenario must contain exactly the keys 'name', "
+                    "'weights', 'total_budget' and 'key_budgets'"
+                )
+            name = scenario["name"]
+            if not isinstance(name, str):
+                raise TypeError(
+                    "scenario name must be a str, got "
+                    f"{type(name).__name__}"
+                )
+            if not name:
+                raise ValueError("scenario name must be a non-empty str")
+            if name in seen_names:
+                raise ValueError(f"duplicate scenario name {name!r}")
+            seen_names.add(name)
+            weights = scenario["weights"]
+            ordered_keys = BranchStore._validate_weights(weights)
+            total_budget = scenario["total_budget"]
+            BranchStore._require_finite_budget(
+                total_budget, f"total budget for scenario {name!r}"
+            )
+            key_budgets = scenario["key_budgets"]
+            if not isinstance(key_budgets, dict):
+                raise TypeError(
+                    "key_budgets for scenario "
+                    f"{name!r} must be a dict, got "
+                    f"{type(key_budgets).__name__}"
+                )
+            for budget_key, budget_limit in key_budgets.items():
+                EventGraph._require_nonempty_str(
+                    budget_key, "per-key budget key"
+                )
+                BranchStore._require_finite_budget(
+                    budget_limit,
+                    f"per-key budget for {budget_key!r} in scenario "
+                    f"{name!r}",
+                )
+                if budget_key not in weights:
+                    raise ValueError(
+                        f"per-key budget key {budget_key!r} is absent from "
+                        f"the weights of scenario {name!r}"
+                    )
+            parsed.append(
+                (name, weights, total_budget, key_budgets, ordered_keys)
+            )
+        return parsed
+
+    def _frontier_search_once(
+        self,
+        combos: list[tuple[str, ...]],
+        views_by_name: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ],
+        ordered_keys: tuple[str, ...],
+        weights: dict[str, int | float],
+        key_budgets: dict[str, int | float],
+        total_budget: int | float,
+        required_set: set[str],
+        ordered_pairs: list[tuple[str, str]],
+    ) -> tuple[
+        list[dict[str, object]],
+        list[dict[str, object]],
+        dict[tuple[str, ...], tuple[int | float, tuple[int | float, ...]]],
+    ]:
+        """Run one existing-search evaluation over pre-enumerated candidates.
+
+        Shares :meth:`search_combinations`' rejection first causes,
+        budget accounting, frontier rule and output row shapes exactly,
+        but enumerates nothing itself: the same candidate list is reused
+        across scenarios. Returns the frontier rows (already in frontier
+        order), the rejected rows (enumeration order) and a stats dict
+        mapping every feasible combination's copied member tuple to its
+        final-checkpoint risk and marginal contributions.
+        """
+        rejected: list[dict[str, object]] = []
+        feasible: list[
+            tuple[
+                tuple[str, ...],
+                int | float,
+                tuple[int | float, ...],
+                tuple[tuple[dict[str, object], ...], ...],
+            ]
+        ] = []
+        for candidate in combos:
+            # A copied member tuple keeps each scenario's rows detached
+            # from the shared enumeration and from one another.
+            combo = tuple(candidate)
+            combo_set = set(combo)
+
+            if not required_set.issubset(combo_set):
+                rejected.append(
+                    {
+                        "members": combo,
+                        "reason": "missing_required",
+                        "checkpoint": None,
+                        "key": None,
+                        "overrun": None,
+                    }
+                )
+                continue
+            hit_pair = next(
+                (
+                    pair
+                    for pair in ordered_pairs
+                    if pair[0] in combo_set and pair[1] in combo_set
+                ),
+                None,
+            )
+            if hit_pair is not None:
+                rejected.append(
+                    {
+                        "members": combo,
+                        "reason": "exclusive_pair",
+                        "checkpoint": None,
+                        "key": None,
+                        "overrun": None,
+                    }
+                )
+                continue
+
+            outcome = self._evaluate_subset_view(
+                [views_by_name[member] for member in combo],
+                ordered_keys,
+                weights,
+                key_budgets,
+                total_budget,
+            )
+            if outcome[0] == "reject":
+                _, checkpoint, reason, breach_key, overrun = outcome
+                rejected.append(
+                    {
+                        "members": combo,
+                        "reason": reason,
+                        "checkpoint": checkpoint,
+                        "key": breach_key,
+                        "overrun": overrun,
+                    }
+                )
+                continue
+
+            (
+                _,
+                final_risk,
+                final_aggregate,
+                final_member_diffs,
+                final_position,
+            ) = outcome
+            contributions: list[int | float] = []
+            for member_index in range(len(combo)):
+                if final_position is None:
+                    contributions.append(0)
+                    continue
+                excluded_risk: int | float = 0
+                for key in ordered_keys:
+                    excluded = (
+                        final_aggregate[key]
+                        - final_member_diffs[member_index][key]
+                    )
+                    excluded_risk += abs(excluded) * weights[key]
+                if excluded_risk == 0:
+                    excluded_risk = (
+                        0
+                        if isinstance(excluded_risk, int)
+                        else 0.0
+                    )
+                contribution = final_risk - excluded_risk
+                if contribution == 0:
+                    contribution = (
+                        0
+                        if isinstance(contribution, int)
+                        else 0.0
+                    )
+                contributions.append(contribution)
+
+            attributions: tuple[
+                tuple[dict[str, object], ...], ...
+            ] = ()
+            if final_position is not None:
+                attributions = tuple(
+                    tuple(
+                        self._copy_attribution(
+                            self._attribute_divergence_on_orders(
+                                left_order,
+                                right_order,
+                                node_a,
+                                node_b,
+                                key,
+                            )
+                        )
+                        for key in ordered_keys
+                    )
+                    for (
+                        left_order,
+                        right_order,
+                        node_a,
+                        node_b,
+                    ) in final_position
+                )
+
+            feasible.append(
+                (combo, final_risk, tuple(contributions), attributions)
+            )
+
+        frontier_entries: list[
+            tuple[
+                tuple[str, ...],
+                int | float,
+                tuple[int | float, ...],
+                tuple[tuple[dict[str, object], ...], ...],
+            ]
+        ] = []
+        for entry in feasible:
+            members, risk, _, _ = entry
+            dominated = any(
+                len(other_members) >= len(members)
+                and other_risk <= risk
+                and (
+                    len(other_members) > len(members)
+                    or other_risk < risk
+                )
+                for other_members, other_risk, _, _ in feasible
+            )
+            if not dominated:
+                frontier_entries.append(entry)
+        frontier_entries.sort(
+            key=lambda entry: (-len(entry[0]), entry[1], entry[0])
+        )
+
+        frontier_rows = [
+            {
+                "members": members,
+                "risk": risk,
+                "contributions": tuple(contributions),
+                "attributions": tuple(
+                    tuple(member_attributions)
+                    for member_attributions in attributions
+                ),
+            }
+            for members, risk, contributions, attributions in (
+                frontier_entries
+            )
+        ]
+        feasible_stats = {
+            members: (risk, tuple(contributions))
+            for members, risk, contributions, _ in feasible
+        }
+        return frontier_rows, rejected, feasible_stats
+
     def _evaluate_subset_view(
         self,
         member_views: list[list[tuple[list[str], list[str], str, str]]],
