@@ -3678,69 +3678,205 @@ class BranchStore:
         # shared checkpoint count is pure validated input data, so the
         # bounds need no state.
         point_count = self._frontier_point_count(validated)
-        if not isinstance(indices, tuple):
-            raise TypeError(
-                f"indices must be a tuple, got {type(indices).__name__}"
-            )
-        index_values: list[int] = []
-        seen_indices: set[int] = set()
-        previous_index: int | None = None
-        for index in indices:
-            index_value = self._require_checkpoint_index(index, "indices")
-            if index_value < 0:
-                raise ValueError(
-                    "indices checkpoint index must be non-negative"
-                )
-            if index_value >= point_count:
-                raise ValueError(
-                    f"indices checkpoint index {index_value} is out of "
-                    f"range for {point_count} checkpoint(s)"
-                )
-            if index_value in seen_indices:
-                raise ValueError(
-                    f"duplicate checkpoint index {index_value}"
-                )
-            if previous_index is not None and index_value <= previous_index:
-                raise ValueError(
-                    "indices checkpoint indices must be strictly increasing"
-                )
-            seen_indices.add(index_value)
-            previous_index = index_value
-            index_values.append(index_value)
+        index_values = self._validate_slice_indices(indices, point_count)
 
         causes, direction, depth_value, node_limit_value = (
             self._validate_slice_inputs(causes, direction, depth, node_limit)
         )
-        change_limit_value = BranchStore._require_size_bound(
+        change_limit_value = BranchStore._require_record_limit(
             change_limit, "change_limit"
         )
-        if change_limit_value < 1:
-            raise ValueError("change_limit must be >= 1")
 
         # Capture the single read-only historical view once; every prefix
         # is taken from it, so the slices never disagree about history.
         prepared = self._capture_frontier_view(validated)
+        snapshots, segments = self._cascade_slice_timeline_data(
+            prepared,
+            index_values,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+        )
+        return {"snapshots": snapshots, "segments": segments}
 
+    def cascade_slice_lifetimes(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        indices: tuple[int, ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+    ) -> dict[str, object]:
+        """Summarize evidence identity lifetimes over a slice timeline.
+
+        The read-only lifetime companion of
+        :meth:`cascade_slice_timeline`: it is called with every argument
+        of that query -- none has a default -- followed by
+        ``lifetime_limit``. The ``indices`` window is the whole
+        observation window: the query reads only the selected snapshots
+        and the adjacent change segments of the one frozen timeline that
+        :meth:`cascade_slice_timeline` assembles on the shared
+        historical view, never any other historical position.
+
+        Validation runs in exactly :meth:`cascade_slice_timeline`'s
+        order -- the ordinary inputs, then ``indices``, then the
+        existing slice inputs ``causes``, ``direction``, ``depth`` and
+        ``node_limit``, then ``change_limit`` -- and ``lifetime_limit``
+        is validated last: it must be a non-``bool`` :class:`int` (else
+        :class:`TypeError`) and at least one (else :class:`ValueError`).
+        Only then do the branch and historical-node lookups, checkpoint
+        alignment and the candidate-count cap run, all on the one frozen
+        view, keeping the existing :class:`KeyError`/:class:`ValueError`
+        contracts and lookup order; the per-position node cap and the
+        total change cap are enforced exactly as in
+        :meth:`cascade_slice_timeline`.
+
+        Nodes are identified by their cause event and state key, edges
+        solely by the node identities of their two endpoints and gaps by
+        their interval and member combination. The result is a fresh
+        dict whose only key is ``lifetimes``: a tuple of fresh dicts,
+        one per identity that appears in at least one selected snapshot
+        -- an identity that never appears produces no record. Each
+        record's keys are ordered ``type, identity, first_seen,
+        last_seen, intervals, transitions``: ``type`` is ``node``,
+        ``edge`` or ``gap``; ``first_seen`` and ``last_seen`` are the
+        first and last selected checkpoint indices the identity appears
+        at; ``intervals`` holds the closed checkpoint-index intervals of
+        presence in time order, continuing only while adjacent selected
+        snapshots both carry the identity -- a disappearance followed by
+        a reappearance opens a new interval; ``transitions`` collects
+        the identity's additions, removals and content changes segment
+        by segment in time order, each a fresh dict keeping the original
+        change classification and isolated copies of both sides'
+        evidence. Evidence already present in the first selected
+        snapshot counts toward the lifetime only; no addition change is
+        fabricated for it. Records are ordered by ``node``, then
+        ``edge``, then ``gap``; within each type they are stably sorted
+        by first-appearance index, ties keeping the existing identity
+        order.
+
+        When the record count exceeds ``lifetime_limit`` a
+        :class:`ValueError` is raised and no partial result is returned.
+        An empty ``indices`` still completes every input and state
+        check, then returns an empty tuple; an empty ``causes`` tuple
+        does the same. Objects at every level are freshly built and
+        share nothing with each other or internal state, so repeated
+        calls return item-wise equal results. The query is read-only:
+        success or failure never modifies the event graph, branch heads,
+        audit or idempotency records, or any existing query, and the
+        existing cascade, slice, diff, timeline and turning-point
+        explanation behavior is unchanged.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The checkpoint indices come next, then the existing slice inputs
+        # and change_limit in their existing order; lifetime_limit is
+        # validated last, all before any state is queried.
+        point_count = self._frontier_point_count(validated)
+        index_values = self._validate_slice_indices(indices, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+
+        # Capture the single read-only historical view once; the selected
+        # snapshots and adjacent segments are taken from it, so the
+        # lifetimes never read different branch states per position.
+        prepared = self._capture_frontier_view(validated)
+        snapshots, segments = self._cascade_slice_timeline_data(
+            prepared,
+            index_values,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+        )
+        lifetimes = self._build_slice_lifetimes(snapshots, segments)
+
+        # The full record set is known before the cap is enforced, so an
+        # over-cap call returns no partial lifetimes.
+        if len(lifetimes) > lifetime_limit_value:
+            raise ValueError(
+                f"cascade slice lifetimes lifetime limit exceeded: "
+                f"{len(lifetimes)} lifetime records, limit is "
+                f"{lifetime_limit_value}"
+            )
+        return {"lifetimes": lifetimes}
+
+    def _cascade_slice_timeline_data(
+        self,
+        prepared: dict[str, object],
+        index_values: list[int],
+        causes: tuple[str, ...],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+        change_limit_value: int,
+    ) -> tuple[tuple[dict[str, object], ...], tuple[dict[str, object], ...]]:
+        """Build the frozen per-index snapshots and adjacent segments.
+
+        Shared by :meth:`cascade_slice_timeline` and
+        :meth:`cascade_slice_lifetimes` so both read the same selected
+        snapshots and adjacent change segments from the one captured
+        view. Every input and state check has already run; an empty
+        index list selects nothing, an empty cause set yields an empty
+        slice per position, and the per-position node cap and the total
+        change cap are enforced before any result is assembled.
+        """
         if not index_values:
             # Every input and state check is done; no position is selected.
-            return {"snapshots": (), "segments": ()}
+            return (), ()
 
         if not causes:
             # Every input and state check is done; an empty set yields an
             # empty slice per position and never trips the node cap.
-            return {
-                "snapshots": tuple(
+            return (
+                tuple(
                     {
                         "index": index_value,
                         "slice": {"nodes": (), "edges": (), "gaps": ()},
                     }
                     for index_value in index_values
                 ),
-                "segments": tuple(
+                tuple(
                     {"before": before, "after": after, "changes": ()}
                     for before, after in zip(index_values, index_values[1:])
                 ),
-            }
+            )
 
         cascades = [
             self._build_decision_cascade(
@@ -3819,7 +3955,184 @@ class BranchStore:
                 f"{change_count} change records, limit is "
                 f"{change_limit_value}"
             )
-        return {"snapshots": snapshots, "segments": tuple(segments)}
+        return snapshots, tuple(segments)
+
+    @staticmethod
+    def _build_slice_lifetimes(
+        snapshots: tuple[dict[str, object], ...],
+        segments: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Aggregate per-identity lifetimes over frozen snapshots/segments.
+
+        Identities never use slice position numbers: edge endpoints are
+        remapped back to node identities, exactly as in
+        :meth:`_build_slice_changes`. Presence is tracked per selected
+        position, so an identity seen at two positions separated by an
+        absence closes one interval and opens another. Transitions reuse
+        the segments' own change records -- already isolated copies --
+        keeping their classification and both sides' evidence; evidence
+        present in the first selected snapshot has no segment before it,
+        so it never gains a fabricated addition.
+        """
+        index_values = [snapshot["index"] for snapshot in snapshots]
+        first_seen: dict[str, dict[object, int]] = {
+            "node": {},
+            "edge": {},
+            "gap": {},
+        }
+        last_seen: dict[str, dict[object, int]] = {
+            "node": {},
+            "edge": {},
+            "gap": {},
+        }
+        # Identity -> selected positions (ascending) where it appears.
+        presence: dict[str, dict[object, list[int]]] = {
+            "node": {},
+            "edge": {},
+            "gap": {},
+        }
+        transitions: dict[str, dict[object, list[dict[str, object]]]] = {
+            "node": {},
+            "edge": {},
+            "gap": {},
+        }
+
+        for position, snapshot in enumerate(snapshots):
+            index_value = snapshot["index"]
+            slice_result = snapshot["slice"]
+            nodes = slice_result["nodes"]
+            typed_identities = {
+                "node": [
+                    (node["cause"], node["key"]) for node in nodes
+                ],
+                "edge": [
+                    (
+                        (
+                            nodes[edge["source"]]["cause"],
+                            nodes[edge["source"]]["key"],
+                        ),
+                        (
+                            nodes[edge["target"]]["cause"],
+                            nodes[edge["target"]]["key"],
+                        ),
+                    )
+                    for edge in slice_result["edges"]
+                ],
+                "gap": [
+                    (gap["interval"], tuple(gap["members"]))
+                    for gap in slice_result["gaps"]
+                ],
+            }
+            for type_name, identities in typed_identities.items():
+                for identity in identities:
+                    if identity not in first_seen[type_name]:
+                        first_seen[type_name][identity] = index_value
+                        presence[type_name][identity] = []
+                    last_seen[type_name][identity] = index_value
+                    presence[type_name][identity].append(position)
+
+        for segment in segments:
+            for change in segment["changes"]:
+                type_name = change["kind"].split("_", 1)[0]
+                transitions[type_name].setdefault(
+                    change["identity"], []
+                ).append(
+                    {
+                        "kind": change["kind"],
+                        "before": change["before"],
+                        "after": change["after"],
+                    }
+                )
+
+        lifetimes: list[dict[str, object]] = []
+        for type_name in ("node", "edge", "gap"):
+            records: list[dict[str, object]] = []
+            # Dict order is the first-encounter order, which is the
+            # existing identity order within each snapshot sequence.
+            for identity, first in first_seen[type_name].items():
+                positions = presence[type_name][identity]
+                intervals: list[tuple[int, int]] = []
+                run_start = positions[0]
+                previous = positions[0]
+                for position in positions[1:]:
+                    if position != previous + 1:
+                        intervals.append(
+                            (index_values[run_start], index_values[previous])
+                        )
+                        run_start = position
+                    previous = position
+                intervals.append(
+                    (index_values[run_start], index_values[previous])
+                )
+                records.append(
+                    {
+                        "type": type_name,
+                        "identity": identity,
+                        "first_seen": first,
+                        "last_seen": last_seen[type_name][identity],
+                        "intervals": tuple(intervals),
+                        "transitions": tuple(
+                            transitions[type_name].get(identity, ())
+                        ),
+                    }
+                )
+            # Stable sort: ties on the first-appearance index keep the
+            # existing identity order.
+            records.sort(key=lambda record: record["first_seen"])
+            lifetimes.extend(records)
+        return tuple(lifetimes)
+
+    @staticmethod
+    def _validate_slice_indices(indices: Any, point_count: int) -> list[int]:
+        """Validate the ``indices`` checkpoint window of the slice queries.
+
+        Shared by :meth:`cascade_slice_timeline` and
+        :meth:`cascade_slice_lifetimes` so both apply identical checks in
+        the same order: a tuple (else :class:`TypeError`) of non-``bool``
+        :class:`int` elements walked in input order, a negative or
+        out-of-range index, a duplicate or a non-increasing sequence
+        raising :class:`ValueError`.
+        """
+        if not isinstance(indices, tuple):
+            raise TypeError(
+                f"indices must be a tuple, got {type(indices).__name__}"
+            )
+        index_values: list[int] = []
+        seen_indices: set[int] = set()
+        previous_index: int | None = None
+        for index in indices:
+            index_value = BranchStore._require_checkpoint_index(
+                index, "indices"
+            )
+            if index_value < 0:
+                raise ValueError(
+                    "indices checkpoint index must be non-negative"
+                )
+            if index_value >= point_count:
+                raise ValueError(
+                    f"indices checkpoint index {index_value} is out of "
+                    f"range for {point_count} checkpoint(s)"
+                )
+            if index_value in seen_indices:
+                raise ValueError(
+                    f"duplicate checkpoint index {index_value}"
+                )
+            if previous_index is not None and index_value <= previous_index:
+                raise ValueError(
+                    "indices checkpoint indices must be strictly increasing"
+                )
+            seen_indices.add(index_value)
+            previous_index = index_value
+            index_values.append(index_value)
+        return index_values
+
+    @staticmethod
+    def _require_record_limit(value: Any, name: str) -> int:
+        """Validate one non-``bool`` record-count cap of at least one."""
+        limit_value = BranchStore._require_size_bound(value, name)
+        if limit_value < 1:
+            raise ValueError(f"{name} must be >= 1")
+        return limit_value
 
     @staticmethod
     def _require_checkpoint_index(value: Any, name: str) -> int:
