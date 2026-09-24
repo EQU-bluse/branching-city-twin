@@ -15,6 +15,7 @@ tests/test_cascade_slice.py
 tests/test_cascade_slice_diff.py
 tests/test_cascade_slice_lifetimes.py
 tests/test_cascade_slice_timeline.py
+tests/test_checkpoints.py
 tests/test_cli.py
 tests/test_combination_budget.py
 tests/test_compare_lifetimes.py
@@ -25,6 +26,8 @@ tests/test_explain_frontier_breakpoints.py
 tests/test_frontier_breakpoints.py
 tests/test_frontier_sensitivity.py
 tests/test_impact_budget.py
+tests/test_lifetime_evolution.py
 tests/test_rank_impacts.py
 tests/test_replay_at.py
 tests/test_search_combinations.py
+tests/test_snapshot_tokens.py
