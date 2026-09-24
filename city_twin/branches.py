@@ -3571,6 +3571,256 @@ class BranchStore:
             "changes": changes,
         }
 
+    def cascade_slice_timeline(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        indices: tuple[int, ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+    ) -> dict[str, object]:
+        """Snapshot frozen cascade slices at several historical checkpoints.
+
+        The read-only multi-checkpoint companion of
+        :meth:`cascade_slice_diff`: it is called with every ordinary
+        argument of that query -- none has a default -- with ``indices``
+        in place of the ``before``/``after`` pair and ``change_limit``
+        appended after ``node_limit``. The indices select historical
+        positions aligned across every series plan; each position uses
+        only the prefix of checkpoints from the first point up to and
+        including its index, and every prefix slice is answered from one
+        shared read-only historical view, so the batch never reads
+        different branch states per segment.
+
+        The ordinary inputs are validated first in exactly
+        :meth:`cascade_slice_diff`'s order, before any state is
+        consulted. ``indices`` is validated next: it must be a tuple
+        (else :class:`TypeError`) whose elements, walked in input order,
+        are each a non-``bool`` :class:`int` (a :class:`bool` or any
+        non-:class:`int` element raises :class:`TypeError`); a negative
+        or out-of-range index, a duplicated index or a sequence that is
+        not strictly increasing raises :class:`ValueError`. The range is
+        the shared checkpoint count of the series plans (zero plans leave
+        no valid index). The existing slice inputs -- ``causes``,
+        ``direction``, ``depth`` and ``node_limit`` -- are validated
+        afterwards in their existing order, and ``change_limit`` last:
+        it must be a non-``bool`` :class:`int` (else :class:`TypeError`)
+        and at least one (else :class:`ValueError`). Only then do the
+        branch and historical-node lookups, checkpoint alignment and the
+        candidate-count cap run, all on the one frozen view, keeping the
+        existing :class:`KeyError`/:class:`ValueError` contracts and
+        lookup order.
+
+        Cause events are handled in input order; a cause event absent
+        from every selected slice raises :class:`KeyError` (the first
+        such cause in input order). Each position's reachable set is
+        counted after the direction-and-depth expansion, and when any
+        position's set exceeds ``node_limit`` a :class:`ValueError` is
+        raised before any slice is assembled, so no partial timeline is
+        returned. The change records of every segment are counted
+        together; when their total exceeds ``change_limit`` a
+        :class:`ValueError` is raised and nothing is returned. An empty
+        ``indices`` still completes the ordinary-input, slice-input,
+        branch and historical-node checks, then returns two empty
+        tuples. An empty ``causes`` tuple still completes every input
+        and state check and yields an empty slice at every selected
+        position with an empty change set on every segment, never
+        tripping the node cap.
+
+        The result is a fresh dict whose keys are ordered ``snapshots,
+        segments``. ``snapshots`` is a tuple with one fresh dict per
+        index in its original order, whose keys are ordered ``index,
+        slice``: the checkpoint index and a fresh ``nodes, edges, gaps``
+        slice dict item-wise equal to the existing :meth:`cascade_slice`
+        result on that checkpoint prefix. ``segments`` compares adjacent
+        indices only: one fresh dict per adjacent pair in index order,
+        whose keys are ordered ``before, after, changes`` -- the two
+        adjacent checkpoint indices and the tuple of fresh change
+        records between their slices, with identity, classification and
+        ordering exactly as :meth:`cascade_slice_diff` produces them
+        (nodes, then edges, then gaps; removed, added and changed within
+        each group). Objects at every level are freshly built and share
+        nothing with each other or internal state, so repeated calls
+        return item-wise equal results. The query is read-only: success
+        or failure never modifies the event graph, branch heads, audit
+        or idempotency records, or any existing query, and the existing
+        cascade, single-point slice, two-point diff and turning-point
+        explanation behavior is unchanged.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The checkpoint indices come next, walked in input order (type,
+        # then sign, then range, then duplicates and monotonicity). The
+        # shared checkpoint count is pure validated input data, so the
+        # bounds need no state.
+        point_count = self._frontier_point_count(validated)
+        if not isinstance(indices, tuple):
+            raise TypeError(
+                f"indices must be a tuple, got {type(indices).__name__}"
+            )
+        index_values: list[int] = []
+        seen_indices: set[int] = set()
+        previous_index: int | None = None
+        for index in indices:
+            index_value = self._require_checkpoint_index(index, "indices")
+            if index_value < 0:
+                raise ValueError(
+                    "indices checkpoint index must be non-negative"
+                )
+            if index_value >= point_count:
+                raise ValueError(
+                    f"indices checkpoint index {index_value} is out of "
+                    f"range for {point_count} checkpoint(s)"
+                )
+            if index_value in seen_indices:
+                raise ValueError(
+                    f"duplicate checkpoint index {index_value}"
+                )
+            if previous_index is not None and index_value <= previous_index:
+                raise ValueError(
+                    "indices checkpoint indices must be strictly increasing"
+                )
+            seen_indices.add(index_value)
+            previous_index = index_value
+            index_values.append(index_value)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_size_bound(
+            change_limit, "change_limit"
+        )
+        if change_limit_value < 1:
+            raise ValueError("change_limit must be >= 1")
+
+        # Capture the single read-only historical view once; every prefix
+        # is taken from it, so the slices never disagree about history.
+        prepared = self._capture_frontier_view(validated)
+
+        if not index_values:
+            # Every input and state check is done; no position is selected.
+            return {"snapshots": (), "segments": ()}
+
+        if not causes:
+            # Every input and state check is done; an empty set yields an
+            # empty slice per position and never trips the node cap.
+            return {
+                "snapshots": tuple(
+                    {
+                        "index": index_value,
+                        "slice": {"nodes": (), "edges": (), "gaps": ()},
+                    }
+                    for index_value in index_values
+                ),
+                "segments": tuple(
+                    {"before": before, "after": after, "changes": ()}
+                    for before, after in zip(index_values, index_values[1:])
+                ),
+            }
+
+        cascades = [
+            self._build_decision_cascade(
+                self._prefix_frontier_view(prepared, index_value + 1)
+            )
+            for index_value in index_values
+        ]
+
+        # A cause event must appear in at least one position's selected
+        # slice; the first cause absent everywhere raises. Start positions
+        # follow cause input order, skipping positions whose prefix does
+        # not carry the cause.
+        positions_per_cascade: list[dict[str, list[int]]] = []
+        for cascade in cascades:
+            positions: dict[str, list[int]] = {}
+            for position, node in enumerate(cascade["nodes"]):
+                positions.setdefault(node["cause"], []).append(position)
+            positions_per_cascade.append(positions)
+        for cause in causes:
+            if not any(
+                cause in positions for positions in positions_per_cascade
+            ):
+                raise KeyError(cause)
+
+        selected_per_cascade: list[set[int]] = []
+        for cascade, positions in zip(cascades, positions_per_cascade):
+            starts: list[int] = []
+            for cause in causes:
+                starts.extend(positions.get(cause, ()))
+            selected_per_cascade.append(
+                self._expand_slice_nodes(
+                    cascade["nodes"],
+                    cascade["edges"],
+                    starts,
+                    direction,
+                    depth_value,
+                )
+            )
+
+        # Every reachable set is known before any cap is enforced, so an
+        # over-cap position returns no partial timeline.
+        for index_value, selected in zip(index_values, selected_per_cascade):
+            if len(selected) > node_limit_value:
+                raise ValueError(
+                    f"cascade slice node limit exceeded: {len(selected)} "
+                    f"nodes selected on the slice at checkpoint index "
+                    f"{index_value}, limit is {node_limit_value}"
+                )
+
+        slices = [
+            self._assemble_cascade_slice(cascade, selected)
+            for cascade, selected in zip(cascades, selected_per_cascade)
+        ]
+        snapshots = tuple(
+            {"index": index_value, "slice": slice_result}
+            for index_value, slice_result in zip(index_values, slices)
+        )
+
+        segments: list[dict[str, object]] = []
+        change_count = 0
+        for position in range(len(slices) - 1):
+            changes = self._build_slice_changes(
+                slices[position], slices[position + 1]
+            )
+            change_count += len(changes)
+            segments.append(
+                {
+                    "before": index_values[position],
+                    "after": index_values[position + 1],
+                    "changes": changes,
+                }
+            )
+        if change_count > change_limit_value:
+            raise ValueError(
+                f"cascade slice timeline change limit exceeded: "
+                f"{change_count} change records, limit is "
+                f"{change_limit_value}"
+            )
+        return {"snapshots": snapshots, "segments": tuple(segments)}
+
     @staticmethod
     def _require_checkpoint_index(value: Any, name: str) -> int:
         """Validate one non-``bool`` checkpoint index parameter."""
