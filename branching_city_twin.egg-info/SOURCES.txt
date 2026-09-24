@@ -13,9 +13,11 @@ tests/test_audit_log.py
 tests/test_audit_trace.py
 tests/test_cascade_slice.py
 tests/test_cascade_slice_diff.py
+tests/test_cascade_slice_lifetimes.py
 tests/test_cascade_slice_timeline.py
 tests/test_cli.py
 tests/test_combination_budget.py
+tests/test_compare_lifetimes.py
 tests/test_decision_cascade.py
 tests/test_divergence_matrix.py
 tests/test_divergence_timeline.py
