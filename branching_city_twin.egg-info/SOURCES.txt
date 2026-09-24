@@ -11,6 +11,17 @@ city_twin/event_graph.py
 tests/test_attribute_divergence.py
 tests/test_audit_log.py
 tests/test_audit_trace.py
+tests/test_cascade_slice.py
+tests/test_cascade_slice_diff.py
 tests/test_cli.py
+tests/test_combination_budget.py
+tests/test_decision_cascade.py
+tests/test_divergence_matrix.py
 tests/test_divergence_timeline.py
+tests/test_explain_frontier_breakpoints.py
+tests/test_frontier_breakpoints.py
+tests/test_frontier_sensitivity.py
+tests/test_impact_budget.py
+tests/test_rank_impacts.py
 tests/test_replay_at.py
+tests/test_search_combinations.py
