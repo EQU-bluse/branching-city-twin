@@ -1411,6 +1411,398 @@ class BranchStore:
         )
         return tuple(rows)
 
+    def combination_budget(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        combinations: dict[str, tuple[str, ...]],
+        weights: dict[str, int | float],
+        total_budget: int | float,
+        key_budgets: dict[str, int | float],
+    ) -> tuple[dict[str, object], ...]:
+        """Judge simultaneously applied branch combinations against budgets.
+
+        The read-only portfolio companion of :meth:`impact_budget`: each
+        entry of ``combinations`` names a set of series branches applied
+        together, and their per-checkpoint divergences from ``reference``
+        are aggregated before being weighed against the same two budgets.
+        ``series``, ``weights``, ``total_budget`` and ``key_budgets`` keep
+        exactly :meth:`impact_budget`'s numeric conventions and errors.
+
+        ``reference`` and ``series`` are validated first, in exactly
+        :meth:`impact_budget`'s order and with its errors: a non-``str``
+        or empty ``reference`` raises :class:`TypeError`/
+        :class:`ValueError`; ``series`` must be a dict (else
+        :class:`TypeError`); its keys are checked in insertion order, a
+        non-``str`` series name raising :class:`TypeError` and an empty or
+        ``reference``-equal name raising :class:`ValueError`; points are
+        walked in input order (a non-tuple container or non-length-2-tuple
+        point raises :class:`TypeError`, non-``str`` or empty node ids
+        raise :class:`TypeError`/:class:`ValueError`, a repeated node pair
+        raises :class:`ValueError`). ``combinations`` is checked next: it
+        must be a dict (else :class:`TypeError`) mapping non-empty
+        combination names to member branch tuples; a non-``str``
+        combination name raises :class:`TypeError` and an empty one
+        :class:`ValueError`; members that are not tuples raise
+        :class:`TypeError`; within a combination, walked in input order, a
+        non-``str`` member raises :class:`TypeError`, and an empty,
+        duplicated or non-series member name raises :class:`ValueError`.
+        Every member of one combination must have the same number of
+        checkpoints and the same reference node at each position, else
+        :class:`ValueError`; an empty member tuple applies no branch at
+        all. ``weights``, ``total_budget`` and ``key_budgets`` are checked
+        last, before any branch is looked up, with exactly
+        :meth:`impact_budget`'s contract and errors. The branches are then
+        looked up, reference first and then the series in ``series``
+        insertion order (unknown branch :class:`KeyError`), and nodes are
+        checked per pair, left before right, pairs in points order
+        (:class:`KeyError` when absent from the graph or the named
+        branch's current head closure).
+
+        Every combination, checkpoint and key is answered from one shared
+        read-only historical view: the reference branch's and every series
+        branch's current head closures and every node's own closure are
+        taken once before results are built. At each aligned checkpoint
+        the signed difference ``member value minus reference value`` is
+        summed per key over the combination's members -- a side that never
+        introduced a key contributes ``0`` -- and the total risk is the
+        sum, over the weight keys, of the absolute aggregate difference
+        times the key's weight: plain Python arithmetic yielding an
+        :class:`int` or :class:`float`, never rounded, and a zero (integer
+        or float) is never negative zero. A checkpoint breaches when its
+        total risk is strictly greater than ``total_budget``, or when any
+        configured key's absolute aggregate difference is strictly greater
+        than that key's per-key budget.
+
+        Each combination contributes a fresh dict whose keys are ordered
+        ``combination, members, breached, first_breach, max_overrun,
+        remaining, over_keys, contributions, attributions``:
+        ``combination`` is the combination name and ``members`` its member
+        branch names in member order; ``breached`` says whether any
+        checkpoint ever breached; ``first_breach`` is the index of the
+        first checkpoint that did, or ``None`` when none did;
+        ``max_overrun`` is the largest breach magnitude seen -- the
+        maximum, over every checkpoint, of the total risk above
+        ``total_budget`` and of each breaching key's excess aggregate
+        difference multiplied by that key's weight -- or ``0`` when
+        nothing ever breached; ``remaining`` is ``total_budget`` minus the
+        final checkpoint's risk (plain Python arithmetic, may be
+        negative); ``over_keys`` is the tuple of keys still over their
+        per-key budget at the final checkpoint, ordered by Unicode code
+        point. ``contributions`` holds each member's marginal contribution
+        at the final checkpoint -- the full combination's risk minus the
+        risk of the combination with that member removed -- which may be
+        negative and is returned in member order. ``attributions`` aligns
+        one-to-one with ``over_keys``: one fresh dict per such key whose
+        keys are ordered ``key, aggregate, diffs, attributions`` -- the
+        key, its signed aggregate difference at the final checkpoint, the
+        tuple of the members' signed branch differences for the key in
+        member order, and the tuple of independent copies of the existing
+        historical divergence attribution for each member at that same
+        checkpoint (the ``key, fork, left, right`` structure of
+        :meth:`attribute_divergence_at` between the shared reference node
+        and the member's node), detached from every other returned object.
+        A combination with no checkpoints -- an empty member tuple or
+        members without points -- never breaches: its final risk is ``0``,
+        ``remaining`` equals ``total_budget`` and every member's
+        contribution is ``0``.
+
+        The rows are sorted with every ever-breached combination first;
+        within that grouping they are ordered by descending
+        ``max_overrun``, then ascending ``first_breach`` with ``None``
+        placed after every integer, then by the Unicode code point of the
+        combination name. An empty ``combinations`` still validates every
+        input and looks the reference branch up, yielding an empty tuple;
+        empty ``weights`` still checks every member, branch and node and
+        yields zero risk (``key_budgets`` must then be empty). The tuples
+        and dicts at every level are freshly built, neither sharing
+        objects with each other nor aliasing internal state. Success or
+        failure never modifies the graph, branch heads, audit or
+        idempotency records, or any existing divergence interface.
+        """
+        # --- All inputs finish validating before any branch is looked up,
+        # mirroring impact_budget with combinations after series. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        series_points_by_name: dict[str, tuple[tuple[str, str], ...]] = {}
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            per_series.append((series_name, series_points))
+            series_points_by_name[series_name] = series_points
+        if not isinstance(combinations, dict):
+            raise TypeError(
+                "combinations must be a dict, got "
+                f"{type(combinations).__name__}"
+            )
+        per_combination: list[tuple[str, tuple[str, ...]]] = []
+        for combination_name, members in combinations.items():
+            self._require_nonempty_str(combination_name, "combination")
+            if not isinstance(members, tuple):
+                raise TypeError(
+                    f"members must be a tuple, got {type(members).__name__}"
+                )
+            seen_members: set[str] = set()
+            for member in members:
+                self._require_nonempty_str(member, "member")
+                if member in seen_members:
+                    raise ValueError(f"duplicate member {member!r}")
+                seen_members.add(member)
+                if member not in series:
+                    raise ValueError(
+                        f"member {member!r} of combination "
+                        f"{combination_name!r} is absent from series"
+                    )
+            if members:
+                anchor = series_points_by_name[members[0]]
+                for member in members[1:]:
+                    member_points = series_points_by_name[member]
+                    if len(member_points) != len(anchor) or any(
+                        point[0] != anchor_point[0]
+                        for point, anchor_point in zip(member_points, anchor)
+                    ):
+                        raise ValueError(
+                            f"members of combination {combination_name!r} "
+                            "must share checkpoint count and reference nodes"
+                        )
+            per_combination.append((combination_name, members))
+        ordered_keys = self._validate_weights(weights)
+        self._require_finite_budget(total_budget, "total budget")
+        if not isinstance(key_budgets, dict):
+            raise TypeError(
+                "key_budgets must be a dict, got "
+                f"{type(key_budgets).__name__}"
+            )
+        for limit_key, limit in key_budgets.items():
+            EventGraph._require_nonempty_str(
+                limit_key, "per-key budget key"
+            )
+            self._require_finite_budget(
+                limit, f"per-key budget for {limit_key!r}"
+            )
+            if limit_key not in weights:
+                raise ValueError(
+                    f"per-key budget key {limit_key!r} is absent from weights"
+                )
+
+        self._require_known_branch(reference)
+        if not combinations:
+            return ()
+
+        # Capture the shared read-only view before any result is built,
+        # exactly as in impact_budget: every combination is answered from
+        # the same historical closures.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views_by_name: dict[
+            str, list[tuple[list[str], list[str], str, str]]
+        ] = {}
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            views_by_name[series_name] = [
+                (
+                    self._graph._ordered_ancestors(node_a),
+                    self._graph._ordered_ancestors(node_b),
+                    node_a,
+                    node_b,
+                )
+                for node_a, node_b in series_points
+            ]
+
+        rows: list[dict[str, object]] = []
+        for combination_name, members in per_combination:
+            member_views = [views_by_name[member] for member in members]
+            point_count = len(member_views[0]) if member_views else 0
+
+            breached = False
+            first_breach: int | None = None
+            max_overrun: int | float = 0
+            final_risk: int | float = 0
+            final_over_keys: list[str] = []
+            final_aggregate: dict[str, int] = {}
+            final_member_diffs: list[dict[str, int]] = []
+            final_position: list[
+                tuple[list[str], list[str], str, str]
+            ] | None = None
+
+            for index in range(point_count):
+                position = [views[index] for views in member_views]
+                # The reference node is shared across members, so its
+                # replayed values are computed once per checkpoint.
+                reference_order = position[0][0]
+                reference_values = {
+                    key: self._replayed_value(reference_order, key)
+                    for key in ordered_keys
+                }
+                aggregate: dict[str, int] = {
+                    key: 0 for key in ordered_keys
+                }
+                member_diffs: list[dict[str, int]] = []
+                for _, right_order, _, _ in position:
+                    diffs: dict[str, int] = {}
+                    for key in ordered_keys:
+                        diff = (
+                            self._replayed_value(right_order, key)
+                            - reference_values[key]
+                        )
+                        diffs[key] = diff
+                        aggregate[key] += diff
+                    member_diffs.append(diffs)
+
+                risk: int | float = 0
+                for key in ordered_keys:
+                    risk += abs(aggregate[key]) * weights[key]
+                # A zero risk must never surface as negative zero.
+                if risk == 0:
+                    risk = 0 if isinstance(risk, int) else 0.0
+
+                key_breaches = [
+                    key
+                    for key in ordered_keys
+                    if key in key_budgets
+                    and abs(aggregate[key]) > key_budgets[key]
+                ]
+                if risk > total_budget or key_breaches:
+                    if not breached:
+                        breached = True
+                        first_breach = index
+                    # The checkpoint's breach magnitude is the greatest of
+                    # its total overrun and every breaching key's weighted
+                    # excess; no overrun contributes a negative amount.
+                    point_overrun: int | float = (
+                        risk - total_budget if risk > total_budget else 0
+                    )
+                    for key in key_breaches:
+                        amount = (
+                            abs(aggregate[key]) - key_budgets[key]
+                        ) * weights[key]
+                        if amount > point_overrun:
+                            point_overrun = amount
+                    if point_overrun > max_overrun:
+                        max_overrun = point_overrun
+
+                final_risk = risk
+                final_over_keys = key_breaches
+                final_aggregate = aggregate
+                final_member_diffs = member_diffs
+                final_position = position
+
+            # Each member's marginal contribution at the final checkpoint
+            # is the full combination's risk minus the risk without it.
+            contributions: list[int | float] = []
+            for member_index in range(len(members)):
+                if final_position is None:
+                    contributions.append(0)
+                    continue
+                excluded_risk: int | float = 0
+                for key in ordered_keys:
+                    excluded = (
+                        final_aggregate[key]
+                        - final_member_diffs[member_index][key]
+                    )
+                    excluded_risk += abs(excluded) * weights[key]
+                if excluded_risk == 0:
+                    excluded_risk = (
+                        0 if isinstance(excluded_risk, int) else 0.0
+                    )
+                contribution = final_risk - excluded_risk
+                # A zero contribution must never surface as negative zero.
+                if contribution == 0:
+                    contribution = (
+                        0 if isinstance(contribution, int) else 0.0
+                    )
+                contributions.append(contribution)
+
+            attributions: list[dict[str, object]] = []
+            if final_position is not None and final_over_keys:
+                for key in sorted(final_over_keys):
+                    # Attributions reuse the existing historical divergence
+                    # result at this same checkpoint, freshly copied so the
+                    # returned objects share nothing with each other.
+                    attributions.append(
+                        {
+                            "key": key,
+                            "aggregate": final_aggregate[key],
+                            "diffs": tuple(
+                                diffs[key]
+                                for diffs in final_member_diffs
+                            ),
+                            "attributions": tuple(
+                                self._copy_attribution(
+                                    self._attribute_divergence_on_orders(
+                                        left_order,
+                                        right_order,
+                                        node_a,
+                                        node_b,
+                                        key,
+                                    )
+                                )
+                                for (
+                                    left_order,
+                                    right_order,
+                                    node_a,
+                                    node_b,
+                                ) in final_position
+                            ),
+                        }
+                    )
+
+            remaining = total_budget - final_risk
+            # Remaining must never surface as negative zero.
+            if remaining == 0:
+                remaining = 0 if isinstance(remaining, int) else 0.0
+            rows.append(
+                {
+                    "combination": combination_name,
+                    "members": tuple(members),
+                    "breached": breached,
+                    "first_breach": first_breach,
+                    "max_overrun": max_overrun,
+                    "remaining": remaining,
+                    "over_keys": tuple(final_over_keys),
+                    "contributions": tuple(contributions),
+                    "attributions": tuple(attributions),
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                not row["breached"],
+                -row["max_overrun"],
+                row["first_breach"] is None,
+                (
+                    row["first_breach"]
+                    if row["first_breach"] is not None
+                    else 0
+                ),
+                row["combination"],
+            )
+        )
+        return tuple(rows)
+
     @staticmethod
     def _require_finite_budget(value: Any, name: str) -> None:
         """Validate one budget number, shared by the total and per-key maps.
