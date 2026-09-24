@@ -1143,6 +1143,292 @@ class BranchStore:
         )
         return tuple(rows)
 
+    def impact_budget(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        weights: dict[str, int | float],
+        total_budget: int | float,
+        key_budgets: dict[str, int | float],
+    ) -> tuple[dict[str, object], ...]:
+        """Evaluate weighted checkpoint risk against an operating budget.
+
+        The budget companion of :meth:`rank_impacts`: each entry of
+        ``series`` pairs a branch name with its own tuple of
+        ``(reference node, series node)`` checkpoint pairs, replayed
+        against the same ``reference`` branch exactly as there, and
+        ``weights`` maps each examined state key to its non-negative
+        weight. ``total_budget`` caps the weighted total risk at every
+        checkpoint, and ``key_budgets`` optionally caps the absolute
+        per-key difference of individual examined keys.
+
+        ``reference``, ``series`` and ``weights`` are validated first,
+        in exactly :meth:`rank_impacts`'s order and with its errors: a
+        non-``str`` or empty ``reference`` raises :class:`TypeError`/
+        :class:`ValueError`; ``series`` must be a dict (else
+        :class:`TypeError`); its keys are checked in insertion order, a
+        non-``str`` series name raising :class:`TypeError` and an empty
+        or ``reference``-equal name raising :class:`ValueError`; each
+        series' points are walked in input order (a non-tuple container
+        or non-length-2-tuple point raises :class:`TypeError`,
+        non-``str`` or empty node ids raise
+        :class:`TypeError`/:class:`ValueError`, a repeated node pair
+        raises :class:`ValueError`); and ``weights`` must be a dict of
+        non-empty string keys to non-``bool``, non-negative, finite
+        :class:`int`/:class:`float` weights. ``total_budget`` is checked
+        next: it must be a non-``bool`` :class:`int` or :class:`float`
+        (anything else raises :class:`TypeError`), and a negative, NaN
+        or infinite budget raises :class:`ValueError`. ``key_budgets``
+        is checked last, before any branch is looked up: it must be a
+        dict (else :class:`TypeError`); its entries are walked in
+        insertion order, a non-``str`` key raising :class:`TypeError`
+        and an empty key raising :class:`ValueError`; each budget must
+        be a non-``bool`` :class:`int` or :class:`float` (else
+        :class:`TypeError`) and must not be negative, NaN or infinite
+        (else :class:`ValueError`); and a key absent from ``weights``
+        raises :class:`ValueError` -- keys of ``weights`` may simply be
+        omitted, which leaves them without a per-key cap. The branches
+        are then looked up, reference first and then the series in
+        ``series`` insertion order (unknown branch :class:`KeyError`),
+        and nodes are checked per pair, left before right, pairs in
+        points order (:class:`KeyError` when absent from the graph or
+        the named branch's current head closure).
+
+        Every series, point and key is answered from one shared
+        read-only historical view: the reference branch's and every
+        series branch's current head closures and every node's own
+        closure are taken once before results are built. At each
+        checkpoint the total risk is the sum, over the examined keys
+        (the ``weights`` keys, ordered by Unicode code point), of the
+        absolute left/right replayed value difference times the key's
+        weight -- plain Python arithmetic yielding an :class:`int` or
+        :class:`float` with no rounding, and a zero result is never
+        negative zero. A checkpoint breaches when its total risk exceeds
+        ``total_budget`` or when an examined key with a configured
+        budget has an absolute difference exceeding it. Each branch
+        contributes a fresh dict whose keys are ordered ``branch,
+        breached, first_breach, max_overshoot, remaining, exceeded,
+        attributions``:
+
+        ``breached`` is whether any checkpoint breached, and
+        ``first_breach`` is the index of the first breaching checkpoint
+        or ``None`` when none did. ``max_overshoot`` is the largest of
+        the amounts by which a checkpoint's total risk exceeded
+        ``total_budget`` and of each key's excess over its own budget
+        times that key's weight, or zero when nothing ever exceeded.
+        ``remaining`` is ``total_budget`` minus the final checkpoint's
+        total risk and may be negative. ``exceeded`` is the tuple of
+        keys whose absolute difference exceeds their own budget at the
+        final checkpoint, ordered by Unicode code point, and
+        ``attributions`` aligns with it: one fresh ``key, fork, left,
+        right`` attribution dict per exceeded key, item-wise equal to
+        that key's ``last`` attribution in :meth:`divergence_matrix`
+        for the same arguments.
+
+        The rows list breaching branches first, then sort by descending
+        ``max_overshoot``, ascending ``first_breach`` with ``None``
+        placed after every integer, and finally the Unicode code point
+        of the branch name. An empty ``series`` still validates the
+        budgets and looks the reference branch up, yielding an empty
+        tuple; empty ``weights`` still validates every branch and node,
+        and each series then contributes a zero-risk row. A series with
+        no checkpoints also contributes a zero-risk row, whose
+        ``remaining`` equals ``total_budget``. The tuples and dicts at
+        every level are freshly built, neither sharing objects with each
+        other nor aliasing internal state. Success or failure never
+        modifies the graph, branch heads, audit or idempotency records.
+        """
+        # --- All inputs finish validating before any branch is looked
+        # up, mirroring rank_impacts with the budgets after weights. ---
+        self._require_nonempty_str(reference, "reference")
+        if not isinstance(series, dict):
+            raise TypeError(
+                f"series must be a dict, got {type(series).__name__}"
+            )
+        per_series: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+        for series_name, series_points in series.items():
+            self._require_nonempty_str(series_name, "series branch")
+            if series_name == reference:
+                raise ValueError(
+                    f"series branch {series_name!r} cannot equal reference "
+                    f"branch {reference!r}"
+                )
+            self._validate_points(series_points)
+            per_series.append((series_name, series_points))
+        ordered_keys = self._validate_weights(weights)
+        total_budget = self._require_budget(total_budget, "total_budget")
+        if not isinstance(key_budgets, dict):
+            raise TypeError(
+                f"key_budgets must be a dict, got {type(key_budgets).__name__}"
+            )
+        checked_budgets: dict[str, int | float] = {}
+        for key, value in key_budgets.items():
+            EventGraph._require_nonempty_str(key, "key budget key")
+            checked = self._require_budget(value, f"key budget for {key!r}")
+            if key not in weights:
+                raise ValueError(
+                    f"key budget for {key!r} has no matching weight"
+                )
+            checked_budgets[key] = checked
+
+        self._require_known_branch(reference)
+
+        # Capture the shared read-only view before any result is built,
+        # exactly as in rank_impacts.
+        reference_head_closure = set(
+            self._graph._ordered_ancestors(self._heads[reference])
+        )
+        views: list[
+            tuple[str, list[tuple[list[str], list[str], str, str]] | None]
+        ] = []
+        for series_name, series_points in per_series:
+            self._require_known_branch(series_name)
+            head_closure_b = set(
+                self._graph._ordered_ancestors(self._heads[series_name])
+            )
+            for node_a, node_b in series_points:
+                if (
+                    node_a not in self._graph._at
+                    or node_a not in reference_head_closure
+                ):
+                    raise KeyError(node_a)
+                if (
+                    node_b not in self._graph._at
+                    or node_b not in head_closure_b
+                ):
+                    raise KeyError(node_b)
+            ordered_points: list[
+                tuple[list[str], list[str], str, str]
+            ] | None = None
+            if series_points:
+                ordered_points = [
+                    (
+                        self._graph._ordered_ancestors(node_a),
+                        self._graph._ordered_ancestors(node_b),
+                        node_a,
+                        node_b,
+                    )
+                    for node_a, node_b in series_points
+                ]
+            views.append((series_name, ordered_points))
+
+        rows: list[dict[str, object]] = []
+        for series_name, ordered_points in views:
+            breached = False
+            first_breach: int | None = None
+            max_overshoot: int | float = 0
+            final_risk: int | float = 0
+            exceeded: tuple[str, ...] = ()
+            attributions: tuple[dict[str, object], ...] = ()
+            if ordered_points and ordered_keys:
+                # All per-checkpoint values come from the captured view.
+                attributed: list[dict[str, dict[str, Any]]] = [
+                    {
+                        key: self._attribute_divergence_on_orders(
+                            left_order, right_order, node_a, node_b, key
+                        )
+                        for key in ordered_keys
+                    }
+                    for left_order, right_order, node_a, node_b in (
+                        ordered_points
+                    )
+                ]
+                for index, per_key in enumerate(attributed):
+                    risk: int | float = 0
+                    point_breached = False
+                    for key in ordered_keys:
+                        record = per_key[key]
+                        diff = abs(
+                            record["left"]["value"]
+                            - record["right"]["value"]
+                        )
+                        risk += diff * weights[key]
+                        if (
+                            key in checked_budgets
+                            and diff > checked_budgets[key]
+                        ):
+                            point_breached = True
+                            excess = (diff - checked_budgets[key]) * (
+                                weights[key]
+                            )
+                            if excess > max_overshoot:
+                                max_overshoot = excess
+                    # A zero risk must never surface as negative zero.
+                    if risk == 0:
+                        risk = 0 if isinstance(risk, int) else 0.0
+                    if risk > total_budget:
+                        point_breached = True
+                        excess = risk - total_budget
+                        if excess > max_overshoot:
+                            max_overshoot = excess
+                    if point_breached:
+                        breached = True
+                        if first_breach is None:
+                            first_breach = index
+                    final_risk = risk
+                final = attributed[-1]
+                exceeded = tuple(
+                    key
+                    for key in ordered_keys
+                    if key in checked_budgets
+                    and abs(
+                        final[key]["left"]["value"]
+                        - final[key]["right"]["value"]
+                    )
+                    > checked_budgets[key]
+                )
+                attributions = tuple(
+                    self._copy_attribution(final[key]) for key in exceeded
+                )
+            rows.append(
+                {
+                    "branch": series_name,
+                    "breached": breached,
+                    "first_breach": first_breach,
+                    "max_overshoot": max_overshoot,
+                    "remaining": total_budget - final_risk,
+                    "exceeded": exceeded,
+                    "attributions": attributions,
+                }
+            )
+        rows.sort(
+            key=lambda row: (
+                not row["breached"],
+                -row["max_overshoot"],
+                row["first_breach"] is None,
+                (
+                    row["first_breach"]
+                    if row["first_breach"] is not None
+                    else 0
+                ),
+                row["branch"],
+            )
+        )
+        return tuple(rows)
+
+    @staticmethod
+    def _require_budget(value: Any, name: str) -> int | float:
+        """Validate a budget amount and return it.
+
+        Shared by the total and per-key budgets: a non-``bool``
+        :class:`int` or :class:`float` is required (anything else raises
+        :class:`TypeError`), and a negative, NaN or infinite value
+        raises :class:`ValueError`.
+        """
+        # bool is a subclass of int, but must not be accepted as one.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(
+                f"{name} must be an int or float, got "
+                f"{type(value).__name__}"
+            )
+        if isinstance(value, float) and (
+            math.isnan(value) or math.isinf(value)
+        ):
+            raise ValueError(f"{name} must be finite")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+        return value
+
     @staticmethod
     def _validate_weights(weights: Any) -> tuple[str, ...]:
         """Validate ``weights`` and return its keys in Unicode order.
