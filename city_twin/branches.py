@@ -5,9 +5,28 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+import threading
+import uuid
 from typing import Any
 
 from city_twin.event_graph import EventGraph
+
+
+class _SnapshotEntry:
+    """One snapshot token's frozen view and remaining read allowance.
+
+    ``store`` is a detached :class:`BranchStore` holding deep copies of the
+    creating store's event graph, heads and records at creation time; it is
+    never mutated afterwards. ``remaining`` counts successful queries only
+    and reaches zero exactly when the token expires. Read accounting and
+    expiry are decided under the owning store's snapshot lock.
+    """
+
+    __slots__ = ("store", "remaining")
+
+    def __init__(self, store: "BranchStore", max_reads: int) -> None:
+        self.store = store
+        self.remaining = max_reads
 
 
 class BranchStore:
@@ -22,6 +41,9 @@ class BranchStore:
     and idempotency records unchanged.
     """
 
+    #: Maximum number of live (unreleased) snapshot tokens per store.
+    MAX_SNAPSHOTS = 32
+
     def __init__(self, graph: EventGraph) -> None:
         if not isinstance(graph, EventGraph):
             raise TypeError(
@@ -32,6 +54,12 @@ class BranchStore:
         self._sources: dict[str, str] = {}
         self._appends: dict[str, dict[str, tuple[int, dict[str, int]]]] = {}
         self._merges: dict[str, tuple[str, str, int, dict[str, int]]] = {}
+        # token -> SnapshotEntry; only create_snapshot/release_snapshot and
+        # the snapshot-aware lifetime queries touch it.
+        self._snapshots: dict[str, "_SnapshotEntry"] = {}
+        # Guards only the token registry and each entry's read accounting, so
+        # a read reservation and the expiry decision stay one atomic step.
+        self._snapshot_lock = threading.Lock()
 
     @staticmethod
     def _require_nonempty_str(value: Any, name: str) -> None:
@@ -187,6 +215,155 @@ class BranchStore:
         # --- Commit: only after the graph accepted the event. ---
         self._heads[target] = id
         self._merges[id] = (target, source, at_value, changes)
+
+    def create_snapshot(self, max_reads: int) -> str:
+        """Freeze the current graph, heads and records into a snapshot token.
+
+        The token names a detached copy of everything the read-only
+        lifetime queries consult: the full event graph (timestamps, parent
+        tuples and per-event changes), every branch head, the append and
+        merge records that form the audit log and idempotency keys. Later
+        appends, merges or branch creation on this store never reach the
+        token's view, and the snapshot never shares a mutable object with
+        live state, so neither side can mutate the other.
+
+        ``max_reads`` must be a non-``bool`` :class:`int` (else
+        :class:`TypeError`) of at least one (else :class:`ValueError`);
+        it bounds how many token-bearing lifetime queries may succeed.
+        At most :attr:`MAX_SNAPSHOTS` (32) unreleased tokens -- expired
+        ones included -- may exist at once; reaching the cap raises
+        :class:`RuntimeError` without evicting an older token or
+        disturbing any existing one. Snapshot creation is read-only:
+        success or failure never modifies the event graph, branch heads,
+        audit or idempotency records.
+        """
+        if isinstance(max_reads, bool) or not isinstance(max_reads, int):
+            raise TypeError(
+                f"max_reads must be an int, got {type(max_reads).__name__}"
+            )
+        if max_reads < 1:
+            raise ValueError("max_reads must be >= 1")
+
+        with self._snapshot_lock:
+            # The cap is enforced before anything is copied, and expired
+            # tokens are still unreleased, so they keep their slot until
+            # release_snapshot frees it.
+            if len(self._snapshots) >= self.MAX_SNAPSHOTS:
+                raise RuntimeError(
+                    f"snapshot token limit reached: at most "
+                    f"{self.MAX_SNAPSHOTS} unreleased tokens per store"
+                )
+            frozen = self._copy_snapshot_view()
+            while True:
+                token = uuid.uuid4().hex
+                if token not in self._snapshots:
+                    break
+            self._snapshots[token] = _SnapshotEntry(frozen, max_reads)
+        return token
+
+    def release_snapshot(self, token: str) -> None:
+        """Release a snapshot token, valid or expired, and free its slot.
+
+        ``token`` must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`); an
+        unknown token, one already released or one owned by another store
+        raises :class:`KeyError`. Releasing a live token and releasing an
+        expired token both succeed and return ``None``; the slot becomes
+        reusable immediately and the token can never be restored. The
+        release never modifies the event graph, branch heads, audit or
+        idempotency records.
+        """
+        self._require_token_str(token)
+        with self._snapshot_lock:
+            entry = self._snapshots.pop(token, None)
+        if entry is None:
+            raise KeyError(token)
+        return None
+
+    @staticmethod
+    def _require_token_str(token: Any) -> None:
+        """Validate the token parameter's type and emptiness."""
+        if not isinstance(token, str):
+            raise TypeError(
+                f"token must be a str, got {type(token).__name__}"
+            )
+        if not token:
+            raise ValueError("token must be a non-empty str")
+
+    def _reserve_snapshot_read(self, token: str) -> "BranchStore":
+        """Validate ``token`` and atomically reserve one successful read.
+
+        Runs only after every ordinary query parameter has been validated.
+        The type/emptiness checks precede the registry lookup: a non-``str``
+        token raises :class:`TypeError`, an empty string raises
+        :class:`ValueError`, and an unknown, released or foreign token
+        raises :class:`KeyError`. A token whose allowance is exhausted is
+        expired: the query raises :class:`RuntimeError` without consuming
+        anything. Otherwise the allowance is decremented and the expiry
+        decision is made in the same locked step, so at most ``max_reads``
+        concurrent queries can ever succeed. Returns the token's frozen,
+        detached :class:`BranchStore` view.
+        """
+        self._require_token_str(token)
+        with self._snapshot_lock:
+            entry = self._snapshots.get(token)
+            if entry is None:
+                raise KeyError(token)
+            if entry.remaining <= 0:
+                raise RuntimeError(
+                    "snapshot token has expired: read allowance exhausted"
+                )
+            entry.remaining -= 1
+            return entry.store
+
+    def _refund_snapshot_read(self, token: str) -> None:
+        """Give a failed query's reserved read back to its token.
+
+        Query failures never consume the read allowance. A token released
+        in the meantime has no entry left and needs no refund; an expired
+        allowance restored here makes the token usable again, exactly as
+        if the failing query had never run.
+        """
+        with self._snapshot_lock:
+            entry = self._snapshots.get(token)
+            if entry is not None:
+                entry.remaining += 1
+
+    def _copy_snapshot_view(self) -> "BranchStore":
+        """Build a detached BranchStore copy of the current state.
+
+        Every event timestamp, parent tuple (immutable), change dict,
+        branch head, source, append record and merge record is copied into
+        a fresh graph and store; the result shares no mutable object with
+        live state, so later appends, merges or branch creation are
+        invisible to it and snapshot queries cannot mutate history.
+        """
+        graph = EventGraph()
+        for event_id in self._graph._at:
+            graph._at[event_id] = self._graph._at[event_id]
+            graph._parents[event_id] = self._graph._parents[event_id]
+            graph._changes[event_id] = dict(self._graph._changes[event_id])
+
+        frozen = BranchStore(graph)
+        frozen._heads = dict(self._heads)
+        frozen._sources = dict(self._sources)
+        frozen._appends = {
+            name: {
+                event_id: (at_value, dict(changes))
+                for event_id, (at_value, changes) in appends.items()
+            }
+            for name, appends in self._appends.items()
+        }
+        frozen._merges = {
+            event_id: (target, source, at_value, dict(changes))
+            for event_id, (
+                target,
+                source,
+                at_value,
+                changes,
+            ) in self._merges.items()
+        }
+        return frozen
 
     def audit_merge(self, id: str) -> dict[str, object]:
         """Return an audit record for the merge event ``id``.
@@ -3657,6 +3834,22 @@ class BranchStore:
         or idempotency records, or any existing query, and the existing
         cascade, single-point slice, two-point diff and turning-point
         explanation behavior is unchanged.
+
+        The trailing ``token`` is optional and defaults to ``None``;
+        omitting it keeps the existing positional signature, validation
+        order and return structure exactly as before. When a token from
+        :meth:`create_snapshot` is given, every ordinary parameter is
+        validated first (a non-``str`` token then raises
+        :class:`TypeError`, an empty string :class:`ValueError`, and an
+        unknown, released or foreign token :class:`KeyError`), one read
+        of the token's allowance is reserved atomically, and the branch
+        and historical-node checks run only inside the snapshot's frozen
+        view: branches or events created after the token are invisible,
+        so a missing branch or node keeps raising :class:`KeyError` and
+        an out-of-range alignment or count keeps raising
+        :class:`ValueError`. A failed state check never consumes the
+        reserved read; when the allowance is exhausted the token is
+        expired and further token queries raise :class:`RuntimeError`.
         """
         # Ordinary inputs are validated first, in exactly the existing
         # order, but no branch or historical node is looked up yet.
@@ -3720,6 +3913,7 @@ class BranchStore:
         node_limit: int,
         change_limit: int,
         lifetime_limit: int,
+        token: str | None = None,
     ) -> dict[str, object]:
         """Summarize evidence identity lifetimes over a slice timeline.
 
@@ -3780,6 +3974,18 @@ class BranchStore:
         audit or idempotency records, or any existing query, and the
         existing cascade, slice, diff, timeline and turning-point
         explanation behavior is unchanged.
+
+        The trailing ``token`` is optional and defaults to ``None``;
+        omitting it preserves the existing positional signature,
+        validation order and return structure. When a snapshot token is
+        given, all ordinary parameters are validated first, then the
+        token (non-``str`` :class:`TypeError`, empty :class:`ValueError`,
+        unknown/released/foreign :class:`KeyError`), one read is
+        reserved atomically, and both windows' state checks run inside
+        the frozen view -- later branch or event changes stay invisible
+        while existing :class:`KeyError`/:class:`ValueError` contracts
+        hold; a failed state check refunds the read, and an exhausted
+        token raises :class:`RuntimeError`.
         """
         # Ordinary inputs are validated first, in exactly the existing
         # order, but no branch or historical node is looked up yet.
@@ -3812,29 +4018,45 @@ class BranchStore:
             lifetime_limit, "lifetime_limit"
         )
 
-        # Capture the single read-only historical view once; the selected
-        # snapshots and adjacent segments are taken from it, so the
-        # lifetimes never read different branch states per position.
-        prepared = self._capture_frontier_view(validated)
-        snapshots, segments = self._cascade_slice_timeline_data(
-            prepared,
-            index_values,
-            causes,
-            direction,
-            depth_value,
-            node_limit_value,
-            change_limit_value,
-        )
-        lifetimes = self._build_slice_lifetimes(snapshots, segments)
-
-        # The full record set is known before the cap is enforced, so an
-        # over-cap call returns no partial lifetimes.
-        if len(lifetimes) > lifetime_limit_value:
-            raise ValueError(
-                f"cascade slice lifetimes lifetime limit exceeded: "
-                f"{len(lifetimes)} lifetime records, limit is "
-                f"{lifetime_limit_value}"
+        # Token checks come after every ordinary parameter. Without a token
+        # the query runs on live state exactly as before; with one, the read
+        # allowance is reserved atomically before any state check and given
+        # back if a state check (KeyError/ValueError below) fails, so only
+        # fully successful queries consume a read.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            # Capture the single read-only historical view once; the
+            # selected snapshots and adjacent segments are taken from it,
+            # so the lifetimes never read different branch states per
+            # position. For a token query the view is the frozen store
+            # captured at token creation, so later branch changes are
+            # invisible.
+            prepared = view._capture_frontier_view(validated)
+            snapshots, segments = view._cascade_slice_timeline_data(
+                prepared,
+                index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
             )
+            lifetimes = view._build_slice_lifetimes(snapshots, segments)
+
+            # The full record set is known before the cap is enforced, so an
+            # over-cap call returns no partial lifetimes.
+            if len(lifetimes) > lifetime_limit_value:
+                raise ValueError(
+                    f"cascade slice lifetimes lifetime limit exceeded: "
+                    f"{len(lifetimes)} lifetime records, limit is "
+                    f"{lifetime_limit_value}"
+                )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
         return {"lifetimes": lifetimes}
 
     def compare_lifetimes(
@@ -3858,6 +4080,7 @@ class BranchStore:
         change_limit: int,
         lifetime_limit: int,
         diff_limit: int,
+        token: str | None = None,
     ) -> dict[str, object]:
         """Diff the identity lifetimes of two slice-timeline windows.
 
@@ -3928,6 +4151,18 @@ class BranchStore:
         branch heads, audit or idempotency records, or any existing
         query, and the existing cascade, slice, diff, timeline, lifetime
         and turning-point explanation behavior is unchanged.
+
+        The trailing ``token`` is optional and defaults to ``None``;
+        omitting it preserves the existing positional signature,
+        validation order and return structure. When a snapshot token is
+        given, all ordinary parameters are validated first, then the
+        token (non-``str`` :class:`TypeError`, empty :class:`ValueError`,
+        unknown/released/foreign :class:`KeyError`), one read is
+        reserved atomically, and every window's state checks run inside
+        the frozen view -- later branch or event changes stay invisible
+        while existing :class:`KeyError`/:class:`ValueError` contracts
+        hold; a failed state check refunds the read, and an exhausted
+        token raises :class:`RuntimeError`.
         """
         # Ordinary inputs are validated first, in exactly the existing
         # order, but no branch or historical node is looked up yet.
@@ -3970,68 +4205,83 @@ class BranchStore:
             diff_limit, "diff_limit"
         )
 
-        # Capture the single read-only historical view once; both windows
-        # select their snapshots and adjacent segments from it, so the two
-        # sides never disagree about history.
-        prepared = self._capture_frontier_view(validated)
-        left_snapshots, left_segments = self._cascade_slice_timeline_data(
-            prepared,
-            left_index_values,
-            causes,
-            direction,
-            depth_value,
-            node_limit_value,
-            change_limit_value,
-        )
-        right_snapshots, right_segments = self._cascade_slice_timeline_data(
-            prepared,
-            right_index_values,
-            causes,
-            direction,
-            depth_value,
-            node_limit_value,
-            change_limit_value,
-        )
-        left_lifetimes = self._build_slice_lifetimes(
-            left_snapshots, left_segments
-        )
-        right_lifetimes = self._build_slice_lifetimes(
-            right_snapshots, right_segments
-        )
-
-        # Both full record sets are known before either cap is enforced,
-        # so an over-cap call returns no partial lifetimes.
-        if len(left_lifetimes) > lifetime_limit_value:
-            raise ValueError(
-                f"compare lifetimes lifetime limit exceeded: "
-                f"{len(left_lifetimes)} lifetime records on the left "
-                f"window, limit is {lifetime_limit_value}"
+        # Token checks come after every ordinary parameter. Without a token
+        # the query runs on live state exactly as before; with one, the read
+        # allowance is reserved atomically before any state check and given
+        # back if a state check (KeyError/ValueError below) fails, so only
+        # fully successful queries consume a read. Both windows are then
+        # answered from the token's one frozen view.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            # Capture the single read-only historical view once; both
+            # windows select their snapshots and adjacent segments from it,
+            # so the two sides never disagree about history.
+            prepared = view._capture_frontier_view(validated)
+            left_snapshots, left_segments = view._cascade_slice_timeline_data(
+                prepared,
+                left_index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
             )
-        if len(right_lifetimes) > lifetime_limit_value:
-            raise ValueError(
-                f"compare lifetimes lifetime limit exceeded: "
-                f"{len(right_lifetimes)} lifetime records on the right "
-                f"window, limit is {lifetime_limit_value}"
+            right_snapshots, right_segments = view._cascade_slice_timeline_data(
+                prepared,
+                right_index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+            )
+            left_lifetimes = view._build_slice_lifetimes(
+                left_snapshots, left_segments
+            )
+            right_lifetimes = view._build_slice_lifetimes(
+                right_snapshots, right_segments
             )
 
-        changes = self._build_lifetime_changes(left_lifetimes, right_lifetimes)
-        if len(changes) > diff_limit_value:
-            raise ValueError(
-                f"compare lifetimes diff limit exceeded: "
-                f"{len(changes)} change records, limit is "
-                f"{diff_limit_value}"
-            )
-        return {
-            "left": tuple(
-                self._copy_lifetime_record(record)
-                for record in left_lifetimes
-            ),
-            "right": tuple(
-                self._copy_lifetime_record(record)
-                for record in right_lifetimes
-            ),
-            "changes": changes,
-        }
+            # Both full record sets are known before either cap is enforced,
+            # so an over-cap call returns no partial lifetimes.
+            if len(left_lifetimes) > lifetime_limit_value:
+                raise ValueError(
+                    f"compare lifetimes lifetime limit exceeded: "
+                    f"{len(left_lifetimes)} lifetime records on the left "
+                    f"window, limit is {lifetime_limit_value}"
+                )
+            if len(right_lifetimes) > lifetime_limit_value:
+                raise ValueError(
+                    f"compare lifetimes lifetime limit exceeded: "
+                    f"{len(right_lifetimes)} lifetime records on the right "
+                    f"window, limit is {lifetime_limit_value}"
+                )
+
+            changes = view._build_lifetime_changes(left_lifetimes, right_lifetimes)
+            if len(changes) > diff_limit_value:
+                raise ValueError(
+                    f"compare lifetimes diff limit exceeded: "
+                    f"{len(changes)} change records, limit is "
+                    f"{diff_limit_value}"
+                )
+            result = {
+                "left": tuple(
+                    view._copy_lifetime_record(record)
+                    for record in left_lifetimes
+                ),
+                "right": tuple(
+                    view._copy_lifetime_record(record)
+                    for record in right_lifetimes
+                ),
+                "changes": changes,
+            }
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
 
     def lifetime_evolution(
         self,
@@ -4055,6 +4305,7 @@ class BranchStore:
         diff_limit: int,
         window_limit: int,
         total_diff_limit: int,
+        token: str | None = None,
     ) -> dict[str, object]:
         """Follow identity-lifetime evolution across many slice windows.
 
@@ -4174,77 +4425,92 @@ class BranchStore:
                 f"{window_limit_value}"
             )
 
-        # Capture the single read-only historical view once; every window
-        # selects its snapshots and adjacent segments from it, so the batch
-        # never reads different branch states per window.
-        prepared = self._capture_frontier_view(validated)
+        # Token checks come after every ordinary parameter. Without a token
+        # the query runs on live state exactly as before; with one, the read
+        # allowance is reserved atomically before any state check and given
+        # back if a state check (KeyError/ValueError below) fails, so only
+        # fully successful queries consume a read. Every window is then
+        # answered from the token's one frozen view.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            # Capture the single read-only historical view once; every
+            # window selects its snapshots and adjacent segments from it,
+            # so the batch never reads different branch states per window.
+            prepared = view._capture_frontier_view(validated)
 
-        window_records: list[tuple[dict[str, object], ...]] = []
-        for position, index_values in enumerate(index_windows):
-            snapshots, segments = self._cascade_slice_timeline_data(
-                prepared,
-                index_values,
-                causes,
-                direction,
-                depth_value,
-                node_limit_value,
-                change_limit_value,
-            )
-            lifetimes = self._build_slice_lifetimes(snapshots, segments)
-            if len(lifetimes) > lifetime_limit_value:
-                raise ValueError(
-                    f"lifetime evolution lifetime limit exceeded: "
-                    f"{len(lifetimes)} lifetime records on window at "
-                    f"position {position}, limit is "
-                    f"{lifetime_limit_value}"
+            window_records: list[tuple[dict[str, object], ...]] = []
+            for position, index_values in enumerate(index_windows):
+                snapshots, segments = view._cascade_slice_timeline_data(
+                    prepared,
+                    index_values,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
                 )
-            window_records.append(lifetimes)
+                lifetimes = view._build_slice_lifetimes(snapshots, segments)
+                if len(lifetimes) > lifetime_limit_value:
+                    raise ValueError(
+                        f"lifetime evolution lifetime limit exceeded: "
+                        f"{len(lifetimes)} lifetime records on window at "
+                        f"position {position}, limit is "
+                        f"{lifetime_limit_value}"
+                    )
+                window_records.append(lifetimes)
 
-        # Every segment's full change set is known before either cap is
-        # enforced, so an over-cap batch returns no partial evolution.
-        segment_changes: list[tuple[dict[str, object], ...]] = []
-        total_changes = 0
-        for position in range(len(window_records) - 1):
-            changes = self._build_lifetime_changes(
-                window_records[position], window_records[position + 1]
-            )
-            if len(changes) > diff_limit_value:
-                raise ValueError(
-                    f"lifetime evolution diff limit exceeded: "
-                    f"{len(changes)} change records on segment between "
-                    f"windows at positions {position} and {position + 1}, "
-                    f"limit is {diff_limit_value}"
+            # Every segment's full change set is known before either cap is
+            # enforced, so an over-cap batch returns no partial evolution.
+            segment_changes: list[tuple[dict[str, object], ...]] = []
+            total_changes = 0
+            for position in range(len(window_records) - 1):
+                changes = view._build_lifetime_changes(
+                    window_records[position], window_records[position + 1]
                 )
-            total_changes += len(changes)
-            segment_changes.append(changes)
-        if total_changes > total_diff_limit_value:
-            raise ValueError(
-                f"lifetime evolution total diff limit exceeded: "
-                f"{total_changes} change records over "
-                f"{len(segment_changes)} segment(s), limit is "
-                f"{total_diff_limit_value}"
-            )
+                if len(changes) > diff_limit_value:
+                    raise ValueError(
+                        f"lifetime evolution diff limit exceeded: "
+                        f"{len(changes)} change records on segment between "
+                        f"windows at positions {position} and {position + 1}, "
+                        f"limit is {diff_limit_value}"
+                    )
+                total_changes += len(changes)
+                segment_changes.append(changes)
+            if total_changes > total_diff_limit_value:
+                raise ValueError(
+                    f"lifetime evolution total diff limit exceeded: "
+                    f"{total_changes} change records over "
+                    f"{len(segment_changes)} segment(s), limit is "
+                    f"{total_diff_limit_value}"
+                )
 
-        return {
-            "windows": tuple(
-                {
-                    "position": position,
-                    "lifetimes": tuple(
-                        self._copy_lifetime_record(record)
-                        for record in lifetimes
-                    ),
-                }
-                for position, lifetimes in enumerate(window_records)
-            ),
-            "segments": tuple(
-                {
-                    "left": position,
-                    "right": position + 1,
-                    "changes": changes,
-                }
-                for position, changes in enumerate(segment_changes)
-            ),
-        }
+            result = {
+                "windows": tuple(
+                    {
+                        "position": position,
+                        "lifetimes": tuple(
+                            view._copy_lifetime_record(record)
+                            for record in lifetimes
+                        ),
+                    }
+                    for position, lifetimes in enumerate(window_records)
+                ),
+                "segments": tuple(
+                    {
+                        "left": position,
+                        "right": position + 1,
+                        "changes": changes,
+                    }
+                    for position, changes in enumerate(segment_changes)
+                ),
+            }
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
 
     @staticmethod
     def _freeze_lifetime_value(value: object) -> object:

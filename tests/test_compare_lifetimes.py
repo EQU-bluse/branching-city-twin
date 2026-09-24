@@ -116,11 +116,14 @@ class CompareLifetimesSignatureTests(unittest.TestCase):
                 "change_limit",
                 "lifetime_limit",
                 "diff_limit",
+                "token",
             ],
         )
-        self.assertTrue(
-            all(p.default is inspect.Parameter.empty for p in parameters)
+        self.assertEqual(
+            [p.default for p in parameters[:-1]],
+            [inspect.Parameter.empty] * (len(parameters) - 1),
         )
+        self.assertIsNone(parameters[-1].default)
 
     def test_result_is_a_dict_with_left_right_changes(self):
         store, args = diamond_store()

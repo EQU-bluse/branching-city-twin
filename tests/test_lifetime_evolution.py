@@ -127,11 +127,14 @@ class LifetimeEvolutionSignatureTests(unittest.TestCase):
                 "diff_limit",
                 "window_limit",
                 "total_diff_limit",
+                "token",
             ],
         )
-        self.assertTrue(
-            all(p.default is inspect.Parameter.empty for p in parameters)
+        self.assertEqual(
+            [p.default for p in parameters[:-1]],
+            [inspect.Parameter.empty] * (len(parameters) - 1),
         )
+        self.assertIsNone(parameters[-1].default)
 
     def test_result_is_a_dict_with_windows_and_segments(self):
         store, args = diamond_store()
