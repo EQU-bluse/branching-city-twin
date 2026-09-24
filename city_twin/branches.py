@@ -4033,6 +4033,290 @@ class BranchStore:
             "changes": changes,
         }
 
+    def lifetime_evolution(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+    ) -> dict[str, object]:
+        """Observe identity lifetimes across several aligned windows.
+
+        The read-only multi-window companion of :meth:`compare_lifetimes`:
+        it is called with every ordinary argument of that query -- none
+        has a default -- with the single ``left_indices``/
+        ``right_indices`` pair replaced by ``windows`` and the two caps
+        ``window_limit`` and ``total_diff_limit`` appended after
+        ``diff_limit``. ``windows`` is a tuple of index windows in input
+        order, each window itself a tuple of the same checkpoint indices
+        :meth:`compare_lifetimes` accepts: each window independently
+        selects the historical positions aligned across every series
+        plan and summarizes only its own selected snapshots and adjacent
+        change segments with the existing lifetime semantics, and every
+        window is answered from the one frozen historical view captured
+        by :meth:`_capture_frontier_view`, so the whole batch never
+        reads different branch states.
+
+        The ordinary inputs are validated first in exactly
+        :meth:`compare_lifetimes`'s order, before any state is consulted.
+        ``windows`` is validated next: it must be a tuple (else
+        :class:`TypeError`) and each window, walked in input order, must
+        itself be a tuple (a non-tuple window raises
+        :class:`TypeError`); the windows carry no cross-window
+        uniqueness or monotonicity requirement, so completely identical
+        windows may appear adjacently. Within a window every element
+        must be a non-``bool`` :class:`int` (a :class:`bool` or any
+        non-:class:`int` element raises :class:`TypeError`); a negative
+        or out-of-range index, a duplicate or a non-strictly-increasing
+        sequence raises :class:`ValueError`. Every window-level message
+        identifies the window by its zero-based position in
+        ``windows``, including a duplicate-index error. The range is the
+        shared checkpoint count of the series plans (zero plans leave no
+        valid index). The existing slice inputs -- ``causes``,
+        ``direction``, ``depth`` and ``node_limit`` -- are validated
+        afterwards in their existing order, followed by
+        ``change_limit``, ``lifetime_limit`` and ``diff_limit``, and
+        ``window_limit`` and ``total_diff_limit`` last: each must be a
+        non-``bool`` :class:`int` (else :class:`TypeError`) and at least
+        one (else :class:`ValueError`). Only then do the branch and
+        historical-node lookups, checkpoint alignment and the
+        candidate-count cap run, all on the one frozen view, keeping the
+        existing :class:`KeyError`/:class:`ValueError` contracts and
+        lookup order.
+
+        Nodes, edges and gaps keep the identities, change
+        classifications and stable ordering of
+        :meth:`compare_lifetimes`: each per-window lifetime tuple equals
+        the existing :meth:`cascade_slice_lifetimes` result on that
+        window, and each adjacent window pair is compared with
+        :meth:`_build_lifetime_changes`. The result is a fresh dict
+        whose keys are ordered ``windows, segments``, both fresh
+        tuples: ``windows`` carries one fresh dict per window in input
+        order with keys ordered ``position, lifetimes`` -- the window's
+        zero-based position in ``windows`` and its isolated full
+        lifetime tuple -- and ``segments`` carries one fresh dict per
+        adjacent window pair with keys ordered ``left, right,
+        changes`` -- the two adjacent window positions and the tuple of
+        fresh change records between their lifetime tuples. Two
+        completely identical adjacent windows still produce their
+        segment record, with an empty change tuple.
+
+        More windows than ``window_limit``, a window whose record count
+        exceeds ``lifetime_limit``, any other existing per-window cap
+        (the per-position node cap or the total change cap of
+        :meth:`cascade_slice_timeline`), a segment whose change count
+        exceeds ``diff_limit``, or a batch whose segment changes total
+        more than ``total_diff_limit`` raises :class:`ValueError` and no
+        partial result is returned; the window cap is enforced on the
+        leftmost over-cap window, per-window lifetime caps in window
+        order and segment caps in segment order. An empty ``windows``
+        tuple still completes every input and state check, then returns
+        two empty tuples. Objects at every level are freshly built and
+        share nothing with each other or internal state, so repeated
+        calls return item-wise equal results. The query is read-only:
+        success or failure never modifies the event graph, branch
+        heads, audit or idempotency records, or any existing query, and
+        the existing cascade, slice, diff, timeline, lifetime,
+        two-window comparison and turning-point explanation behavior is
+        unchanged.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The windows come next: the outer tuple, then each window in
+        # input order at its zero-based position, each checked exactly
+        # like the two-window query's indices. The shared checkpoint
+        # count is pure validated input data, so the bounds need no
+        # state.
+        point_count = self._frontier_point_count(validated)
+        window_values = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+
+        # Capture the single read-only historical view once; every
+        # window selects its snapshots and adjacent segments from it, so
+        # the batch never disagrees about history.
+        prepared = self._capture_frontier_view(validated)
+
+        if not window_values:
+            # Every input and state check is done; no window is selected.
+            return {"windows": (), "segments": ()}
+
+        if len(window_values) > window_limit_value:
+            raise ValueError(
+                f"lifetime evolution window limit exceeded: "
+                f"{len(window_values)} windows, limit is {window_limit_value}"
+            )
+
+        # Every window's data is built before any per-window cap is
+        # enforced, so an over-cap window returns no partial evolution.
+        window_lifetimes: list[tuple[dict[str, object], ...]] = []
+        for position, index_values in enumerate(window_values):
+            snapshots, segments = self._cascade_slice_timeline_data(
+                prepared,
+                index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+            )
+            lifetimes = self._build_slice_lifetimes(snapshots, segments)
+            if len(lifetimes) > lifetime_limit_value:
+                raise ValueError(
+                    f"lifetime evolution lifetime limit exceeded: "
+                    f"{len(lifetimes)} lifetime records on window at "
+                    f"position {position}, limit is {lifetime_limit_value}"
+                )
+            window_lifetimes.append(lifetimes)
+
+        # Every segment's change set is built before either segment cap
+        # is enforced, so an over-cap segment or batch returns nothing.
+        segment_changes: list[tuple[dict[str, object], ...]] = []
+        total_changes = 0
+        for position in range(len(window_lifetimes) - 1):
+            changes = self._build_lifetime_changes(
+                window_lifetimes[position], window_lifetimes[position + 1]
+            )
+            if len(changes) > diff_limit_value:
+                raise ValueError(
+                    f"lifetime evolution diff limit exceeded: "
+                    f"{len(changes)} change records on segment at "
+                    f"position {position}, limit is {diff_limit_value}"
+                )
+            total_changes += len(changes)
+            segment_changes.append(changes)
+        if total_changes > total_diff_limit_value:
+            raise ValueError(
+                f"lifetime evolution total diff limit exceeded: "
+                f"{total_changes} change records across "
+                f"{len(segment_changes)} segment(s), limit is "
+                f"{total_diff_limit_value}"
+            )
+
+        result_windows = tuple(
+            {
+                "position": position,
+                "lifetimes": tuple(
+                    self._copy_lifetime_record(record)
+                    for record in lifetimes
+                ),
+            }
+            for position, lifetimes in enumerate(window_lifetimes)
+        )
+        result_segments = tuple(
+            {
+                "left": position,
+                "right": position + 1,
+                "changes": changes,
+            }
+            for position, changes in enumerate(segment_changes)
+        )
+        return {"windows": result_windows, "segments": result_segments}
+
+    @staticmethod
+    def _validate_lifetime_windows(
+        windows: Any, point_count: int
+    ) -> list[list[int]]:
+        """Validate the multi-window index input of lifetime evolution.
+
+        The outer value must be a tuple; each window is walked in input
+        order and must itself be a tuple, checked exactly like
+        :meth:`_validate_slice_indices` windows, except that windows are
+        independent of one another -- identical windows may repeat --
+        and every message carries the window's zero-based position in
+        ``windows``, including a duplicate-index error.
+        """
+        if not isinstance(windows, tuple):
+            raise TypeError(
+                f"windows must be a tuple, got {type(windows).__name__}"
+            )
+        window_values: list[list[int]] = []
+        for position, window in enumerate(windows):
+            name = f"windows[{position}]"
+            if not isinstance(window, tuple):
+                raise TypeError(
+                    f"{name} must be a tuple, got {type(window).__name__}"
+                )
+            index_values: list[int] = []
+            seen_indices: set[int] = set()
+            previous_index: int | None = None
+            for index in window:
+                index_value = BranchStore._require_checkpoint_index(
+                    index, name
+                )
+                if index_value < 0:
+                    raise ValueError(
+                        f"{name} checkpoint index must be non-negative"
+                    )
+                if index_value >= point_count:
+                    raise ValueError(
+                        f"{name} checkpoint index {index_value} is out of "
+                        f"range for {point_count} checkpoint(s)"
+                    )
+                if index_value in seen_indices:
+                    raise ValueError(
+                        f"{name} duplicate checkpoint index {index_value}"
+                    )
+                if (
+                    previous_index is not None
+                    and index_value <= previous_index
+                ):
+                    raise ValueError(
+                        f"{name} checkpoint indices must be strictly "
+                        "increasing"
+                    )
+                seen_indices.add(index_value)
+                previous_index = index_value
+                index_values.append(index_value)
+            window_values.append(index_values)
+        return window_values
+
     @staticmethod
     def _freeze_lifetime_value(value: object) -> object:
         """Return an isolated tuple/dict-only copy of a lifetime value."""
