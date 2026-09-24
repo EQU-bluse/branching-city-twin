@@ -2,14 +2,47 @@
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import heapq
 import itertools
+import json
 import math
+import os
+import tempfile
 import threading
 import uuid
 from typing import Any
 
 from city_twin.event_graph import EventGraph
+
+
+def _serialized(mutator):
+    """Run a BranchStore mutator under the store's state lock.
+
+    Branch creation, appends and merges all commit under one lock, and
+    checkpoint saving copies state under the same lock, so a checkpoint
+    always captures a same-instant, aligned view of the event graph and
+    the append/merge records -- never a mix of two concurrent mutations.
+    """
+
+    @functools.wraps(mutator)
+    def wrapper(self, *args, **kwargs):
+        with self._state_lock:
+            return mutator(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _canonical_checkpoint_json(value: Any) -> str:
+    """Serialize ``value`` as compact JSON with deterministic key order.
+
+    Object key order comes from insertion order (callers build every
+    dict in the documented field order); the output uses
+    ``separators=(',', ':')`` and ``ensure_ascii=False``, matching
+    :meth:`EventGraph.to_json`.
+    """
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
 class _SnapshotEntry:
@@ -60,6 +93,10 @@ class BranchStore:
         # Guards only the token registry and each entry's read accounting, so
         # a read reservation and the expiry decision stay one atomic step.
         self._snapshot_lock = threading.Lock()
+        # Guards the business state (graph, heads, sources, append and merge
+        # records) against concurrent create/append/merge commits, so a
+        # checkpoint save always copies one consistent instant.
+        self._state_lock = threading.Lock()
 
     @staticmethod
     def _require_nonempty_str(value: Any, name: str) -> None:
@@ -70,6 +107,7 @@ class BranchStore:
         if name not in self._heads:
             raise KeyError(name)
 
+    @_serialized
     def create(self, name: str, from_event: str) -> None:
         """Create a branch named ``name`` starting at ``from_event``.
 
@@ -93,6 +131,7 @@ class BranchStore:
         self._sources[name] = from_event
         self._appends[name] = {}
 
+    @_serialized
     def append(
         self,
         name: str,
@@ -142,6 +181,7 @@ class BranchStore:
         self._heads[name] = id
         self._appends[name][id] = (at_value, changes)
 
+    @_serialized
     def merge(
         self,
         target: str,
@@ -253,7 +293,8 @@ class BranchStore:
                     f"snapshot token limit reached: at most "
                     f"{self.MAX_SNAPSHOTS} unreleased tokens per store"
                 )
-            frozen = self._copy_snapshot_view()
+            with self._state_lock:
+                frozen = self._copy_snapshot_view()
             while True:
                 token = uuid.uuid4().hex
                 if token not in self._snapshots:
@@ -364,6 +405,568 @@ class BranchStore:
             ) in self._merges.items()
         }
         return frozen
+
+    #: Version of the checkpoint file format written by
+    #: :meth:`save_checkpoint` and accepted by :meth:`load_checkpoint`.
+    CHECKPOINT_SCHEMA_VERSION = 1
+
+    def save_checkpoint(self, path: str) -> None:
+        """Persist a consistent checkpoint of the current state to ``path``.
+
+        The file captures one same-instant view of everything needed to
+        resume the store elsewhere: the full event graph, every branch's
+        source and head, and the append and merge records that form the
+        audit log and idempotency keys. Concurrent creates, appends or
+        merges cannot interleave with the copy, so the graph and the
+        records in the file never disagree. Snapshot tokens, their read
+        allowances and their release states are process-local and are
+        never written.
+
+        The file is UTF-8 compact JSON without a BOM or trailing
+        newline. Its top-level keys are ordered ``schema_version``,
+        ``payload``, ``checksum``; the payload holds, in order, the
+        event graph, the branch table and the append and merge records,
+        with identifiers and change keys sorted by Unicode code point
+        and parent order preserved. ``checksum`` is the lowercase
+        hexadecimal SHA-256 of the payload's canonical JSON bytes, so
+        identical business states produce byte-identical files.
+
+        ``path`` must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`), checked
+        before any state is touched. The content is written to a
+        temporary file in the same directory, flushed to disk and then
+        atomically moved over ``path``; a failure before that commit
+        leaves a pre-existing target byte-identical and removes the
+        temporary file. Filesystem failures while opening, writing,
+        flushing or replacing raise :class:`OSError`. Whether the save
+        succeeds or fails, the store's business state is unchanged.
+        """
+        if not isinstance(path, str):
+            raise TypeError(f"path must be a str, got {type(path).__name__}")
+        if not path:
+            raise ValueError("path must be a non-empty str")
+
+        with self._state_lock:
+            view = self._copy_snapshot_view()
+        payload = view._checkpoint_payload()
+        payload_bytes = _canonical_checkpoint_json(payload).encode("utf-8")
+        document = {
+            "schema_version": self.CHECKPOINT_SCHEMA_VERSION,
+            "payload": payload,
+            "checksum": hashlib.sha256(payload_bytes).hexdigest(),
+        }
+        data = _canonical_checkpoint_json(document).encode("utf-8")
+        self._write_checkpoint_file(path, data)
+        return None
+
+    @classmethod
+    def load_checkpoint(cls, path: str) -> "BranchStore":
+        """Restore a store from a file written by :meth:`save_checkpoint`.
+
+        ``path`` must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`), checked
+        before anything else. Filesystem failures while opening or
+        reading raise :class:`OSError`; a file that is not valid UTF-8
+        or not valid JSON raises :class:`ValueError`. The checksum must
+        match the payload's canonical JSON bytes before any content is
+        trusted, and every violation -- a checksum mismatch, an unknown
+        schema version, a structural, type or missing/extra-field
+        violation, an empty identifier, a negative timestamp, a boolean
+        posing as an integer, duplicate events or parents, unknown
+        parents, a cycle, an invalid branch head or source, or append
+        and merge records inconsistent with the events or their parent
+        order -- raises :class:`ValueError`. A failed load never returns
+        a partial object and never modifies the file.
+
+        The returned store replays, audits, conflicts and deduplicates
+        exactly as the saved one did; its snapshot token table is always
+        empty, since tokens, read allowances and release states are not
+        persisted. The new store shares no mutable state with the saved
+        store or the parsed document, so later writes to either side
+        stay isolated.
+        """
+        if not isinstance(path, str):
+            raise TypeError(f"path must be a str, got {type(path).__name__}")
+        if not path:
+            raise ValueError("path must be a non-empty str")
+
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"checkpoint is not valid UTF-8: {exc}") from exc
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"checkpoint is not valid JSON: {exc}") from exc
+
+        if not isinstance(data, dict) or set(data.keys()) != {
+            "schema_version",
+            "payload",
+            "checksum",
+        }:
+            raise ValueError(
+                "top-level object must contain exactly the keys "
+                "'schema_version', 'payload' and 'checksum'"
+            )
+        version = data["schema_version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("schema_version must be an int")
+        if version != cls.CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError(f"unsupported schema_version {version!r}")
+        checksum = data["checksum"]
+        if not isinstance(checksum, str):
+            raise ValueError("checksum must be a str")
+        payload = data["payload"]
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        digest = hashlib.sha256(
+            _canonical_checkpoint_json(payload).encode("utf-8")
+        ).hexdigest()
+        if digest != checksum:
+            raise ValueError("checkpoint checksum mismatch")
+        if set(payload.keys()) != {"events", "branches", "appends", "merges"}:
+            raise ValueError(
+                "payload must contain exactly the keys 'events', "
+                "'branches', 'appends' and 'merges'"
+            )
+
+        # The graph parser validates event structure, types, duplicates,
+        # unknown parents and cycles before anything is built.
+        graph = EventGraph.from_json(
+            json.dumps({"events": payload["events"]}, ensure_ascii=False)
+        )
+        heads, sources = cls._load_checkpoint_branches(
+            payload["branches"], graph
+        )
+        appends = cls._load_checkpoint_appends(
+            payload["appends"], graph, heads
+        )
+        merges = cls._load_checkpoint_merges(
+            payload["merges"], graph, heads, appends
+        )
+        cls._check_checkpoint_consistency(graph, heads, sources, appends, merges)
+
+        store = cls(graph)
+        store._heads = heads
+        store._sources = sources
+        store._appends = appends
+        store._merges = merges
+        return store
+
+    def _checkpoint_payload(self) -> dict[str, object]:
+        """Build the canonical checkpoint payload from the current state.
+
+        Events are ordered by id, branches by name, append records by
+        ``(event_id, branch)`` and merge records by event id, all by
+        Unicode code point; change keys are sorted the same way and
+        parent order is preserved, so equal business states always
+        produce equal payloads.
+        """
+        events: list[dict[str, object]] = []
+        for event_id in sorted(self._graph._at):
+            changes = self._graph._changes[event_id]
+            events.append(
+                {
+                    "id": event_id,
+                    "at": self._graph._at[event_id],
+                    "parents": list(self._graph._parents[event_id]),
+                    "changes": {key: changes[key] for key in sorted(changes)},
+                }
+            )
+        branches: list[dict[str, object]] = []
+        for name in sorted(self._heads):
+            branches.append(
+                {
+                    "name": name,
+                    "source": self._sources[name],
+                    "head": self._heads[name],
+                }
+            )
+        appends: list[dict[str, object]] = []
+        for name, records in self._appends.items():
+            for event_id, (at_value, changes) in records.items():
+                appends.append(
+                    {
+                        "event_id": event_id,
+                        "branch": name,
+                        "at": at_value,
+                        "changes": {
+                            key: changes[key] for key in sorted(changes)
+                        },
+                    }
+                )
+        appends.sort(key=lambda record: (record["event_id"], record["branch"]))
+        merges: list[dict[str, object]] = []
+        for event_id, (
+            target,
+            source,
+            at_value,
+            changes,
+        ) in self._merges.items():
+            merges.append(
+                {
+                    "event_id": event_id,
+                    "target": target,
+                    "source": source,
+                    "at": at_value,
+                    "changes": {key: changes[key] for key in sorted(changes)},
+                }
+            )
+        merges.sort(key=lambda record: record["event_id"])
+        return {
+            "events": events,
+            "branches": branches,
+            "appends": appends,
+            "merges": merges,
+        }
+
+    @staticmethod
+    def _write_checkpoint_file(path: str, data: bytes) -> None:
+        """Write ``data`` to ``path`` atomically.
+
+        The bytes go to a temporary file in the target's directory, are
+        flushed to disk and are then moved over the target with
+        :func:`os.replace`. Any failure before that commit removes the
+        temporary file and leaves a pre-existing target untouched.
+        """
+        directory = os.path.dirname(os.path.abspath(path))
+        fd, temp_path = tempfile.mkstemp(
+            dir=directory, prefix=".checkpoint-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        except BaseException:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _require_checkpoint_event_fields(
+        entry: dict[str, Any], event_id: str, graph: EventGraph
+    ) -> tuple[int, dict[str, int]]:
+        """Validate a record's ``at``/``changes`` against the graph event."""
+        at_value = entry["at"]
+        if isinstance(at_value, bool) or not isinstance(at_value, int):
+            raise ValueError(f"record for event {event_id!r}: at must be an int")
+        if at_value < 0:
+            raise ValueError(
+                f"record for event {event_id!r}: at must be non-negative"
+            )
+        if at_value != graph._at[event_id]:
+            raise ValueError(
+                f"record for event {event_id!r}: at disagrees with the "
+                "event graph"
+            )
+        changes = entry["changes"]
+        if not isinstance(changes, dict):
+            raise ValueError(
+                f"record for event {event_id!r}: changes must be an object"
+            )
+        for key, value in changes.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(
+                    f"record for event {event_id!r}: every change key must "
+                    "be a non-empty str"
+                )
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"record for event {event_id!r}: change value for "
+                    f"{key!r} must be an int"
+                )
+        if changes != graph._changes[event_id]:
+            raise ValueError(
+                f"record for event {event_id!r}: changes disagree with "
+                "the event graph"
+            )
+        return at_value, dict(changes)
+
+    @staticmethod
+    def _load_checkpoint_branches(
+        raw_branches: Any, graph: EventGraph
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Validate the branch table into fresh heads/sources dicts."""
+        if not isinstance(raw_branches, list):
+            raise ValueError("'branches' must be an array")
+        heads: dict[str, str] = {}
+        sources: dict[str, str] = {}
+        for index, entry in enumerate(raw_branches):
+            if not isinstance(entry, dict) or set(entry.keys()) != {
+                "name",
+                "source",
+                "head",
+            }:
+                raise ValueError(
+                    f"branch at index {index} must contain exactly the "
+                    "keys 'name', 'source' and 'head'"
+                )
+            name = entry["name"]
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"branch at index {index}: name must be a non-empty str"
+                )
+            if name in heads:
+                raise ValueError(f"duplicate branch name {name!r}")
+            for field in ("source", "head"):
+                value = entry[field]
+                if not isinstance(value, str) or not value:
+                    raise ValueError(
+                        f"branch {name!r}: {field} must be a non-empty str"
+                    )
+                if value not in graph._at:
+                    raise ValueError(
+                        f"branch {name!r}: unknown {field} event {value!r}"
+                    )
+            heads[name] = entry["head"]
+            sources[name] = entry["source"]
+        for name, head in heads.items():
+            if sources[name] not in set(graph._ordered_ancestors(head)):
+                raise ValueError(
+                    f"branch {name!r}: source {sources[name]!r} is not an "
+                    f"ancestor of head {head!r}"
+                )
+        return heads, sources
+
+    @staticmethod
+    def _load_checkpoint_appends(
+        raw_appends: Any, graph: EventGraph, heads: dict[str, str]
+    ) -> dict[str, dict[str, tuple[int, dict[str, int]]]]:
+        """Validate the append records into a fresh per-branch table."""
+        if not isinstance(raw_appends, list):
+            raise ValueError("'appends' must be an array")
+        appends: dict[str, dict[str, tuple[int, dict[str, int]]]] = {
+            name: {} for name in heads
+        }
+        for index, entry in enumerate(raw_appends):
+            if not isinstance(entry, dict) or set(entry.keys()) != {
+                "event_id",
+                "branch",
+                "at",
+                "changes",
+            }:
+                raise ValueError(
+                    f"append record at index {index} must contain exactly "
+                    "the keys 'event_id', 'branch', 'at' and 'changes'"
+                )
+            event_id = entry["event_id"]
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError(
+                    f"append record at index {index}: event_id must be a "
+                    "non-empty str"
+                )
+            if event_id not in graph._at:
+                raise ValueError(
+                    f"append record at index {index}: unknown event "
+                    f"{event_id!r}"
+                )
+            branch = entry["branch"]
+            if not isinstance(branch, str) or not branch:
+                raise ValueError(
+                    f"append record for event {event_id!r}: branch must "
+                    "be a non-empty str"
+                )
+            if branch not in heads:
+                raise ValueError(
+                    f"append record for event {event_id!r}: unknown "
+                    f"branch {branch!r}"
+                )
+            if event_id in appends[branch]:
+                raise ValueError(
+                    f"duplicate append record for event {event_id!r} on "
+                    f"branch {branch!r}"
+                )
+            if len(graph._parents[event_id]) != 1:
+                raise ValueError(
+                    f"append record for event {event_id!r}: the event "
+                    "does not have exactly one parent"
+                )
+            at_value, changes = BranchStore._require_checkpoint_event_fields(
+                entry, event_id, graph
+            )
+            appends[branch][event_id] = (at_value, changes)
+        return appends
+
+    @staticmethod
+    def _load_checkpoint_merges(
+        raw_merges: Any,
+        graph: EventGraph,
+        heads: dict[str, str],
+        appends: dict[str, dict[str, tuple[int, dict[str, int]]]],
+    ) -> dict[str, tuple[str, str, int, dict[str, int]]]:
+        """Validate the merge records into a fresh idempotency table."""
+        if not isinstance(raw_merges, list):
+            raise ValueError("'merges' must be an array")
+        appended = {
+            event_id
+            for records in appends.values()
+            for event_id in records
+        }
+        merges: dict[str, tuple[str, str, int, dict[str, int]]] = {}
+        for index, entry in enumerate(raw_merges):
+            if not isinstance(entry, dict) or set(entry.keys()) != {
+                "event_id",
+                "target",
+                "source",
+                "at",
+                "changes",
+            }:
+                raise ValueError(
+                    f"merge record at index {index} must contain exactly "
+                    "the keys 'event_id', 'target', 'source', 'at' and "
+                    "'changes'"
+                )
+            event_id = entry["event_id"]
+            if not isinstance(event_id, str) or not event_id:
+                raise ValueError(
+                    f"merge record at index {index}: event_id must be a "
+                    "non-empty str"
+                )
+            if event_id not in graph._at:
+                raise ValueError(
+                    f"merge record at index {index}: unknown event "
+                    f"{event_id!r}"
+                )
+            if event_id in merges:
+                raise ValueError(
+                    f"duplicate merge record for event {event_id!r}"
+                )
+            if event_id in appended:
+                raise ValueError(
+                    f"event {event_id!r} is recorded as both an append "
+                    "and a merge"
+                )
+            target = entry["target"]
+            source = entry["source"]
+            for field, branch in (("target", target), ("source", source)):
+                if not isinstance(branch, str) or not branch:
+                    raise ValueError(
+                        f"merge record for event {event_id!r}: {field} "
+                        "must be a non-empty str"
+                    )
+                if branch not in heads:
+                    raise ValueError(
+                        f"merge record for event {event_id!r}: unknown "
+                        f"{field} branch {branch!r}"
+                    )
+            if target == source:
+                raise ValueError(
+                    f"merge record for event {event_id!r}: target and "
+                    "source must differ"
+                )
+            if len(graph._parents[event_id]) != 2:
+                raise ValueError(
+                    f"merge record for event {event_id!r}: the event "
+                    "does not have exactly two parents"
+                )
+            at_value, changes = BranchStore._require_checkpoint_event_fields(
+                entry, event_id, graph
+            )
+            merges[event_id] = (target, source, at_value, changes)
+        return merges
+
+    @staticmethod
+    def _check_checkpoint_consistency(
+        graph: EventGraph,
+        heads: dict[str, str],
+        sources: dict[str, str],
+        appends: dict[str, dict[str, tuple[int, dict[str, int]]]],
+        merges: dict[str, tuple[str, str, int, dict[str, int]]],
+    ) -> None:
+        """Check records against the branch structure they imply.
+
+        A branch's head is its source, one of its append events or a
+        merge event targeting it; the branch's recorded events form one
+        chain from its source to its head: each recorded event's
+        predecessor (an append's sole parent, a merge's first parent) is
+        the source or another recorded event of the branch, no two
+        recorded events share a predecessor, and every recorded event
+        except the head is itself the predecessor of exactly one
+        recorded event. A merge's second parent is the source branch's
+        head at that time. Anything else means the records disagree
+        with the events or their parent order.
+        """
+        merge_targets = {
+            event_id: target
+            for event_id, (target, _, _, _) in merges.items()
+        }
+
+        def history_of(name: str) -> set[str]:
+            return set(appends[name]) | {
+                event_id
+                for event_id, target in merge_targets.items()
+                if target == name
+            }
+
+        def predecessor_of(event_id: str) -> str:
+            # Append events have exactly one parent, merge events exactly
+            # two with the target's parent first; both were validated
+            # before this consistency pass runs.
+            return graph._parents[event_id][0]
+
+        for name, head in heads.items():
+            history = history_of(name)
+            if head != sources[name] and head not in history:
+                raise ValueError(
+                    f"branch {name!r}: head {head!r} is not a recorded "
+                    "event of the branch"
+                )
+            predecessors: dict[str, str] = {}
+            for event_id in history:
+                parent = predecessor_of(event_id)
+                if parent != sources[name] and parent not in history:
+                    raise ValueError(
+                        f"branch {name!r}: recorded event {event_id!r} "
+                        f"does not follow the branch's source or one of "
+                        f"its recorded events (found {parent!r})"
+                    )
+                if parent in predecessors:
+                    raise ValueError(
+                        f"branch {name!r}: recorded events "
+                        f"{predecessors[parent]!r} and {event_id!r} "
+                        f"share the same predecessor {parent!r}"
+                    )
+                predecessors[parent] = event_id
+            for event_id in history:
+                if event_id != head and event_id not in predecessors:
+                    raise ValueError(
+                        f"branch {name!r}: recorded event {event_id!r} "
+                        "is not on the chain from the branch's source "
+                        "to its head"
+                    )
+            closure = set(graph._ordered_ancestors(head))
+            for event_id in history:
+                if event_id not in closure:
+                    raise ValueError(
+                        f"branch {name!r}: recorded event {event_id!r} "
+                        "is not an ancestor of its head"
+                    )
+        for event_id, (target, source, _, _) in merges.items():
+            first, second = graph._parents[event_id]
+            if (
+                first != sources[target]
+                and first not in history_of(target)
+            ):
+                raise ValueError(
+                    f"merge record for event {event_id!r}: first parent "
+                    f"{first!r} is not a recorded event of target branch "
+                    f"{target!r}"
+                )
+            if (
+                second != sources[source]
+                and second not in history_of(source)
+            ):
+                raise ValueError(
+                    f"merge record for event {event_id!r}: second parent "
+                    f"{second!r} is not a recorded event of source "
+                    f"branch {source!r}"
+                )
 
     def audit_merge(self, id: str) -> dict[str, object]:
         """Return an audit record for the merge event ``id``.
