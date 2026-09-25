@@ -254,6 +254,87 @@ class _CanonicalJsonStream:
         )
 
 
+class _ChainSegmenter:
+    """Fold an authenticated recovery-chain frame stream into segments.
+
+    Frames arrive in sequence order via :meth:`on_frame`; every time
+    ``segment_size`` consecutive frames have accumulated, one segment
+    record is emitted through the ``on_segment`` callback and the
+    accumulator resets, so only one frame's contribution is ever held.
+    A segment record carries the first and last sequence numbers, the
+    boundary frame digests and the SHA-256 of the segment's canonical
+    frame bytes (the concatenation of each frame's canonical JSON, in
+    order). :meth:`finish` emits the final, possibly short, segment.
+    """
+
+    __slots__ = (
+        "_size",
+        "_canonical",
+        "_on_segment",
+        "_count",
+        "_first",
+        "_first_digest",
+        "_last",
+        "_last_digest",
+        "_hasher",
+    )
+
+    def __init__(
+        self, segment_size: int, canonical: Any, on_segment: Any
+    ) -> None:
+        self._size = segment_size
+        self._canonical = canonical
+        self._on_segment = on_segment
+        self._count = 0
+        self._first = 0
+        self._first_digest = ""
+        self._last = 0
+        self._last_digest = ""
+        self._hasher = hashlib.sha256()
+
+    def _reset(self) -> None:
+        self._count = 0
+        self._hasher = hashlib.sha256()
+
+    def _emit(self) -> None:
+        self._on_segment(
+            {
+                "first": self._first,
+                "last": self._last,
+                "first_digest": self._first_digest,
+                "last_digest": self._last_digest,
+                "digest": self._hasher.hexdigest(),
+            }
+        )
+        self._reset()
+
+    def on_frame(self, frame: dict[str, Any]) -> None:
+        """Fold one authenticated frame into the current segment."""
+        if self._count == self._size:
+            self._emit()
+        if not self._count:
+            self._first = frame["seq"]
+            self._first_digest = frame["digest"]
+        self._last = frame["seq"]
+        self._last_digest = frame["digest"]
+        self._hasher.update(
+            self._canonical(
+                {
+                    "seq": frame["seq"],
+                    "prev": frame["prev"],
+                    "record": frame["record"],
+                    "digest": frame["digest"],
+                }
+            ).encode("utf-8")
+        )
+        self._count += 1
+
+    def finish(self) -> None:
+        """Emit the trailing segment when one is partially filled."""
+        if self._count:
+            self._emit()
+
+
 class BranchStore:
     """Named heads into a shared :class:`EventGraph`.
 
@@ -2525,6 +2606,37 @@ class BranchStore:
         "digest",
     )
 
+    #: Disposable, rebuildable segmented index over the recovery-audit
+    #: chain (see :meth:`build_recovery_audit_segments`). Consecutive
+    #: frames are grouped into fixed-size segments (the last one may be
+    #: short); every segment records its first and last sequence
+    #: numbers, the boundary frame digests and the SHA-256 of the
+    #: segment's canonical frame bytes. The document binds the chain's
+    #: schema version, frame count, head digest and segment size. It is
+    #: only ever a cache: the canonical chain remains the sole trusted
+    #: source.
+    _RECOVERY_CHAIN_SEGMENTS_FORMAT = (
+        "branching-city-twin/recovery-audit-chain-segments"
+    )
+    _RECOVERY_CHAIN_SEGMENTS_VERSION = 1
+    _RECOVERY_CHAIN_SEGMENTS_SUPPORTED_VERSIONS = (1,)
+    _RECOVERY_CHAIN_SEGMENTS_KEYS = (
+        "format",
+        "version",
+        "segment_size",
+        "segments",
+        "chain_version",
+        "frames",
+        "head",
+    )
+    _RECOVERY_CHAIN_SEGMENT_KEYS = (
+        "first",
+        "last",
+        "first_digest",
+        "last_digest",
+        "digest",
+    )
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -4079,13 +4191,16 @@ class BranchStore:
 
     @classmethod
     def _scan_index_entries(
-        cls, stream: _CanonicalJsonStream
+        cls, stream: _CanonicalJsonStream, fingerprint: Any
     ) -> tuple[int, str | None]:
         """Stream the index's ``entries`` array, validating each entry's
         shape, consecutive numbering, byte boundaries and digest
         evidence, and return the entry count and the last entry's
-        digest. Any defect raises :class:`ValueError`, which the caller
-        treats as a corrupt (rebuildable) index."""
+        digest. ``fingerprint`` is a SHA-256 hasher updated with each
+        entry's canonical bytes, so the caller can compare the entries
+        item for item against the authenticated chain frames. Any defect
+        raises :class:`ValueError`, which the caller treats as a corrupt
+        (rebuildable) index."""
         stream.expect(0x5B)  # '['
         count = 0
         last_digest: str | None = None
@@ -4145,6 +4260,16 @@ class BranchStore:
             digest = fields["digest"]
             if len(digest) != 64 or set(digest) - cls._HEX_DIGITS:
                 raise ValueError("bad entry digest")
+            fingerprint.update(
+                cls._canonical_json(
+                    {
+                        "seq": seq,
+                        "offset": fields["offset"],
+                        "length": fields["length"],
+                        "digest": digest,
+                    }
+                ).encode("utf-8")
+            )
             last_digest = digest
             byte = stream.take()
             if byte == 0x2C:  # ','
@@ -4157,10 +4282,15 @@ class BranchStore:
     @classmethod
     def _read_recovery_chain_index(
         cls, index_path: str
-    ) -> tuple[int, int, str] | None:
+    ) -> tuple[int, int, str, str] | None:
         """Read and fully validate the index, returning its binding --
-        ``(chain_version, frames, head)`` -- or ``None`` when the index
-        is missing, unreadable or defective in any way.
+        ``(chain_version, frames, head, entries_fingerprint)`` -- or
+        ``None`` when the index is missing, unreadable or defective in
+        any way. The fingerprint is the SHA-256 over every entry's
+        canonical bytes in order, so the caller can check that each
+        entry's sequence number, byte offset, length and digest evidence
+        matches the corresponding authenticated chain frame item for
+        item.
 
         The index is a disposable cache, so no index problem ever raises
         here: it only marks the index for a rebuild from the canonical
@@ -4181,6 +4311,7 @@ class BranchStore:
                 head: Any = None
                 count = 0
                 last_digest: str | None = None
+                fingerprint = hashlib.sha256()
                 if stream.peek() == 0x7D:  # '}'
                     stream.take()
                 else:
@@ -4196,7 +4327,7 @@ class BranchStore:
                         stream.expect(0x3A)  # ':'
                         if key == "entries":
                             count, last_digest = cls._scan_index_entries(
-                                stream
+                                stream, fingerprint
                             )
                         elif key in ("format", "head"):
                             if stream.peek() != 0x22:  # '"'
@@ -4256,7 +4387,12 @@ class BranchStore:
                     or head != last_digest
                 ):
                     return None
-                return chain_version, declared_frames, head
+                return (
+                    chain_version,
+                    declared_frames,
+                    head,
+                    fingerprint.hexdigest(),
+                )
         except (OSError, ValueError, RecursionError):
             return None
 
@@ -4277,10 +4413,17 @@ class BranchStore:
         ever materialized, plus the bodies the caller asked for, so
         memory grows only with the largest single frame and fixed
         buffers -- never with the total frame count or a queried range
-        span. The index is then re-read and, whenever it is missing,
-        stale or defective, rebuilt once from the just-authenticated
-        canonical chain; the chain remains the only trusted source and
-        the index never answers a query by itself.
+        span. The index is then re-read and every entry's sequence
+        number, byte offset, length and digest evidence is checked
+        against the corresponding authenticated chain frame (via a
+        rolling SHA-256 fingerprint, so no entry list is materialized);
+        any entry that does not point at its canonical frame marks the
+        index corrupt. A missing, stale or corrupt index is rebuilt once
+        from the just-authenticated canonical chain and re-checked; if
+        it still does not match, :class:`ValueError` is raised. The
+        chain remains the only trusted source and the index never
+        answers a query by itself, so no index content can mask a chain
+        defect.
         """
         lock_path = cls._recovery_chain_lock_path(path)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -4288,10 +4431,21 @@ class BranchStore:
             cls._acquire_chain_lock(fd, None)
             try:
                 captured: dict[int, dict[str, Any]] = {}
+                fingerprint = hashlib.sha256()
 
                 def on_frame(frame: dict[str, Any]) -> None:
                     if wanted is not None and frame["seq"] in wanted:
                         captured[frame["seq"]] = frame["body"]
+                    fingerprint.update(
+                        cls._canonical_json(
+                            {
+                                "seq": frame["seq"],
+                                "offset": frame["offset"],
+                                "length": frame["length"],
+                                "digest": frame["digest"],
+                            }
+                        ).encode("utf-8")
+                    )
 
                 chain_file = cls._open_recovery_chain_locked(path)
                 try:
@@ -4300,11 +4454,18 @@ class BranchStore:
                     )
                 finally:
                     chain_file.close()
+                expected = (version, count, head, fingerprint.hexdigest())
                 binding = cls._read_recovery_chain_index(index_path)
-                if binding != (version, count, head):
+                if binding != expected:
                     cls._build_recovery_audit_index_locked(
                         path, index_path
                     )
+                    binding = cls._read_recovery_chain_index(index_path)
+                    if binding != expected:
+                        raise ValueError(
+                            "recovery chain index does not match the "
+                            "authenticated chain"
+                        )
                 return count, head, captured
             finally:
                 cls._release_chain_lock(fd)
@@ -4489,11 +4650,15 @@ class BranchStore:
         frame and fixed buffers -- never with the total frame count.
         The external head is still checked against the authenticated
         chain, never against the index: the index cannot mask any chain
-        defect. Afterwards the index is re-read and, if it is missing,
-        stale, truncated or corrupt, rebuilt once from the canonical
-        chain and durably atomically published; a failed rebuild
-        propagates :class:`OSError` and leaves any previous index and
-        the chain untouched.
+        defect. Afterwards the index is re-read and every entry's
+        sequence number, offset, length and digest evidence is checked
+        against the corresponding authenticated chain frame; a missing,
+        stale, truncated or corrupt index is rebuilt once from the
+        canonical chain and durably atomically published, and an index
+        that still does not match after the rebuild raises
+        :class:`ValueError`. A failed rebuild propagates
+        :class:`OSError` and leaves any previous index and the chain
+        untouched.
         """
         if index_path is not None:
             cls._validate_chain_path(path)
@@ -4550,10 +4715,13 @@ class BranchStore:
         The two endpoint records are still taken from the authenticated
         canonical chain and the result is item-for-item identical to
         the no-index result; the index never answers by itself and
-        cannot mask a chain defect. A missing, stale, truncated or
-        corrupt index is rebuilt once from the canonical chain and
-        durably atomically published; a failed rebuild propagates
-        :class:`OSError`.
+        cannot mask a chain defect. Every index entry's sequence number,
+        offset, length and digest evidence is checked against the
+        corresponding authenticated chain frame; a missing, stale,
+        truncated or corrupt index is rebuilt once from the canonical
+        chain and durably atomically published, and an index that still
+        does not match after the rebuild raises :class:`ValueError`. A
+        failed rebuild propagates :class:`OSError`.
         """
         cls._validate_chain_path(path)
         if index_path is not None:
@@ -4672,6 +4840,601 @@ class BranchStore:
                 cls._release_chain_lock(fd)
         finally:
             os.close(fd)
+
+    @classmethod
+    def _validate_segment_size(cls, segment_size: Any) -> None:
+        """Validate a ``segment_size`` argument: a non-``bool``
+        :class:`int`, otherwise :class:`TypeError`; a value below one
+        raises :class:`ValueError`."""
+        if isinstance(segment_size, bool) or not isinstance(
+            segment_size, int
+        ):
+            raise TypeError(
+                f"segment_size must be an int, got "
+                f"{type(segment_size).__name__}"
+            )
+        if segment_size < 1:
+            raise ValueError(
+                "segment_size must be greater than or equal to 1"
+            )
+
+    @classmethod
+    def _build_recovery_audit_segments_locked(
+        cls, path: str, index_path: str, segment_size: int
+    ) -> str:
+        """Stream-authenticate the chain and durably publish its
+        segmented index, returning the chain head digest; the caller
+        holds the chain lock.
+
+        Segment records are written as the segments complete while the
+        frames stream past, so no more than one frame, audit body or
+        segment is ever materialized. The segment bytes are UTF-8
+        without a BOM, compact JSON without a trailing newline, and
+        identical for identical chains and segment sizes. They are
+        written to a temporary file in the index's directory, flushed,
+        fsync-ed and atomically moved onto ``index_path`` with directory
+        syncs; on any failure the temporary file is removed and neither
+        the chain file nor a previous segment index is modified.
+        """
+        chain_file = cls._open_recovery_chain_locked(path)
+        try:
+            directory = os.path.dirname(os.path.abspath(index_path))
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".recovery-chain-segments-",
+                suffix=".tmp",
+                dir=directory,
+            )
+            published = False
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(
+                        b'{"format":"'
+                        + cls._RECOVERY_CHAIN_SEGMENTS_FORMAT.encode(
+                            "ascii"
+                        )
+                        + b'","version":'
+                        + str(cls._RECOVERY_CHAIN_SEGMENTS_VERSION).encode(
+                            "ascii"
+                        )
+                        + b',"segment_size":'
+                        + str(segment_size).encode("ascii")
+                        + b',"segments":['
+                    )
+                    first = True
+
+                    def on_segment(segment: dict[str, Any]) -> None:
+                        nonlocal first
+                        if not first:
+                            handle.write(b",")
+                        handle.write(
+                            cls._canonical_json(segment).encode("utf-8")
+                        )
+                        first = False
+
+                    segmenter = _ChainSegmenter(
+                        segment_size, cls._canonical_json, on_segment
+                    )
+                    version, count, head = cls._scan_recovery_chain(
+                        chain_file, segmenter.on_frame
+                    )
+                    segmenter.finish()
+                    handle.write(
+                        (
+                            '],"chain_version":%d,"frames":%d,"head":"%s"}'
+                            % (version, count, head)
+                        ).encode("ascii")
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                cls._fsync_directory(directory)
+                os.replace(tmp_path, index_path)
+                published = True
+                cls._fsync_directory(directory)
+            finally:
+                if not published:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
+        finally:
+            chain_file.close()
+        return head
+
+    @classmethod
+    def _scan_segment_entries(
+        cls, stream: _CanonicalJsonStream, fingerprint: Any
+    ) -> tuple[int, int, str | None]:
+        """Stream the segment index's ``segments`` array, validating
+        each segment's shape, contiguous coverage from sequence number
+        one, bounds and digest evidence, and return the segment count,
+        the last covered sequence number and the last segment's trailing
+        boundary digest. ``fingerprint`` is a SHA-256 hasher updated
+        with each segment's canonical bytes, so the caller can compare
+        the segments item for item against the authenticated chain. Any
+        defect raises :class:`ValueError`, which the caller treats as a
+        corrupt (rebuildable) segment index."""
+        stream.expect(0x5B)  # '['
+        count = 0
+        expected_first = 1
+        last_seq = 0
+        last_digest: str | None = None
+        if stream.peek() == 0x5D:  # ']'
+            stream.take()
+            return count, last_seq, last_digest
+        while True:
+            stream.expect(0x7B)  # '{'
+            fields: dict[str, Any] = {}
+            if stream.peek() == 0x7D:  # '}'
+                stream.take()
+            else:
+                while True:
+                    if stream.peek() != 0x22:  # '"'
+                        raise ValueError("expected a segment key")
+                    key = stream.parse_string()
+                    if key in fields:
+                        raise ValueError(
+                            f"duplicate key {key!r} in JSON object"
+                        )
+                    stream.expect(0x3A)  # ':'
+                    if key in ("first", "last"):
+                        fields[key] = stream.parse_number()
+                    elif key in ("first_digest", "last_digest", "digest"):
+                        if stream.peek() != 0x22:  # '"'
+                            raise ValueError("expected a string")
+                        fields[key] = stream.parse_string()
+                    else:
+                        stream.skip_value()
+                        fields[key] = None
+                    byte = stream.take()
+                    if byte == 0x2C:  # ','
+                        continue
+                    if byte == 0x7D:  # '}'
+                        break
+                    raise ValueError("unexpected content")
+            if set(fields.keys()) != set(cls._RECOVERY_CHAIN_SEGMENT_KEYS):
+                raise ValueError("bad segment keys")
+            first = fields["first"]
+            last = fields["last"]
+            for name, value in (("first", first), ("last", last)):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                ):
+                    raise ValueError("bad segment bounds")
+            if last < first:
+                raise ValueError("bad segment bounds")
+            if first != expected_first:
+                raise ValueError("bad segment continuity")
+            digests = {}
+            for name in ("first_digest", "last_digest", "digest"):
+                value = fields[name]
+                if len(value) != 64 or set(value) - cls._HEX_DIGITS:
+                    raise ValueError("bad segment digest")
+                digests[name] = value
+            fingerprint.update(
+                cls._canonical_json(
+                    {
+                        "first": first,
+                        "last": last,
+                        "first_digest": digests["first_digest"],
+                        "last_digest": digests["last_digest"],
+                        "digest": digests["digest"],
+                    }
+                ).encode("utf-8")
+            )
+            count += 1
+            expected_first = last + 1
+            last_seq = last
+            last_digest = digests["last_digest"]
+            byte = stream.take()
+            if byte == 0x2C:  # ','
+                continue
+            if byte == 0x5D:  # ']'
+                break
+            raise ValueError("unexpected content")
+        return count, last_seq, last_digest
+
+    @classmethod
+    def _read_recovery_chain_segments(
+        cls, index_path: str
+    ) -> tuple[int, int, int, str, str] | None:
+        """Read and fully validate the segment index, returning its
+        binding -- ``(segment_size, chain_version, frames, head,
+        segments_fingerprint)`` -- or ``None`` when the index is
+        missing, unreadable or defective in any way. The fingerprint is
+        the SHA-256 over every segment's canonical bytes in order, so
+        the caller can check that each segment's bounds, boundary
+        digests and frame-bytes digest match the authenticated chain
+        item for item.
+
+        The segment index is a disposable cache, so no index problem
+        ever raises here: it only marks the index for a rebuild from the
+        canonical chain. Only a fixed amount of memory is used
+        regardless of the segment count.
+        """
+        try:
+            with open(index_path, "rb") as fileobj:
+                stream = _CanonicalJsonStream(fileobj)
+                if stream.peek() is None or stream.peek() == 0xEF:
+                    return None
+                stream.expect(0x7B)  # '{'
+                seen: set[str] = set()
+                format_value: Any = None
+                version_value: Any = None
+                segment_size_value: Any = None
+                chain_version: Any = None
+                declared_frames: Any = None
+                head: Any = None
+                count = 0
+                last_seq = 0
+                last_digest: str | None = None
+                fingerprint = hashlib.sha256()
+                if stream.peek() == 0x7D:  # '}'
+                    stream.take()
+                else:
+                    while True:
+                        if stream.peek() != 0x22:  # '"'
+                            raise ValueError("expected an object key")
+                        key = stream.parse_string()
+                        if key in seen:
+                            raise ValueError(
+                                f"duplicate key {key!r} in JSON object"
+                            )
+                        seen.add(key)
+                        stream.expect(0x3A)  # ':'
+                        if key == "segments":
+                            count, last_seq, last_digest = (
+                                cls._scan_segment_entries(
+                                    stream, fingerprint
+                                )
+                            )
+                        elif key in ("format", "head"):
+                            if stream.peek() != 0x22:  # '"'
+                                raise ValueError("expected a string")
+                            value = stream.parse_string()
+                            if key == "format":
+                                format_value = value
+                            else:
+                                head = value
+                        elif key in (
+                            "version",
+                            "segment_size",
+                            "chain_version",
+                            "frames",
+                        ):
+                            value = stream.parse_number()
+                            if key == "version":
+                                version_value = value
+                            elif key == "segment_size":
+                                segment_size_value = value
+                            elif key == "chain_version":
+                                chain_version = value
+                            else:
+                                declared_frames = value
+                        else:
+                            stream.skip_value()
+                        byte = stream.take()
+                        if byte == 0x2C:  # ','
+                            continue
+                        if byte == 0x7D:  # '}'
+                            break
+                        raise ValueError("unexpected content")
+                if not stream.at_end():
+                    return None
+                if seen != set(cls._RECOVERY_CHAIN_SEGMENTS_KEYS):
+                    return None
+                if format_value != cls._RECOVERY_CHAIN_SEGMENTS_FORMAT:
+                    return None
+                if (
+                    isinstance(version_value, bool)
+                    or not isinstance(version_value, int)
+                    or version_value
+                    not in cls._RECOVERY_CHAIN_SEGMENTS_SUPPORTED_VERSIONS
+                ):
+                    return None
+                if (
+                    isinstance(segment_size_value, bool)
+                    or not isinstance(segment_size_value, int)
+                    or segment_size_value < 1
+                ):
+                    return None
+                if (
+                    isinstance(chain_version, bool)
+                    or not isinstance(chain_version, int)
+                    or chain_version
+                    not in cls._RECOVERY_CHAIN_SUPPORTED_VERSIONS
+                ):
+                    return None
+                if (
+                    isinstance(declared_frames, bool)
+                    or not isinstance(declared_frames, int)
+                    or declared_frames != last_seq
+                    or count < 1
+                ):
+                    return None
+                if (
+                    not isinstance(head, str)
+                    or len(head) != 64
+                    or set(head) - cls._HEX_DIGITS
+                    or head != last_digest
+                ):
+                    return None
+                return (
+                    segment_size_value,
+                    chain_version,
+                    declared_frames,
+                    head,
+                    fingerprint.hexdigest(),
+                )
+        except (OSError, ValueError, RecursionError):
+            return None
+
+    @classmethod
+    def _segmented_chain_scan(
+        cls,
+        path: str,
+        index_path: str,
+        segment_size: int,
+        wanted: set[int],
+    ) -> tuple[int, str, dict[int, dict[str, Any]]]:
+        """Authenticate the chain with bounded memory under the chain
+        lock, keep the segment index fresh and return the frame count,
+        the head digest and the detached audit bodies of the ``wanted``
+        sequence numbers.
+
+        The whole batch runs as one locked chain scan plus one segment
+        check: the chain is streamed and fully authenticated to the same
+        standard as :meth:`_load_recovery_chain`, frames are folded into
+        segments as they pass and only the ``wanted`` audit bodies are
+        materialized, so memory grows only with the largest single frame
+        and fixed buffers -- never with the total frame count or a
+        queried range span. The segment index is then re-read and every
+        segment's bounds, boundary digests and frame-bytes digest is
+        checked against the authenticated chain (via a rolling SHA-256
+        fingerprint, so no segment list is materialized); any mismatch
+        marks the segment index corrupt. A missing, stale or corrupt
+        segment index is rebuilt once from the just-authenticated
+        canonical chain and re-checked; if it still does not match,
+        :class:`ValueError` is raised. The chain remains the only
+        trusted source and the segment index never answers a query by
+        itself, so no index content can mask a chain defect.
+        """
+        lock_path = cls._recovery_chain_lock_path(path)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            cls._acquire_chain_lock(fd, None)
+            try:
+                captured: dict[int, dict[str, Any]] = {}
+                fingerprint = hashlib.sha256()
+
+                def on_segment(segment: dict[str, Any]) -> None:
+                    fingerprint.update(
+                        cls._canonical_json(segment).encode("utf-8")
+                    )
+
+                segmenter = _ChainSegmenter(
+                    segment_size, cls._canonical_json, on_segment
+                )
+
+                def on_frame(frame: dict[str, Any]) -> None:
+                    if frame["seq"] in wanted:
+                        captured[frame["seq"]] = frame["body"]
+                    segmenter.on_frame(frame)
+
+                chain_file = cls._open_recovery_chain_locked(path)
+                try:
+                    version, count, head = cls._scan_recovery_chain(
+                        chain_file, on_frame
+                    )
+                finally:
+                    chain_file.close()
+                segmenter.finish()
+                expected = (
+                    segment_size,
+                    version,
+                    count,
+                    head,
+                    fingerprint.hexdigest(),
+                )
+                binding = cls._read_recovery_chain_segments(index_path)
+                if binding != expected:
+                    cls._build_recovery_audit_segments_locked(
+                        path, index_path, segment_size
+                    )
+                    binding = cls._read_recovery_chain_segments(index_path)
+                    if binding != expected:
+                        raise ValueError(
+                            "recovery chain segment index does not match "
+                            "the authenticated chain"
+                        )
+                return count, head, captured
+            finally:
+                cls._release_chain_lock(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def build_recovery_audit_segments(
+        cls, path: Any, index_path: Any, segment_size: Any
+    ) -> str:
+        """Build the disposable bounded-memory segmented index over a
+        persistent recovery-audit chain and return the authenticated
+        chain head digest.
+
+        ``path`` and ``index_path`` must be non-empty :class:`str`
+        values (a non-``str`` raises :class:`TypeError`, an empty string
+        :class:`ValueError`), and ``index_path`` must not name the chain
+        file itself, even through an alias (:class:`ValueError`).
+        ``segment_size`` must be a non-``bool`` :class:`int` (anything
+        else raises :class:`TypeError`) of at least one (a smaller value
+        raises :class:`ValueError`). A missing or unreadable chain file,
+        a missing index directory or any failed open, flush, replace or
+        sync raises :class:`OSError` and publishes nothing.
+
+        The build competes with appends for the same chain lock and
+        re-checks the chain file's identity inside the lock, so it only
+        ever observes the complete chain from before or after an
+        append. While holding the lock it streams the chain and fully
+        authenticates it -- encoding, canonical form, duplicate keys,
+        frame order, predecessor links, embedded record checksums and
+        frame digests -- without ever materializing all frames or audit
+        bodies at once; any chain defect raises :class:`ValueError` and
+        publishes nothing. Consecutive frames are folded into segments
+        of ``segment_size`` frames (the last segment may be short);
+        every segment records its first and last sequence numbers, the
+        boundary frame digests and the SHA-256 of the segment's
+        canonical frame bytes. The document binds the chain's schema
+        version, frame count, head digest and segment size; its bytes
+        are UTF-8 without a BOM, compact JSON without a trailing
+        newline, and identical for identical chains and segment sizes.
+        They are written to a temporary file in the index's directory,
+        flushed, fsync-ed and atomically moved onto ``index_path`` with
+        directory syncs, so concurrent readers see either the old index
+        or the new one, never a partial document.
+
+        The segment index is a disposable cache: the canonical chain
+        stays the only trusted source, and
+        :meth:`diff_recovery_audit_ranges` rebuilds it whenever it is
+        missing, stale, truncated or corrupt. A crashed or failed build
+        never rewrites the chain file, leaves any previous segment index
+        valid or recognizably stale, and removes its temporary file.
+        Whether the build succeeds or fails, nothing under the
+        generation directory -- business state, audits, idempotency
+        records or the journal attachment -- is modified.
+        """
+        cls._validate_chain_path(path)
+        cls._validate_index_path(index_path)
+        cls._validate_index_target(path, index_path)
+        cls._validate_segment_size(segment_size)
+        lock_path = cls._recovery_chain_lock_path(path)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            cls._acquire_chain_lock(fd, None)
+            try:
+                return cls._build_recovery_audit_segments_locked(
+                    path, index_path, segment_size
+                )
+            finally:
+                cls._release_chain_lock(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def diff_recovery_audit_ranges(
+        cls,
+        path: Any,
+        expected_head: Any,
+        ranges: Any,
+        index_path: Any,
+        segment_size: Any,
+    ) -> tuple[dict[str, Any], ...]:
+        """Compare the audit records sealed at the endpoints of many
+        chain ranges in one batch, strictly read-only.
+
+        ``path`` and ``expected_head`` are authenticated exactly as for
+        :meth:`diff_recovery_audit_range`: an invalid path raises
+        :class:`TypeError`/:class:`ValueError`, a missing or unreadable
+        file :class:`OSError`, any chain defect :class:`ValueError`, and
+        a sound chain whose last frame does not match ``expected_head``
+        raises :class:`ValueError` rather than reporting diffs over
+        unauthenticated material.
+
+        ``ranges`` must be a :class:`tuple` whose every element is a
+        ``(start, end)`` :class:`tuple` of two non-``bool`` integers; a
+        wrong container or element shape raises :class:`TypeError`, as
+        does a non-integer endpoint. An endpoint below one, a start
+        later than its end, a duplicated range or an end past the
+        chain's last frame raises :class:`ValueError`. ``index_path``
+        and ``segment_size`` are validated exactly as for
+        :meth:`build_recovery_audit_segments`.
+
+        The whole batch performs exactly one locked chain scan and one
+        segment check: the chain is streamed and fully authenticated
+        under the same chain lock that serializes appends, only the
+        queried endpoint records are materialized, and the segment index
+        at ``index_path`` is checked segment by segment against the
+        authenticated chain and rebuilt once from it when missing,
+        stale, truncated or corrupt (an index that still does not match
+        after the rebuild raises :class:`ValueError`; a failed rebuild
+        propagates :class:`OSError`). Memory grows only with the largest
+        single frame and fixed buffers -- never with the total frame
+        count or a range span. An empty ``ranges`` still completes the
+        path, head, segment-size, chain and segment-index
+        authentication and then returns an empty tuple.
+
+        The result is a tuple of fresh dictionaries, one per input range
+        in input order, each carrying ``start``, ``end`` and ``changes``
+        -- where ``changes`` is item-for-item identical to the
+        :meth:`diff_recovery_audit_range` result for the same endpoints
+        (an empty tuple when ``start`` equals ``end``). Nothing on disk
+        or any business, audit or idempotency state is modified, and the
+        returned dictionaries are detached from the parsed chain and
+        from each other.
+        """
+        cls._validate_chain_path(path)
+        cls._validate_head_digest(expected_head, allow_none=False)
+        if not isinstance(ranges, tuple):
+            raise TypeError(
+                f"ranges must be a tuple, got {type(ranges).__name__}"
+            )
+        normalized: list[tuple[int, int]] = []
+        seen_ranges: set[tuple[int, int]] = set()
+        for item in ranges:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise TypeError(
+                    "each range must be a (start, end) tuple"
+                )
+            start, end = item
+            for name, value in (("start", start), ("end", end)):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError(
+                        f"{name} must be an int, got "
+                        f"{type(value).__name__}"
+                    )
+            if start < 1 or end < 1:
+                raise ValueError(
+                    "range endpoints must be greater than or equal to 1"
+                )
+            if start > end:
+                raise ValueError(
+                    "range start must not be later than end"
+                )
+            if (start, end) in seen_ranges:
+                raise ValueError(
+                    f"duplicate range ({start}, {end})"
+                )
+            seen_ranges.add((start, end))
+            normalized.append((start, end))
+        cls._validate_index_path(index_path)
+        cls._validate_index_target(path, index_path)
+        cls._validate_segment_size(segment_size)
+        wanted: set[int] = set()
+        for start, end in normalized:
+            wanted.add(start)
+            wanted.add(end)
+        last, head, captured = cls._segmented_chain_scan(
+            path, index_path, segment_size, wanted
+        )
+        if not hmac.compare_digest(head, expected_head):
+            raise ValueError(
+                "recovery chain head does not match the expected head "
+                "digest"
+            )
+        results: list[dict[str, Any]] = []
+        for start, end in normalized:
+            if end > last:
+                raise ValueError(
+                    f"range end {end} is past the last frame {last}"
+                )
+            if start == end:
+                changes: tuple[tuple[Any, ...], ...] = ()
+            else:
+                changes = cls._diff_recovery_bodies(
+                    captured[start], captured[end]
+                )
+            results.append(
+                {"start": start, "end": end, "changes": changes}
+            )
+        return tuple(results)
 
     @classmethod
     def _diff_recovery_bodies(

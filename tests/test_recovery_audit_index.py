@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 
 from city_twin.branches import BranchStore
 from city_twin.event_graph import EventGraph
@@ -543,6 +544,118 @@ class IndexedQuerySideEffectTests(RecoveryAuditIndexTestBase):
             or os.path.exists(os.path.realpath(self.chain) + ".lock")
         )
         self.assertEqual(self.tmp_files(), [])
+
+
+class IndexedEntryCrossCheckTests(RecoveryAuditIndexTestBase):
+    """Every index entry's seq, offset, length and digest must point at
+    the corresponding authenticated chain frame; any entry that does
+    not marks the index corrupt and it is rebuilt exactly once."""
+
+    def tamper_entry(self, position: int, key: str, value) -> bytes:
+        document = self.index_document()
+        document["entries"][position][key] = value
+        data = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        with open(self.index, "wb") as handle:
+            handle.write(data)
+        return data
+
+    def test_verify_rebuilds_entry_with_wrong_offset(self) -> None:
+        head = self.chain_with_frames(3)
+        self.build_index()
+        good = _read(self.index)
+        self.tamper_entry(1, "offset", 0)
+        self.assertIs(
+            BranchStore.verify_recovery_audit_chain(
+                self.chain, head, self.index
+            ),
+            True,
+        )
+        self.assertEqual(_read(self.index), good)
+
+    def test_verify_rebuilds_entry_with_wrong_length(self) -> None:
+        head = self.chain_with_frames(3)
+        self.build_index()
+        good = _read(self.index)
+        entry = self.index_document()["entries"][2]
+        self.tamper_entry(2, "length", entry["length"] + 1)
+        self.assertIs(
+            BranchStore.verify_recovery_audit_chain(
+                self.chain, head, self.index
+            ),
+            True,
+        )
+        self.assertEqual(_read(self.index), good)
+
+    def test_diff_rebuilds_entry_with_wrong_digest(self) -> None:
+        head = self.chain_with_frames(3)
+        self.build_index()
+        good = _read(self.index)
+        expected = BranchStore.diff_recovery_audit_range(
+            self.chain, head, 1, 3
+        )
+        self.tamper_entry(0, "digest", "0" * 64)
+        self.assertEqual(
+            BranchStore.diff_recovery_audit_range(
+                self.chain, head, 1, 3, self.index
+            ),
+            expected,
+        )
+        self.assertEqual(_read(self.index), good)
+
+    def test_diff_rebuilds_entry_with_wrong_seq(self) -> None:
+        head = self.chain_with_frames(2)
+        self.build_index()
+        # Reorder the two entries: the document no longer matches the
+        # authenticated chain and must be rebuilt.
+        document = self.index_document()
+        document["entries"] = list(reversed(document["entries"]))
+        with open(self.index, "wb") as handle:
+            handle.write(
+                json.dumps(document, separators=(",", ":")).encode("utf-8")
+            )
+        self.assertEqual(
+            BranchStore.diff_recovery_audit_range(
+                self.chain, head, 1, 2, self.index
+            ),
+            BranchStore.diff_recovery_audit_range(self.chain, head, 1, 2),
+        )
+        entries = self.index_document()["entries"]
+        self.assertEqual([entry["seq"] for entry in entries], [1, 2])
+
+    def test_still_mismatched_after_one_rebuild_raises(self) -> None:
+        head = self.chain_with_frames(2)
+        self.build_index()
+        # Mark the index corrupt so the query rebuilds it.
+        self.tamper_entry(0, "offset", 0)
+        calls = []
+        original = BranchStore._build_recovery_audit_index_locked
+
+        def poisoned(cls, path, index_path):
+            calls.append(1)
+            result = original(path, index_path)
+            # Publish a structurally valid index whose entries do not
+            # match the authenticated chain.
+            document = json.loads(_read(index_path).decode("utf-8"))
+            document["entries"][0]["offset"] += 1
+            with open(index_path, "wb") as handle:
+                handle.write(
+                    json.dumps(document, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                )
+            return result
+
+        with unittest.mock.patch.object(
+            BranchStore,
+            "_build_recovery_audit_index_locked",
+            classmethod(poisoned),
+        ):
+            with self.assertRaises(ValueError):
+                BranchStore.verify_recovery_audit_chain(
+                    self.chain, head, self.index
+                )
+        # The corrupt index was rebuilt exactly once in the call.
+        self.assertEqual(len(calls), 1)
 
 
 class IndexedQueryLongChainTests(RecoveryAuditIndexTestBase):
