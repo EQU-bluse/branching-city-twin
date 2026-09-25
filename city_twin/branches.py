@@ -2259,6 +2259,22 @@ class BranchStore:
     _POINTER_STATES = ("missing", "ok", "corrupt")
     _DEPENDENCY_STATES = ("root", "linked", "broken", "invalid")
 
+    #: Persistent anti-rollback chain envelope (see
+    #: :meth:`append_recovery_audit_chain`). The document stores an
+    #: ordered list of sealed frames at a fixed schema version; every
+    #: frame's digest links its sequence number, its predecessor and the
+    #: canonical recovery-audit record sampled at append time.
+    _RECOVERY_CHAIN_FORMAT = (
+        "branching-city-twin/recovery-audit-chain"
+    )
+    _RECOVERY_CHAIN_VERSION = 1
+    _RECOVERY_CHAIN_SUPPORTED_VERSIONS = (1,)
+    _RECOVERY_CHAIN_KEYS = ("format", "version", "frames")
+    _RECOVERY_CHAIN_FRAME_KEYS = ("seq", "prev", "record", "digest")
+    #: The first frame roots the chain at the all-zero predecessor
+    #: digest, which is never the digest of a real frame.
+    _RECOVERY_CHAIN_GENESIS_PREV = "0" * 64
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -3113,6 +3129,428 @@ class BranchStore:
             evidence, body["version"]
         )
         return cls._diff_recovery_bodies(body, current_body)
+
+    @classmethod
+    def _validate_chain_path(cls, path: Any) -> None:
+        """Validate a chain file ``path`` argument: a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`."""
+        if not isinstance(path, str):
+            raise TypeError(
+                f"path must be a str, got {type(path).__name__}"
+            )
+        if not path:
+            raise ValueError("path must be a non-empty str")
+
+    @classmethod
+    def _validate_head_digest(
+        cls, value: Any, *, allow_none: bool
+    ) -> None:
+        """Validate a head digest argument. With ``allow_none`` the
+        genesis marker ``None`` is accepted (the append entry); every
+        other use requires a 64-character lowercase hexadecimal string.
+        A wrong type raises :class:`TypeError` and a malformed string
+        :class:`ValueError`."""
+        if value is None:
+            if allow_none:
+                return
+            raise TypeError("expected head digest must be a str, got NoneType")
+        if not isinstance(value, str):
+            raise TypeError(
+                "head digest must be a str, got "
+                f"{type(value).__name__}"
+            )
+        if len(value) != 64 or set(value) - cls._HEX_DIGITS:
+            raise ValueError(
+                "head digest must be a 64-character lowercase hex string"
+            )
+
+    @classmethod
+    def _recovery_chain_frame_digest(
+        cls, seq: int, prev: str, record: str
+    ) -> str:
+        """Compute a frame digest over exactly its sequence number, its
+        predecessor link and the embedded canonical audit record, so a
+        missing, duplicated, swapped, reordered, truncated or rewritten
+        frame changes the digest the caller compares against."""
+        signed = cls._canonical_json(
+            {"seq": seq, "prev": prev, "record": record}
+        )
+        return hashlib.sha256(signed.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _load_recovery_chain(
+        cls, path: str
+    ) -> list[dict[str, Any]]:
+        """Read, decode and fully validate a chain file, returning its
+        detached ordered frames, each carrying the parsed (but not
+        caller-shared) audit record body.
+
+        Filesystem failures -- including a missing file, which
+        propagates as :class:`FileNotFoundError` -- propagate as
+        :class:`OSError`; an empty document and every structural,
+        encoding, sequence or digest-link defect raise
+        :class:`ValueError`. The caller validates ``path``'s type and
+        emptiness.
+        """
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise ValueError("recovery chain must be UTF-8 without a BOM")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"recovery chain is not valid UTF-8: {exc}"
+            ) from exc
+        if not text:
+            raise ValueError("recovery chain document is empty")
+        try:
+            document = json.loads(
+                text, object_pairs_hook=cls._reject_duplicate_json_keys
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"recovery chain is not valid JSON: {exc}"
+            ) from exc
+        if cls._canonical_json(document) != text:
+            raise ValueError(
+                "recovery chain is not canonical compact JSON"
+            )
+        return cls._parse_recovery_chain_document(document)
+
+    @classmethod
+    def _parse_recovery_chain_document(
+        cls, document: Any
+    ) -> list[dict[str, Any]]:
+        """Validate a parsed chain envelope and every frame it seals,
+        returning detached frames ordered by sequence number. Any
+        structural, field-domain, sequence or hash-link deviation raises
+        :class:`ValueError`."""
+        if not isinstance(document, dict):
+            raise ValueError(
+                "recovery chain top-level JSON value must be an object"
+            )
+        if set(document.keys()) != set(cls._RECOVERY_CHAIN_KEYS):
+            raise ValueError(
+                "recovery chain must contain exactly the keys 'format', "
+                "'version' and 'frames'"
+            )
+        if document["format"] != cls._RECOVERY_CHAIN_FORMAT:
+            raise ValueError("recovery chain has an unknown format")
+        version = document["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("recovery chain 'version' must be an int")
+        if version not in cls._RECOVERY_CHAIN_SUPPORTED_VERSIONS:
+            raise ValueError(
+                f"unsupported recovery chain version {version!r}"
+            )
+        frames_value = document["frames"]
+        if not isinstance(frames_value, list):
+            raise ValueError("recovery chain 'frames' must be an array")
+        if not frames_value:
+            raise ValueError("recovery chain document has no frames")
+        frames: list[dict[str, Any]] = []
+        previous_digest = cls._RECOVERY_CHAIN_GENESIS_PREV
+        for position, frame in enumerate(frames_value, start=1):
+            if not isinstance(frame, dict) or set(frame.keys()) != set(
+                cls._RECOVERY_CHAIN_FRAME_KEYS
+            ):
+                raise ValueError(
+                    "each recovery chain frame must contain exactly the "
+                    "keys 'seq', 'prev', 'record' and 'digest'"
+                )
+            seq = frame["seq"]
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                raise ValueError(
+                    f"recovery chain frame {position}: 'seq' must be an int"
+                )
+            if seq != position:
+                raise ValueError(
+                    f"recovery chain frame {position}: sequence numbers "
+                    "must be consecutive starting at 1"
+                )
+            prev = frame["prev"]
+            if not isinstance(prev, str) or len(prev) != 64 or (
+                set(prev) - cls._HEX_DIGITS
+            ):
+                raise ValueError(
+                    f"recovery chain frame {seq}: 'prev' must be a "
+                    "64-character lowercase hex string"
+                )
+            if not hmac.compare_digest(prev, previous_digest):
+                raise ValueError(
+                    f"recovery chain frame {seq}: predecessor digest "
+                    "does not link to the previous frame"
+                )
+            record = frame["record"]
+            if not isinstance(record, str) or not record:
+                raise ValueError(
+                    f"recovery chain frame {seq}: 'record' must be a "
+                    "non-empty str"
+                )
+            # The embedded audit record must itself be a structurally
+            # sound, canonical, checksummed recovery-audit envelope.
+            body = cls._parse_recovery_audit_record(record)
+            digest = frame["digest"]
+            if not isinstance(digest, str) or len(digest) != 64 or (
+                set(digest) - cls._HEX_DIGITS
+            ):
+                raise ValueError(
+                    f"recovery chain frame {seq}: 'digest' must be a "
+                    "64-character lowercase hex string"
+                )
+            expected_digest = cls._recovery_chain_frame_digest(
+                seq, prev, record
+            )
+            if not hmac.compare_digest(digest, expected_digest):
+                raise ValueError(
+                    f"recovery chain frame {seq}: frame digest is invalid"
+                )
+            frames.append(
+                {
+                    "seq": seq,
+                    "prev": prev,
+                    "record": record,
+                    "digest": digest,
+                    "body": body,
+                }
+            )
+            previous_digest = digest
+        return frames
+
+    @classmethod
+    def _write_recovery_chain(
+        cls, path: str, frames: list[dict[str, Any]]
+    ) -> None:
+        """Serialize the complete ordered chain and durably atomically
+        replace ``path``.
+
+        The bytes are UTF-8 (no BOM), compact JSON with no trailing
+        newline; they are written to a temporary file in the same
+        directory, flushed, fsync-ed and atomically moved onto ``path``
+        after the directory entry of the temp file is synced. On any
+        failure the previous chain file is left byte-for-byte untouched
+        and the temporary file is removed; no partial frame set ever
+        becomes visible.
+        """
+        document = {
+            "format": cls._RECOVERY_CHAIN_FORMAT,
+            "version": cls._RECOVERY_CHAIN_VERSION,
+            "frames": [
+                {
+                    "seq": frame["seq"],
+                    "prev": frame["prev"],
+                    "record": frame["record"],
+                    "digest": frame["digest"],
+                }
+                for frame in frames
+            ],
+        }
+        data = cls._canonical_json(document).encode("utf-8")
+        directory = os.path.dirname(os.path.abspath(path))
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".recovery-chain-", suffix=".tmp", dir=directory
+        )
+        replaced = False
+        try:
+            try:
+                handle = os.fdopen(fd, "wb")
+            except BaseException:
+                # fdopen only reaches here without taking ownership of fd.
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                raise
+            with handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            cls._fsync_directory(directory)
+            os.replace(tmp_path, path)
+            replaced = True
+            cls._fsync_directory(directory)
+        finally:
+            if not replaced:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+
+    @classmethod
+    def append_recovery_audit_chain(
+        cls, root: Any, path: Any, previous: Any
+    ) -> str:
+        """Append one fresh recovery-audit sample to a persistent,
+        tamper-evident chain, returning the new head digest.
+
+        ``root`` is validated exactly as for
+        :meth:`export_recovery_audit`: a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`, and a
+        missing root, non-directory, enumeration or read failure
+        :class:`OSError`; the scan is strictly read-only. ``path`` is
+        validated next as a non-empty :class:`str` (non-``str``
+        :class:`TypeError`, empty :class:`ValueError`); a failed chain
+        read or write propagates :class:`OSError`. ``previous`` is the
+        caller-saved previous head digest: it must be ``None`` or a
+        64-character lowercase hexadecimal string, otherwise
+        :class:`TypeError` for the wrong type and :class:`ValueError` for
+        an illegal format.
+
+        The first frame may only be created with ``previous`` equal to
+        ``None``; once the chain exists, ``previous`` must equal the
+        current last frame's digest. A mismatch raises
+        :class:`RuntimeError` and leaves the file byte-for-byte
+        unchanged.
+
+        Each append first exports the current recovery evidence as a
+        canonical, signed audit record and then fully re-verifies the
+        existing chain (structure, canonical encoding, every embedded
+        record's checksum, consecutive numbering and the digest links)
+        before sealing one more frame. A frame is added even when the
+        audit record is identical to the previous sample, so the fact
+        that a sample was taken survives. Frames are numbered from one;
+        the first frame roots the chain at an all-zero predecessor
+        digest, and every later frame cites the prior frame's digest.
+        Each frame digest covers its sequence number, predecessor link
+        and embedded record, so deletion, duplication, swapping,
+        reordering, truncation or rewriting is detectable against the
+        externally retained head digest.
+
+        The whole chain is rewritten in the same directory and durably
+        atomically replaced; a failure leaves the old chain
+        byte-for-byte untouched and exposes no partial frame. Nothing
+        under ``root`` -- the pointer, generations, business state,
+        audits or idempotency records -- is modified.
+        """
+        cls._validate_recovery_root(root)
+        cls._validate_chain_path(path)
+        cls._validate_head_digest(previous, allow_none=True)
+
+        # Export first so a directory with no recoverable generation
+        # raises ValueError before the chain file is consulted.
+        record = cls.export_recovery_audit(root)
+
+        try:
+            frames = cls._load_recovery_chain(path)
+        except FileNotFoundError:
+            frames = []
+        if not frames:
+            if previous is not None:
+                raise RuntimeError(
+                    "no recovery chain exists yet, so the previous head "
+                    "digest must be None"
+                )
+            prev = cls._RECOVERY_CHAIN_GENESIS_PREV
+        else:
+            if previous is None:
+                raise RuntimeError(
+                    "recovery chain already exists, so the previous head "
+                    "digest is required"
+                )
+            if not hmac.compare_digest(frames[-1]["digest"], previous):
+                raise RuntimeError(
+                    "previous head digest does not match the current end "
+                    "of the recovery chain"
+                )
+            prev = frames[-1]["digest"]
+        seq = len(frames) + 1
+        digest = cls._recovery_chain_frame_digest(seq, prev, record)
+        frames.append(
+            {
+                "seq": seq,
+                "prev": prev,
+                "record": record,
+                "digest": digest,
+            }
+        )
+        cls._write_recovery_chain(path, frames)
+        return digest
+
+    @classmethod
+    def verify_recovery_audit_chain(
+        cls, path: Any, expected_head: Any
+    ) -> bool:
+        """Authenticate a persistent recovery-audit chain strictly
+        read-only.
+
+        ``path`` must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`); a
+        missing or unreadable file raises :class:`OSError`. Any content
+        defect -- an empty document, a non-UTF-8 or BOM-bearing file,
+        malformed JSON, duplicate keys, a non-canonical encoding, a
+        structural or version violation, a malformed embedded audit
+        record, a non-consecutive sequence number or a broken
+        predecessor/frame digest link -- raises :class:`ValueError`.
+
+        When the chain is internally sound, the last frame's digest is
+        compared against ``expected_head`` (a 64-character lowercase
+        hexadecimal string, validated like the append argument): exact
+        equality returns ``True``, any difference -- including a rolled
+        back, truncated or forked chain -- returns ``False``. The check
+        never modifies the chain, the generation directory or any
+        business, audit or idempotency state, and its result is
+        detached from the parsed document.
+        """
+        cls._validate_chain_path(path)
+        cls._validate_head_digest(expected_head, allow_none=False)
+        frames = cls._load_recovery_chain(path)
+        if not frames:
+            raise ValueError("recovery chain document has no frames")
+        return hmac.compare_digest(frames[-1]["digest"], expected_head)
+
+    @classmethod
+    def diff_recovery_audit_range(
+        cls, path: Any, expected_head: Any, start: Any, end: Any
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Compare the audit records sealed at two chain positions,
+        strictly read-only.
+
+        ``path`` and ``expected_head`` are authenticated exactly as for
+        :meth:`verify_recovery_audit_chain`: an invalid path raises
+        :class:`TypeError`/:class:`ValueError`, a missing or unreadable
+        file :class:`OSError`, any chain defect :class:`ValueError`, and a
+        sound chain whose last frame does not match ``expected_head``
+        raises :class:`ValueError` rather than reporting a diff over
+        unauthenticated material.
+
+        ``start`` and ``end`` must be non-``bool`` integers, otherwise
+        :class:`TypeError`; a value below one, a start later than end,
+        or a value past the chain's last frame raises
+        :class:`ValueError`. Both endpoints' embedded audit records are
+        compared with the same classification, identities and stable
+        ordering as :meth:`diff_recovery_audit`; equal sequence numbers
+        yield an empty tuple. Nothing on disk or any business, audit or
+        idempotency state is modified, and the returned tuples are
+        detached from the parsed chain.
+        """
+        cls._validate_chain_path(path)
+        cls._validate_head_digest(expected_head, allow_none=False)
+        for name, value in (("start", start), ("end", end)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{name} must be an int, got {type(value).__name__}"
+                )
+        frames = cls._load_recovery_chain(path)
+        if not frames:
+            raise ValueError("recovery chain document has no frames")
+        if not hmac.compare_digest(frames[-1]["digest"], expected_head):
+            raise ValueError(
+                "recovery chain head does not match the expected head "
+                "digest"
+            )
+        last = frames[-1]["seq"]
+        if start < 1 or end < 1:
+            raise ValueError(
+                "range endpoints must be greater than or equal to 1"
+            )
+        if start > end:
+            raise ValueError("range start must not be later than end")
+        if end > last:
+            raise ValueError(
+                f"range end {end} is past the last frame {last}"
+            )
+        if start == end:
+            return ()
+        before = frames[start - 1]["body"]
+        after = frames[end - 1]["body"]
+        return cls._diff_recovery_bodies(before, after)
 
     @classmethod
     def _diff_recovery_bodies(
