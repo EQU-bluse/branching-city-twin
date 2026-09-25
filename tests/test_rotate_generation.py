@@ -485,24 +485,66 @@ class LoadLatestGenerationTests(GenerationTestBase):
         # Generation 1's journal holds the m4 commit that followed it.
         self.assertEqual(recovered.head("main"), "m4")
 
-    def test_corrupt_data_file_invalidates_only_that_generation(
-        self,
-    ) -> None:
+    def test_corrupt_data_file_invalidates_every_dependent(self) -> None:
         self.rotate_three()
-        # Corrupt generation 2's checkpoint bytes; its manifest is
-        # untouched, so generation 3's chain link still verifies.
+        # Corrupt generation 2's checkpoint bytes. Generation 2 is
+        # invalid, and the invalidity propagates by number: generation 3
+        # cannot chain over an invalid predecessor even though its own
+        # manifest still quotes generation 2's (old) manifest digest, so
+        # recovery stops at the last valid generation, number 1.
         checkpoint_path = os.path.join(
             self.generation_dir(2), "checkpoint.json"
         )
         with open(checkpoint_path, "ab") as handle:
             handle.write(b" ")
         recovered, report = BranchStore.load_latest_generation(self.root)
-        self.assertEqual(report["selected"], "generation-0000000000000003")
+        self.assertEqual(report["selected"], "generation-0000000000000001")
         self.assertEqual(
             [entry["name"] for entry in report["ignored"]],
-            ["generation-0000000000000002"],
+            ["generation-0000000000000002", "generation-0000000000000003"],
         )
-        self.assertEqual(recovered.head("main"), "m5")
+        reasons = [entry["reason"] for entry in report["ignored"]]
+        self.assertIn("checkpoint", reasons[0])
+        self.assertIn("invalid", reasons[1])
+        # Generation 1's journal holds the m4 commit that followed it.
+        self.assertEqual(recovered.head("main"), "m4")
+
+    def test_quoted_digest_of_invalid_predecessor_does_not_chain(
+        self,
+    ) -> None:
+        self.rotate_three()
+        # Replace generation 2's checkpoint but leave its manifest bytes
+        # untouched, so generation 3's manifest still quotes the exact
+        # digest of an invalid generation 2 manifest's predecessor chain.
+        # Generation 3 must still be refused: quoting a digest never
+        # legitimizes a predecessor whose own evidence is broken.
+        checkpoint_path = os.path.join(
+            self.generation_dir(2), "checkpoint.json"
+        )
+        with open(checkpoint_path, "wb") as handle:
+            handle.write(b"{}")
+        recovered, report = BranchStore.load_latest_generation(self.root)
+        self.assertEqual(report["selected"], "generation-0000000000000001")
+        self.assertEqual(
+            [entry["name"] for entry in report["ignored"]],
+            ["generation-0000000000000002", "generation-0000000000000003"],
+        )
+        self.assertEqual(recovered.head("main"), "m4")
+
+    def test_gap_in_numbering_cannot_be_jumped(self) -> None:
+        self.rotate_three()
+        # Remove generation 2 entirely: generation 3 must not be reached
+        # by jumping the gap, even if its digest quote is untouched.
+        import shutil
+
+        shutil.rmtree(self.generation_dir(2))
+        recovered, report = BranchStore.load_latest_generation(self.root)
+        self.assertEqual(report["selected"], "generation-0000000000000001")
+        self.assertEqual(
+            [entry["name"] for entry in report["ignored"]],
+            ["generation-0000000000000003"],
+        )
+        self.assertIn("chain", report["ignored"][0]["reason"])
 
     def test_missing_files_and_half_finished_are_invalid(self) -> None:
         self.rotate_three()
@@ -552,6 +594,24 @@ class LoadLatestGenerationTests(GenerationTestBase):
             )
         with self.assertRaises(ValueError):
             BranchStore.load_latest_generation(self.root)
+
+    def test_zero_numbered_forensic_entry_does_not_poison_chain(
+        self,
+    ) -> None:
+        self.rotate_three()
+        # A directory matching the pattern but numbered zero is forensic
+        # junk: it is reported invalid but never occupies the chain that
+        # begins at generation one.
+        os.mkdir(
+            os.path.join(self.root, "generation-0000000000000000")
+        )
+        recovered, report = BranchStore.load_latest_generation(self.root)
+        self.assertEqual(report["selected"], "generation-0000000000000003")
+        self.assertEqual(
+            [entry["name"] for entry in report["ignored"]],
+            ["generation-0000000000000000"],
+        )
+        self.assertEqual(recovered.head("main"), "m5")
 
     def test_no_generations_raises_value_error(self) -> None:
         with self.assertRaises(ValueError):
