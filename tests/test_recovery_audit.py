@@ -95,14 +95,19 @@ class ExportRecoveryAuditTests(RecoveryAuditTestBase):
             ],
         )
         self.assertEqual(document["format"], "branching-city-twin/recovery-audit")
-        self.assertEqual(document["version"], 1)
+        self.assertEqual(document["version"], 2)
         self.assertEqual(document["selected"], "generation-0000000000000003")
         self.assertEqual(
             document["current"],
             {
                 "state": "ok",
                 "value": "generation-0000000000000003",
+                "digest": None,
             },
+        )
+        # The nested pointer object keeps a fixed key order.
+        self.assertEqual(
+            list(document["current"]), ["state", "value", "digest"]
         )
         self.assertEqual(document["ignored"], [])
         self.assertIsInstance(document["checksum"], str)
@@ -192,7 +197,10 @@ class ExportRecoveryAuditTests(RecoveryAuditTestBase):
         self.rotate_three()
         os.remove(os.path.join(self.root, "CURRENT"))
         document = json.loads(BranchStore.export_recovery_audit(self.root))
-        self.assertEqual(document["current"], {"state": "missing", "value": None})
+        self.assertEqual(
+            document["current"],
+            {"state": "missing", "value": None, "digest": None},
+        )
         self.assertEqual(document["selected"], "generation-0000000000000003")
 
     def test_stale_legal_pointer_reported_verbatim(self) -> None:
@@ -202,7 +210,11 @@ class ExportRecoveryAuditTests(RecoveryAuditTestBase):
         document = json.loads(BranchStore.export_recovery_audit(self.root))
         self.assertEqual(
             document["current"],
-            {"state": "ok", "value": "generation-0000000000000001"},
+            {
+                "state": "ok",
+                "value": "generation-0000000000000001",
+                "digest": None,
+            },
         )
         # The stale hint does not steer the evidence-based selection.
         self.assertEqual(document["selected"], "generation-0000000000000003")
@@ -210,7 +222,8 @@ class ExportRecoveryAuditTests(RecoveryAuditTestBase):
     def test_corrupt_pointers_are_summarized_not_echoed(self) -> None:
         self.rotate_three()
         # Each raw pointer carries a distinctive token that must never
-        # appear in the audit record; only the "corrupt" summary does.
+        # appear in the audit record; only the "corrupt" state and the
+        # SHA-256 digest of the raw bytes do.
         cases = (
             b"\xff\xfe secret-pointer-one",
             b"",
@@ -226,7 +239,11 @@ class ExportRecoveryAuditTests(RecoveryAuditTestBase):
             document = json.loads(record)
             self.assertEqual(
                 document["current"],
-                {"state": "corrupt", "value": None},
+                {
+                    "state": "corrupt",
+                    "value": None,
+                    "digest": _sha256(raw),
+                },
             )
             for token in (
                 "secret-pointer-one",
@@ -235,6 +252,19 @@ class ExportRecoveryAuditTests(RecoveryAuditTestBase):
                 "secret-pointer-four",
             ):
                 self.assertNotIn(token, record)
+
+    def test_distinct_corrupt_pointers_are_distinguishable(self) -> None:
+        self.rotate_three()
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"first-corruption")
+        first = BranchStore.export_recovery_audit(self.root)
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"second-corruption")
+        second = BranchStore.export_recovery_audit(self.root)
+        self.assertNotEqual(first, second)
+        self.assertFalse(
+            BranchStore.verify_recovery_audit(self.root, first)
+        )
 
     def test_invalid_generations_recorded_with_reasons_and_dependencies(
         self,
@@ -400,7 +430,7 @@ class VerifyRecoveryAuditTests(RecoveryAuditTestBase):
         # Structural violations carry a recomputed checksum, so the
         # failure is a field ValueError rather than a checksum mismatch.
         for change in (
-            {"version": 2},
+            {"version": 3},
             {"format": "other"},
             {"selected": "not-a-legal-generation-name"},
         ):
@@ -450,6 +480,394 @@ class VerifyRecoveryAuditTests(RecoveryAuditTestBase):
                 allow_nan=False,
             ).encode("utf-8")
         )
+
+
+def _reencode(document: dict[str, object]) -> str:
+    return json.dumps(
+        document, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+
+
+class VersionCompatibilityTests(RecoveryAuditTestBase):
+    def v1_record(self, record: str) -> str:
+        """Rewrite a version 2 record as a signed version 1 one."""
+        document = json.loads(record)
+        document["version"] = 1
+        current = document["current"]
+        assert set(current) == {"state", "value", "digest"}
+        document["current"] = {"state": current["state"], "value": current["value"]}
+        body = {
+            key: document[key]
+            for key in (
+                "format",
+                "version",
+                "current",
+                "selected",
+                "generations",
+                "ignored",
+            )
+        }
+        document["checksum"] = _sha256(_reencode(body).encode("utf-8"))
+        return _reencode(document)
+
+    def test_version_one_records_are_accepted(self) -> None:
+        self.rotate_three()
+        record = self.v1_record(
+            BranchStore.export_recovery_audit(self.root)
+        )
+        self.assertEqual(json.loads(record)["version"], 1)
+        self.assertTrue(
+            BranchStore.verify_recovery_audit(self.root, record)
+        )
+        self.assertEqual(
+            BranchStore.diff_recovery_audit(self.root, record), ()
+        )
+
+    def test_version_two_missing_digest_rejected(self) -> None:
+        self.rotate_three()
+        document = json.loads(
+            BranchStore.export_recovery_audit(self.root)
+        )
+        document["current"] = {
+            "state": document["current"]["state"],
+            "value": document["current"]["value"],
+        }
+        body = {
+            key: document[key]
+            for key in (
+                "format",
+                "version",
+                "current",
+                "selected",
+                "generations",
+                "ignored",
+            )
+        }
+        document["checksum"] = _sha256(
+            _reencode(body).encode("utf-8")
+        )
+        with self.assertRaises(ValueError):
+            BranchStore.verify_recovery_audit(
+                self.root, _reencode(document)
+            )
+
+    def test_version_one_is_blind_to_corrupt_pointer_replacement(self) -> None:
+        self.rotate_three()
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"first-corruption")
+        record = self.v1_record(
+            BranchStore.export_recovery_audit(self.root)
+        )
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"second-corruption")
+        # Version 1 keeps only the corrupt state, so this is invisible.
+        self.assertTrue(
+            BranchStore.verify_recovery_audit(self.root, record)
+        )
+        self.assertEqual(
+            BranchStore.diff_recovery_audit(self.root, record), ()
+        )
+
+    def test_version_two_detects_corrupt_pointer_replacement(self) -> None:
+        self.rotate_three()
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"first-corruption")
+        record = BranchStore.export_recovery_audit(self.root)
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"second-corruption")
+        self.assertFalse(
+            BranchStore.verify_recovery_audit(self.root, record)
+        )
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        self.assertEqual(len(changes), 1)
+        category, generation, change, before, after = changes[0]
+        self.assertEqual(
+            (category, generation, change),
+            ("pointer", None, "changed"),
+        )
+        self.assertEqual(before["state"], "corrupt")
+        self.assertIsNone(before["value"])
+        self.assertEqual(
+            before["digest"], _sha256(b"first-corruption")
+        )
+        self.assertEqual(
+            after["digest"], _sha256(b"second-corruption")
+        )
+        for side in (before, after):
+            rendered = json.dumps(side)
+            self.assertNotIn("first-corruption", rendered)
+            self.assertNotIn("second-corruption", rendered)
+
+
+class DiffRecoveryAuditTests(RecoveryAuditTestBase):
+    def names(self, changes: tuple) -> list[tuple[str, str | None, str]]:
+        return [
+            (category, generation, change)
+            for category, generation, change, _before, _after in changes
+        ]
+
+    def test_no_change_is_empty_tuple(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        self.assertEqual(changes, ())
+        self.assertIsInstance(changes, tuple)
+
+    def test_result_entries_are_five_tuples_with_immutable_values(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"generation-0000000000000001")
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        self.assertEqual(len(changes), 1)
+        category, generation, change, before, after = changes[0]
+        self.assertEqual(
+            (category, generation, change),
+            ("pointer", None, "changed"),
+        )
+        self.assertEqual(
+            before,
+            {
+                "state": "ok",
+                "value": "generation-0000000000000003",
+                "digest": None,
+            },
+        )
+        self.assertEqual(
+            after,
+            {
+                "state": "ok",
+                "value": "generation-0000000000000001",
+                "digest": None,
+            },
+        )
+
+    def test_corrupted_checkpoint_classifies_every_category(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        with open(
+            os.path.join(self.generation_dir(2), "checkpoint.json"), "ab"
+        ) as handle:
+            handle.write(b" ")
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        g2 = "generation-0000000000000002"
+        g3 = "generation-0000000000000003"
+        # Pointer first (unchanged here), then chain, checkpoint,
+        # journal, replay; per-generation groups ascend by number.
+        self.assertEqual(
+            self.names(changes),
+            [
+                ("chain", None, "changed"),
+                ("chain", g2, "changed"),
+                ("chain", g3, "changed"),
+                ("checkpoint", g2, "changed"),
+                ("replay", g2, "changed"),
+                ("replay", g3, "changed"),
+            ],
+        )
+        entries = {
+            (category, generation): (change, before, after)
+            for category, generation, change, before, after in changes
+        }
+        change, before, after = entries[("chain", None)]
+        self.assertEqual(before, g3)
+        self.assertEqual(after, "generation-0000000000000001")
+        change, before, after = entries[("chain", g2)]
+        self.assertTrue(before["valid"])
+        self.assertIsNone(before["reason"])
+        self.assertFalse(after["valid"])
+        self.assertIsNotNone(after["reason"])
+        self.assertEqual(before["manifest"], after["manifest"])
+        change, before, after = entries[("chain", g3)]
+        self.assertEqual(before["dependency"], "linked")
+        self.assertEqual(after["dependency"], "invalid")
+        change, before, after = entries[("checkpoint", g2)]
+        self.assertIsInstance(before, str)
+        self.assertIsInstance(after, str)
+        self.assertNotEqual(before, after)
+        change, before, after = entries[("replay", g2)]
+        self.assertEqual(before, "ok")
+        self.assertEqual(after, "not-run")
+
+    def test_generation_removal_is_reported_per_category(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        shutil.rmtree(self.generation_dir(3))
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        g3 = "generation-0000000000000003"
+        self.assertEqual(
+            self.names(changes),
+            [
+                ("chain", None, "changed"),
+                ("chain", g3, "removed"),
+                ("checkpoint", g3, "removed"),
+                ("journal", g3, "removed"),
+                ("replay", g3, "removed"),
+            ],
+        )
+        entries = {
+            (category, generation): (change, before, after)
+            for category, generation, change, before, after in changes
+        }
+        for category in ("checkpoint", "journal", "replay"):
+            change, before, after = entries[(category, g3)]
+            self.assertIsNotNone(before)
+            self.assertIsNone(after)
+        change, before, after = entries[("chain", g3)]
+        self.assertTrue(before["valid"])
+        self.assertIsNone(after)
+
+    def test_generation_addition_is_reported_per_category(self) -> None:
+        store = self.make_store()
+        store.rotate_generation(self.root)
+        record = BranchStore.export_recovery_audit(self.root)
+        store.append("main", "m4", 6, {"a": 4})
+        store.rotate_generation(self.root)
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        g1 = "generation-0000000000000001"
+        g2 = "generation-0000000000000002"
+        # The append before rotation commits into gen 1's journal and
+        # re-points gen 1's manifest; rotation adds gen 2 and moves the
+        # pointer and selection.
+        self.assertEqual(
+            self.names(changes),
+            [
+                ("pointer", None, "changed"),
+                ("chain", None, "changed"),
+                ("chain", g1, "changed"),
+                ("chain", g2, "added"),
+                ("checkpoint", g2, "added"),
+                ("journal", g1, "changed"),
+                ("journal", g2, "added"),
+                ("replay", g2, "added"),
+            ],
+        )
+        entries = {
+            (category, generation): (change, before, after)
+            for category, generation, change, before, after in changes
+        }
+        change, before, after = entries[("chain", g1)]
+        self.assertTrue(before["valid"])
+        self.assertTrue(after["valid"])
+        self.assertNotEqual(before["manifest"], after["manifest"])
+        change, before, after = entries[("journal", g1)]
+        self.assertNotEqual(before, after)
+        for category in ("checkpoint", "journal", "replay"):
+            change, before, after = entries[(category, g2)]
+            self.assertIsNone(before)
+            self.assertIsNotNone(after)
+
+    def test_losing_every_generation_returns_changes_not_error(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        changes = BranchStore.diff_recovery_audit(empty, record)
+        categories = [entry[0] for entry in changes]
+        # The pointer changed too (ok -> missing), selection changed,
+        # and all three generations vanished from every category.
+        self.assertEqual(categories[0], "pointer")
+        self.assertIn(("chain", None, "changed"), self.names(changes))
+        for number in (1, 2, 3):
+            name = f"generation-{number:016d}"
+            for category in ("chain", "checkpoint", "journal", "replay"):
+                self.assertIn(
+                    (category, name, "removed"), self.names(changes)
+                )
+
+    def test_journal_change_reports_journal_and_replay_only(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        # Gen 1 sits behind two still-valid successors; tamper with gen
+        # 3's journal, which invalidates the tip.
+        with open(
+            os.path.join(self.generation_dir(3), "journal.json"), "ab"
+        ) as handle:
+            handle.write(b" ")
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        names = self.names(changes)
+        self.assertIn(
+            ("journal", "generation-0000000000000003", "changed"), names
+        )
+        self.assertIn(
+            ("replay", "generation-0000000000000003", "changed"), names
+        )
+        self.assertFalse(
+            any(category == "checkpoint" for category, _g, _c in names)
+        )
+
+    def test_pointer_sides_never_carry_raw_bytes(self) -> None:
+        self.rotate_three()
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"\xff secret-pointer-alpha")
+        record = BranchStore.export_recovery_audit(self.root)
+        with open(os.path.join(self.root, "CURRENT"), "wb") as handle:
+            handle.write(b"generation-0000000000000002")
+        changes = BranchStore.diff_recovery_audit(self.root, record)
+        rendered = repr(changes)
+        self.assertNotIn("secret-pointer-alpha", rendered)
+        pointer = [
+            entry for entry in changes if entry[0] == "pointer"
+        ]
+        self.assertEqual(len(pointer), 1)
+        _category, generation, change, before, after = pointer[0]
+        self.assertIsNone(generation)
+        self.assertEqual(change, "changed")
+        self.assertEqual(before["value"], None)
+        self.assertEqual(
+            before["digest"], _sha256(b"\xff secret-pointer-alpha")
+        )
+        self.assertEqual(after["value"], "generation-0000000000000002")
+        self.assertIsNone(after["digest"])
+
+    def test_diff_is_read_only(self) -> None:
+        self.rotate_three()
+        record = BranchStore.export_recovery_audit(self.root)
+        before = self.snapshot()
+        BranchStore.diff_recovery_audit(self.root, record)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_root_validation_precedes_record_validation(self) -> None:
+        for bad in (1, 1.0, b"x", None, ["a"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    BranchStore.diff_recovery_audit(bad, "{}")
+        with self.assertRaises(ValueError):
+            BranchStore.diff_recovery_audit("", "{}")
+        with self.assertRaises(OSError):
+            BranchStore.diff_recovery_audit(
+                os.path.join(self.tmp.name, "nope"), "{}"
+            )
+
+    def test_record_validation(self) -> None:
+        self.rotate_three()
+        for bad in (1, 1.0, b"x", None, ["x"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    BranchStore.diff_recovery_audit(self.root, bad)
+        for bad in (
+            "",
+            "{",
+            "not json",
+            '{"a":1,"a":2}',
+            "[]",
+            "null",
+            "{}",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    BranchStore.diff_recovery_audit(self.root, bad)
+
+    def test_bad_checksum_rejected(self) -> None:
+        self.rotate_three()
+        document = json.loads(
+            BranchStore.export_recovery_audit(self.root)
+        )
+        document["checksum"] = "0" * 64
+        with self.assertRaises(ValueError):
+            BranchStore.diff_recovery_audit(
+                self.root, _reencode(document)
+            )
 
 
 if __name__ == "__main__":
