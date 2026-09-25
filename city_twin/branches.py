@@ -2241,7 +2241,12 @@ class BranchStore:
 
     #: Recovery audit envelope (see :meth:`export_recovery_audit`).
     _RECOVERY_AUDIT_FORMAT = "branching-city-twin/recovery-audit"
-    _RECOVERY_AUDIT_VERSION = 1
+    #: Version written by :meth:`export_recovery_audit`. Version 2
+    #: records a corrupt pointer's SHA-256 digest so two different
+    #: corruptions are distinguishable; version 1 records only the
+    #: pointer state and remains accepted on verification and diff.
+    _RECOVERY_AUDIT_VERSION = 2
+    _RECOVERY_AUDIT_SUPPORTED_VERSIONS = (1, 2)
     _RECOVERY_AUDIT_KEYS = (
         "format",
         "version",
@@ -2473,10 +2478,11 @@ class BranchStore:
     @classmethod
     def _validate_recovery_root(cls, root: Any) -> None:
         """Validate a recovery/audit ``root`` argument the same way for
-        :meth:`load_latest_generation`, :meth:`export_recovery_audit` and
-        :meth:`verify_recovery_audit`: a non-``str`` raises
-        :class:`TypeError`, an empty string :class:`ValueError`, and a
-        missing or non-directory path :class:`OSError`."""
+        :meth:`load_latest_generation`, :meth:`export_recovery_audit`,
+        :meth:`verify_recovery_audit` and :meth:`diff_recovery_audit`:
+        a non-``str`` raises :class:`TypeError`, an empty string
+        :class:`ValueError`, and a missing or non-directory path
+        :class:`OSError`."""
         if not isinstance(root, str):
             raise TypeError(
                 f"root must be a str, got {type(root).__name__}"
@@ -2563,16 +2569,19 @@ class BranchStore:
     @classmethod
     def _read_recovery_pointer(
         cls, root: str
-    ) -> tuple[str | None, str]:
+    ) -> tuple[str | None, str, str | None]:
         """Read the ``CURRENT`` hint strictly and read-only.
 
-        Returns ``(value, state)`` where state is ``"missing"`` (no
-        pointer file -- value ``None``), ``"ok"`` (value is exactly a
-        legal generation name, reported verbatim, however stale) or
-        ``"corrupt"`` (undecodable bytes, an empty file, surrounding
-        whitespace, or anything that is not a legal generation name --
-        value ``None``). Only the state is retained: corrupt pointer
-        bytes are never echoed.
+        Returns ``(value, state, digest)`` where state is ``"missing"``
+        (no pointer file -- value and digest ``None``), ``"ok"`` (value
+        is exactly a legal generation name, reported verbatim, however
+        stale -- digest ``None``) or ``"corrupt"`` (undecodable bytes,
+        an empty file, surrounding whitespace, or anything that is not
+        a legal generation name -- value ``None`` and digest the
+        SHA-256 of the raw bytes). Only the digest is retained for
+        corrupt material: corrupt pointer bytes are never echoed, so
+        two different corruptions are distinguishable without ever
+        exposing their content.
         """
         try:
             with open(
@@ -2580,17 +2589,18 @@ class BranchStore:
             ) as handle:
                 raw = handle.read()
         except FileNotFoundError:
-            return None, "missing"
+            return None, "missing", None
+        digest = hashlib.sha256(raw).hexdigest()
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
-            return None, "corrupt"
+            return None, "corrupt", digest
         if text == "" or text != text.strip():
-            return None, "corrupt"
+            return None, "corrupt", digest
         number = cls._generation_number(text)
         if number is None or number < 1:
-            return None, "corrupt"
-        return text, "ok"
+            return None, "corrupt", digest
+        return text, "ok", None
 
     @classmethod
     def _gather_recovery_evidence(cls, root: str) -> dict[str, Any]:
@@ -2598,15 +2608,17 @@ class BranchStore:
         generation. Shared verbatim by loading and by recovery-audit
         export/verification, so all three act on identical evidence.
 
-        Returns the normalized pointer value and state, one ordered
-        audit record per legally named generation entry, the
+        Returns the normalized pointer value, state and corrupt digest,
+        one ordered audit record per legally named generation entry, the
         ascending-number ``ignored`` list, the selected generation name
         (``None`` when the valid prefix is empty) and everything needed
         to attach a recovered store to it. Raises only :class:`OSError`
         for enumeration or read failures; invalid content is reported,
         never raised.
         """
-        current, pointer_state = cls._read_recovery_pointer(root)
+        current, pointer_state, pointer_digest = (
+            cls._read_recovery_pointer(root)
+        )
 
         candidates: list[tuple[int, str, bool]] = []
         for entry in os.listdir(root):
@@ -2806,6 +2818,7 @@ class BranchStore:
         return {
             "current": current,
             "pointer_state": pointer_state,
+            "pointer_digest": pointer_digest,
             "records": records,
             "ignored": ignored,
             "selected": selected,
@@ -2925,19 +2938,25 @@ class BranchStore:
 
     @classmethod
     def _recovery_audit_body(
-        cls, evidence: dict[str, Any]
+        cls, evidence: dict[str, Any], version: int
     ) -> dict[str, Any]:
         """Assemble the signed recovery-audit body from gathered
-        evidence. Only summaries of corrupt material are kept; no raw
-        pointer bytes or absolute paths appear, so identical evidence
-        serializes identically anywhere."""
+        evidence at the given record version. Only summaries of corrupt
+        material are kept; no raw pointer bytes or absolute paths
+        appear, so identical evidence serializes identically anywhere.
+        Version 2 adds the corrupt pointer's SHA-256 digest to the
+        pointer summary (``None`` for a missing or readable pointer);
+        version 1 carries only the pointer state and value."""
+        current: dict[str, Any] = {
+            "state": evidence["pointer_state"],
+            "value": evidence["current"],
+        }
+        if version >= 2:
+            current["digest"] = evidence["pointer_digest"]
         return {
             "format": cls._RECOVERY_AUDIT_FORMAT,
-            "version": cls._RECOVERY_AUDIT_VERSION,
-            "current": {
-                "state": evidence["pointer_state"],
-                "value": evidence["current"],
-            },
+            "version": version,
+            "current": current,
             "selected": evidence["selected"],
             "generations": [
                 {
@@ -2973,15 +2992,16 @@ class BranchStore:
         :class:`OSError`. The scan is strictly read-only.
 
         The record captures the pointer state (``missing``, ``ok`` or
-        ``corrupt`` -- corrupt pointer bytes are summarized, never
-        echoed), the selected generation, every generation's validity
-        and dependency verdict with its claimed predecessor, manifest
-        and file digests and terminal-replay conclusion, and the
-        ascending-number ignore list with definitive reasons. It
-        carries a format tag, a schema version and a SHA-256 checksum
-        over the recovery decision and all evidence. Serialization is
-        compact UTF-8 JSON with no extra whitespace or trailing newline,
-        so identical evidence produces a byte-identical record.
+        ``corrupt`` -- a corrupt pointer is summarized by the SHA-256
+        digest of its raw bytes, never echoed), the selected generation,
+        every generation's validity and dependency verdict with its
+        claimed predecessor, manifest and file digests and
+        terminal-replay conclusion, and the ascending-number ignore
+        list with definitive reasons. It carries a format tag, schema
+        version 2 and a SHA-256 checksum over the recovery decision and
+        all evidence. Serialization is compact UTF-8 JSON with no extra
+        whitespace or trailing newline, so identical evidence produces
+        a byte-identical record.
 
         Exporting when no generation is recoverable raises
         :class:`ValueError`. No disk material -- the pointer,
@@ -2994,7 +3014,9 @@ class BranchStore:
             raise ValueError(
                 f"no valid generation found under {root!r}"
             )
-        body = cls._recovery_audit_body(evidence)
+        body = cls._recovery_audit_body(
+            evidence, cls._RECOVERY_AUDIT_VERSION
+        )
         body_text = cls._canonical_json(body)
         checksum = hashlib.sha256(
             body_text.encode("utf-8")
@@ -3015,7 +3037,11 @@ class BranchStore:
         raises :class:`TypeError`; an empty string, unparsable JSON,
         duplicate JSON keys, a non-canonical encoding, a structural or
         version violation, or a checksum that does not protect the
-        record raises :class:`ValueError`.
+        record raises :class:`ValueError`. Both record versions are
+        accepted: a version 1 record is checked against the pointer
+        state and value alone, while a version 2 record also pins the
+        corrupt pointer's SHA-256 digest, so replacing one corrupt
+        pointer's content with another is an evidence change.
 
         A valid record is then compared against fresh evidence: the same
         recovery decision and the same file evidence return ``True``; any
@@ -3024,6 +3050,180 @@ class BranchStore:
         read-only.
         """
         cls._validate_recovery_root(root)
+        body = cls._parse_recovery_audit_record(record)
+        evidence = cls._gather_recovery_evidence(root)
+        expected_body = cls._recovery_audit_body(
+            evidence, body["version"]
+        )
+        return hmac.compare_digest(
+            cls._canonical_json(body),
+            cls._canonical_json(expected_body),
+        )
+
+    @classmethod
+    def diff_recovery_audit(
+        cls, root: Any, record: Any
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Classify how ``root``'s recovery evidence diverges from a
+        sealed audit record, strictly read-only.
+
+        ``root`` and ``record`` are validated exactly as for
+        :meth:`verify_recovery_audit` (``root``: non-``str``
+        :class:`TypeError`, empty :class:`ValueError`, missing,
+        non-directory or unreadable :class:`OSError`; ``record``:
+        non-``str`` :class:`TypeError`, empty, unparsable,
+        duplicate-key, non-canonical, structural, version or checksum
+        violations :class:`ValueError`). Both record versions are
+        accepted, and the comparison uses the record's own version: a
+        version 1 record compares the pointer by state and value, a
+        version 2 record also by the corrupt pointer's digest.
+
+        Returns a tuple of change tuples, empty when the fresh evidence
+        matches the record exactly. Unlike
+        :meth:`export_recovery_audit`, a directory with no recoverable
+        generation left is not an error: the lost evidence is reported
+        like any other change instead of raising :class:`ValueError`.
+        Each change tuple is ``(category, generation, change, before,
+        after)`` where ``before`` is the sealed value and ``after`` the
+        current one, a missing side is ``None``, ``category`` is one of
+        ``"pointer"``, ``"chain"``, ``"checkpoint"``, ``"journal"`` or
+        ``"replay"`` and ``change`` is one of ``"added"``,
+        ``"removed"`` or ``"changed"``.
+
+        * ``pointer`` (generation ``None``) compares the pointer state,
+          the legal pointer value and -- for version 2 records -- the
+          corrupt pointer's SHA-256 digest; raw pointer bytes never
+          appear in either side.
+        * ``chain`` compares the selection result (generation ``None``)
+          and, per generation, the generation's existence, dependency
+          verdict, manifest digest, validity and ignore reason.
+        * ``checkpoint`` and ``journal`` compare each generation's file
+          digest, and ``replay`` its terminal replay conclusion.
+
+        Changes are ordered with the pointer first, then the selection,
+        then per generation in ascending number order the chain,
+        checkpoint, journal and replay changes. Nothing under ``root``
+        -- the pointer, generations, business state, audits or
+        idempotency records -- is modified.
+        """
+        cls._validate_recovery_root(root)
+        body = cls._parse_recovery_audit_record(record)
+        evidence = cls._gather_recovery_evidence(root)
+        current_body = cls._recovery_audit_body(
+            evidence, body["version"]
+        )
+        return cls._diff_recovery_bodies(body, current_body)
+
+    @classmethod
+    def _diff_recovery_bodies(
+        cls, before: dict[str, Any], after: dict[str, Any]
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Compute the ordered change tuples between a sealed audit
+        body and the body of freshly gathered evidence. Both bodies
+        must share the same record version."""
+        changes: list[tuple[Any, ...]] = []
+        if before["current"] != after["current"]:
+            changes.append(
+                (
+                    "pointer",
+                    None,
+                    "changed",
+                    before["current"],
+                    after["current"],
+                )
+            )
+        if before["selected"] != after["selected"]:
+            changes.append(
+                (
+                    "chain",
+                    None,
+                    "changed",
+                    before["selected"],
+                    after["selected"],
+                )
+            )
+        before_gens = {
+            entry["name"]: entry for entry in before["generations"]
+        }
+        after_gens = {
+            entry["name"]: entry for entry in after["generations"]
+        }
+        for name in sorted(
+            set(before_gens) | set(after_gens),
+            key=cls._generation_number,
+        ):
+            sealed = before_gens.get(name)
+            fresh = after_gens.get(name)
+            cls._append_recovery_diff(
+                changes,
+                "chain",
+                name,
+                cls._audit_chain_view(sealed),
+                cls._audit_chain_view(fresh),
+            )
+            for category in ("checkpoint", "journal"):
+                cls._append_recovery_diff(
+                    changes,
+                    category,
+                    name,
+                    sealed["files"][category] if sealed else None,
+                    fresh["files"][category] if fresh else None,
+                )
+            cls._append_recovery_diff(
+                changes,
+                "replay",
+                name,
+                sealed["replay"] if sealed else None,
+                fresh["replay"] if fresh else None,
+            )
+        return tuple(changes)
+
+    @staticmethod
+    def _audit_chain_view(
+        entry: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The chain evidence compared per generation: the dependency
+        verdict, manifest digest, validity and ignore reason. ``None``
+        for a generation absent on that side."""
+        if entry is None:
+            return None
+        return {
+            "valid": entry["valid"],
+            "dependency": entry["dependency"],
+            "manifest": entry["manifest"],
+            "reason": entry["reason"],
+        }
+
+    @staticmethod
+    def _append_recovery_diff(
+        changes: list[tuple[Any, ...]],
+        category: str,
+        generation: str | None,
+        before: Any,
+        after: Any,
+    ) -> None:
+        """Append one change tuple unless both sides agree."""
+        if before == after:
+            return
+        if before is None:
+            change = "added"
+        elif after is None:
+            change = "removed"
+        else:
+            change = "changed"
+        changes.append((category, generation, change, before, after))
+
+    @classmethod
+    def _parse_recovery_audit_record(cls, record: Any) -> dict[str, Any]:
+        """Validate a sealed recovery-audit record and return its body.
+
+        A non-``str`` raises :class:`TypeError`; an empty string,
+        unparsable JSON, duplicate JSON keys, a non-canonical encoding,
+        a structural or version violation, or a checksum that does not
+        protect the record raises :class:`ValueError`. Both supported
+        record versions are accepted. The returned body is the envelope
+        without its ``checksum`` key, exactly as sealed.
+        """
         if not isinstance(record, str):
             raise TypeError(
                 f"record must be a str, got {type(record).__name__}"
@@ -3060,13 +3260,7 @@ class BranchStore:
             document["checksum"], expected_checksum
         ):
             raise ValueError("record checksum is invalid")
-
-        evidence = cls._gather_recovery_evidence(root)
-        expected_body = cls._recovery_audit_body(evidence)
-        return hmac.compare_digest(
-            cls._canonical_json(body),
-            cls._canonical_json(expected_body),
-        )
+        return body
 
     @classmethod
     def _validate_recovery_audit_document(cls, document: Any) -> None:
@@ -3087,11 +3281,11 @@ class BranchStore:
         version = document["version"]
         if isinstance(version, bool) or not isinstance(version, int):
             raise ValueError("audit record 'version' must be an int")
-        if version != cls._RECOVERY_AUDIT_VERSION:
+        if version not in cls._RECOVERY_AUDIT_SUPPORTED_VERSIONS:
             raise ValueError(
                 f"unsupported audit record version {version!r}"
             )
-        cls._validate_audit_pointer(document["current"])
+        cls._validate_audit_pointer(document["current"], version)
         selected = document["selected"]
         if selected is not None and not cls._is_legal_generation_name(
             selected
@@ -3150,14 +3344,21 @@ class BranchStore:
         return cls._generation_number(value) is not None
 
     @classmethod
-    def _validate_audit_pointer(cls, value: Any) -> None:
-        if not isinstance(value, dict) or set(value.keys()) != {
-            "state",
-            "value",
-        }:
+    def _validate_audit_pointer(cls, value: Any, version: int) -> None:
+        expected_keys = {"state", "value"}
+        if version >= 2:
+            expected_keys = {"state", "value", "digest"}
+        if not isinstance(value, dict) or set(value.keys()) != (
+            expected_keys
+        ):
+            keys_description = (
+                "'state', 'value' and 'digest'"
+                if version >= 2
+                else "'state' and 'value'"
+            )
             raise ValueError(
                 "audit record 'current' must be an object with exactly "
-                "'state' and 'value'"
+                + keys_description
             )
         state = value["state"]
         if state not in cls._POINTER_STATES:
@@ -3178,6 +3379,22 @@ class BranchStore:
             raise ValueError(
                 "a missing or corrupt pointer value must be null"
             )
+        if version >= 2:
+            digest = value["digest"]
+            if state == "corrupt":
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or set(digest) - cls._HEX_DIGITS
+                ):
+                    raise ValueError(
+                        "a corrupt pointer's 'digest' must be a "
+                        "64-character lowercase hex string"
+                    )
+            elif digest is not None:
+                raise ValueError(
+                    "a missing or ok pointer's 'digest' must be null"
+                )
 
     @classmethod
     def _validate_audit_generation(cls, entry: Any) -> None:
