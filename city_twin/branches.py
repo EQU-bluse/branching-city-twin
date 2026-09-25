@@ -26,6 +26,547 @@ else:
     import fcntl
 
 
+#: Fixed refill size for the bounded streaming JSON reader. Working
+#: memory during index construction and indexed queries grows with the
+#: largest single frame's sealed record, never with frame count or range
+#: span; the reader discards every consumed prefix on refill.
+_RECOVERY_STREAM_BUFFER_SIZE = 64 * 1024
+
+
+class _StaleIndexError(Exception):
+    """Internal signal that a supplied recovery index is missing,
+    stale, truncated or corrupt relative to the canonical chain. The
+    caller rebuilds the index from the chain once and continues."""
+
+
+class _JsonWindowReader:
+    """Forward JSON reader over a raw file descriptor with bounded
+    working memory.
+
+    Bytes are pulled in fixed chunks into one rolling window; consumed
+    prefixes are discarded, so the window never holds more than the one
+    JSON value currently being decoded (at most a single chain frame)
+    plus a fixed chunk. Every freshly read chunk is fed once to the
+    rolling whole-file hash ``sink``. Values are parsed with
+    :meth:`json.JSONDecoder.raw_decode`, and each value's exact spelling
+    is compared against its canonical compact re-encoding, reproducing
+    the regular loader's ``canonical_json(loads(text)) == text``
+    acceptance -- including preserved object key order -- while
+    rejecting whitespace, BOMs and non-canonical escapes.
+    """
+
+    __slots__ = ("fd", "sink", "_window", "_pos", "_absolute", "_eof")
+
+    #: Refill granularity; tests shrink it to prove bounded growth.
+    CHUNK = _RECOVERY_STREAM_BUFFER_SIZE
+
+    def __init__(self, fd: int, sink: Any = None) -> None:
+        self.fd = fd
+        self.sink = sink
+        os.lseek(fd, 0, os.SEEK_SET)
+        self._window = bytearray()
+        self._pos = 0
+        self._absolute = 0
+        self._eof = False
+
+    @property
+    def absolute(self) -> int:
+        """Absolute file offset of the next byte to consume."""
+        return self._absolute
+
+    def _refill(self) -> bool:
+        if self._pos:
+            del self._window[: self._pos]
+            self._pos = 0
+        chunk = os.read(self.fd, self.CHUNK)
+        if not chunk:
+            self._eof = True
+            return False
+        self._window.extend(chunk)
+        if self.sink is not None:
+            self.sink.update(chunk)
+        return True
+
+    def peek_byte(self) -> int | None:
+        """Return the next byte without consuming it, or ``None`` at
+        EOF."""
+        if self._pos >= len(self._window):
+            if not self._refill():
+                return None
+        return self._window[self._pos]
+
+    def take_byte(self) -> int:
+        """Consume and return the next byte, or raise at EOF."""
+        value = self.peek_byte()
+        if value is None:
+            raise ValueError("the document is truncated")
+        self._pos += 1
+        self._absolute += 1
+        return value
+
+    def expect(self, literal: bytes, what: str) -> None:
+        for expected in literal:
+            if self.take_byte() != expected:
+                raise ValueError(f"expected {what}")
+
+    def at_eof(self) -> None:
+        """Raise :class:`ValueError` if any byte remains."""
+        if self.peek_byte() is not None:
+            raise ValueError("the document has trailing bytes")
+
+    def decode_value(self) -> Any:
+        """Decode exactly one complete JSON value at the cursor and
+        require its bytes to be canonical compact JSON. The window may
+        temporarily grow to hold this one value, never the whole
+        document. Leading whitespace is rejected here -- the structural
+        punctuation around values is matched byte-exactly by callers --
+        because ``raw_decode`` would otherwise silently skip it."""
+        if self.peek_byte() in (0x20, 0x09, 0x0A, 0x0D):
+            raise ValueError(
+                "the document is not canonical compact JSON"
+            )
+        decoder = json.JSONDecoder()
+        while True:
+            suffix = bytes(self._window[self._pos:])
+            try:
+                text = suffix.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                # A multi-byte character may straddle the window edge;
+                # grow once to distinguish it from genuinely invalid
+                # UTF-8 (which keeps failing through EOF).
+                if not self._refill():
+                    raise ValueError(
+                        f"the document is not valid UTF-8: {exc}"
+                    ) from exc
+                continue
+            try:
+                value, end = decoder.raw_decode(text, 0)
+            except json.JSONDecodeError as exc:
+                if not self._refill():
+                    raise ValueError(
+                        f"the document is not valid JSON: {exc}"
+                    ) from exc
+                continue
+            # ``end`` is a character index; re-encode the consumed
+            # prefix to recover the exact UTF-8 byte advance so the
+            # accounting is correct for non-ASCII content.
+            token = text[:end].encode("utf-8")
+            canonical = BranchStore._canonical_json(value).encode("utf-8")
+            if token != canonical:
+                raise ValueError(
+                    "the document is not canonical compact JSON"
+                )
+            self._pos += len(token)
+            self._absolute += len(token)
+            return value
+
+
+class _ChainLock:
+    """The shared chain coordination lock together with the chain file
+    opened while holding it.
+
+    Appends, index builds and indexed queries all compete for the same
+    exclusive operating-system lock, and the chain file is opened only
+    after the lock is held, so every holder observes one complete
+    pre- or post-append chain. ``identity`` snapshots the opened inode's
+    ``(device, inode, size)`` for the in-lock re-check.
+    """
+
+    __slots__ = ("path", "lock_fd", "fd", "identity")
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        lock_path = BranchStore._recovery_chain_lock_path(path)
+        self.lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            BranchStore._acquire_chain_lock(self.lock_fd, None)
+            # Open under the lock: an atomic append replace has either
+            # not happened yet or already completed durably.
+            self.fd = os.open(path, os.O_RDONLY)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                BranchStore._release_chain_lock(self.lock_fd)
+            with contextlib.suppress(OSError):
+                os.close(self.lock_fd)
+            raise
+        stat_result = os.fstat(self.fd)
+        self.identity = (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+        )
+
+    def recheck(self) -> None:
+        """Re-verify the opened chain's file identity under the lock.
+        Appends replace atomically while holding this same lock, so a
+        mismatch means this operation never had a stable document."""
+        stat_result = os.fstat(self.fd)
+        current = (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+        )
+        if current != self.identity:
+            raise OSError("recovery chain changed while the lock was held")
+
+    def close(self) -> None:
+        with contextlib.suppress(OSError):
+            BranchStore._release_chain_lock(self.lock_fd)
+        os.close(self.lock_fd)
+        os.close(self.fd)
+
+
+def _stream_authenticate_chain(
+    fd: int,
+    wanted: frozenset[int],
+    *,
+    index_reader: _JsonWindowReader | None = None,
+    entry_writer: Any = None,
+) -> dict[str, Any]:
+    """Stream and fully authenticate one canonical chain with fixed
+    working memory.
+
+    The document is parsed one JSON value at a time through a rolling
+    window that holds at most one frame object, so only the current
+    frame's record (plus, for a diff, the two requested endpoint
+    bodies) is materialized. Authentication is identical to the
+    whole-document canonical loader: exact UTF-8 without BOM, canonical
+    compact spelling, the envelope key set and supported version,
+    consecutive sequence numbers, predecessor links, every embedded
+    audit record's canonical checksum and every frame digest.
+
+    ``wanted`` selects frame sequences whose validated audit bodies are
+    returned. With ``index_reader`` each frame is checked lockstep
+    against the index and any discrepancy raises
+    :class:`_StaleIndexError`. With ``entry_writer`` each validated
+    frame's canonical index entry is emitted while the chain streams, so
+    index construction never buffers all frames.
+    """
+    file_hash = hashlib.sha256()
+    reader = _JsonWindowReader(fd, file_hash)
+    if reader.take_byte() != 0x7B:  # '{'
+        raise ValueError(
+            "recovery chain top-level JSON value must be an object"
+        )
+
+    envelope: dict[str, Any] = {}
+    frames_seen = False
+    frame_state: dict[str, Any] | None = None
+
+    while True:
+        key = reader.decode_value()
+        if not isinstance(key, str):
+            raise ValueError("recovery chain object keys must be strings")
+        if key in envelope or (key == "frames" and frames_seen):
+            raise ValueError(
+                f"duplicate key {key!r} in recovery chain"
+            )
+        reader.expect(b":", "':' after an object key")
+        if key == "frames":
+            frames_seen = True
+            frame_state = _stream_chain_frames(
+                reader, wanted, index_reader, entry_writer
+            )
+        else:
+            envelope[key] = reader.decode_value()
+        marker = reader.take_byte()
+        if marker == 0x7D:  # '}'
+            break
+        if marker != 0x2C:  # ','
+            raise ValueError(
+                "recovery chain object members must be separated by ','"
+            )
+
+    reader.at_eof()
+    if not frames_seen or set(envelope) | {"frames"} != set(
+        BranchStore._RECOVERY_CHAIN_KEYS
+    ):
+        raise ValueError(
+            "recovery chain must contain exactly the keys 'format', "
+            "'version' and 'frames'"
+        )
+    if envelope.get("format") != BranchStore._RECOVERY_CHAIN_FORMAT:
+        raise ValueError("recovery chain has an unknown format")
+    version = envelope.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("recovery chain 'version' must be an int")
+    if version not in BranchStore._RECOVERY_CHAIN_SUPPORTED_VERSIONS:
+        raise ValueError(f"unsupported recovery chain version {version!r}")
+
+    assert frame_state is not None
+    count = frame_state["count"]
+    if count == 0:
+        raise ValueError("recovery chain document has no frames")
+    # Only now, once every chain byte has been hashed, can the index's
+    # whole-file digest be compared.
+    if index_reader is not None:
+        _check_index_tail(index_reader, frame_state, file_hash.hexdigest())
+    return {
+        "length": count,
+        "head": frame_state["head"],
+        "chain_digest": file_hash.hexdigest(),
+        "bodies": frame_state["bodies"],
+    }
+
+
+def _stream_chain_frames(
+    reader: _JsonWindowReader,
+    wanted: frozenset[int],
+    index_reader: _JsonWindowReader | None,
+    entry_writer: Any,
+) -> dict[str, Any]:
+    """Stream and authenticate every frame of the frames array, one
+    frame object at a time."""
+    bodies: dict[int, dict[str, Any]] = {}
+    count = 0
+    previous_digest = BranchStore._RECOVERY_CHAIN_GENESIS_PREV
+    head = ""
+    index_tail: dict[str, Any] = {}
+
+    if index_reader is not None:
+        _open_index_envelope(index_reader)
+
+    if reader.take_byte() != 0x5B:  # '['
+        raise ValueError("recovery chain 'frames' must be an array")
+    while True:
+        marker = reader.peek_byte()
+        if marker == 0x5D:  # ']'
+            reader.take_byte()
+            break
+        if marker is None:
+            raise ValueError("recovery chain document is truncated")
+        if count:
+            if reader.take_byte() != 0x2C:
+                raise ValueError(
+                    "recovery chain frames must be separated by ','"
+                )
+        count += 1
+        offset = reader.absolute
+        frame = reader.decode_value()
+        record, digest = _validate_streamed_frame(
+            frame, count, previous_digest
+        )
+        if index_reader is not None:
+            _check_index_entry(
+                index_reader,
+                count,
+                offset,
+                previous_digest,
+                digest,
+            )
+        if entry_writer is not None:
+            prefix = b"" if count == 1 else b","
+            entry_writer(
+                prefix
+                + BranchStore._canonical_json(
+                    {
+                        "seq": count,
+                        "offset": offset,
+                        "prev": previous_digest,
+                        "digest": digest,
+                    }
+                ).encode("utf-8")
+            )
+        if count in wanted:
+            bodies[count] = BranchStore._parse_recovery_audit_record(record)
+        previous_digest = digest
+        head = digest
+
+    if count == 0:
+        raise ValueError("recovery chain document has no frames")
+    if index_reader is not None:
+        index_tail = _read_index_tail(index_reader)
+    return {
+        "count": count,
+        "head": head,
+        "bodies": bodies,
+        "index_tail": index_tail,
+    }
+
+
+def _validate_streamed_frame(
+    frame: Any, position: int, previous_digest: str
+) -> tuple[str, str]:
+    """Validate one streamed frame exactly as the whole-document
+    loader would, returning ``(record, digest)``."""
+    if not isinstance(frame, dict) or set(frame.keys()) != set(
+        BranchStore._RECOVERY_CHAIN_FRAME_KEYS
+    ):
+        raise ValueError(
+            "each recovery chain frame must contain exactly the keys "
+            "'seq', 'prev', 'record' and 'digest'"
+        )
+    seq = frame["seq"]
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise ValueError(
+            f"recovery chain frame {position}: 'seq' must be an int"
+        )
+    if seq != position:
+        raise ValueError(
+            f"recovery chain frame {position}: sequence numbers must be "
+            "consecutive starting at 1"
+        )
+    prev = frame["prev"]
+    if not isinstance(prev, str) or len(prev) != 64 or (
+        set(prev) - BranchStore._HEX_DIGITS
+    ):
+        raise ValueError(
+            f"recovery chain frame {seq}: 'prev' must be a 64-character "
+            "lowercase hex string"
+        )
+    if not hmac.compare_digest(prev, previous_digest):
+        raise ValueError(
+            f"recovery chain frame {seq}: predecessor digest does not link "
+            "to the previous frame"
+        )
+    record = frame["record"]
+    if not isinstance(record, str) or not record:
+        raise ValueError(
+            f"recovery chain frame {seq}: 'record' must be a non-empty str"
+        )
+    # Structure, canonical encoding and checksum of the embedded record.
+    BranchStore._parse_recovery_audit_record(record)
+    digest = frame["digest"]
+    if not isinstance(digest, str) or len(digest) != 64 or (
+        set(digest) - BranchStore._HEX_DIGITS
+    ):
+        raise ValueError(
+            f"recovery chain frame {seq}: 'digest' must be a 64-character "
+            "lowercase hex string"
+        )
+    expected_digest = BranchStore._recovery_chain_frame_digest(
+        seq, prev, record
+    )
+    if not hmac.compare_digest(digest, expected_digest):
+        raise ValueError(
+            f"recovery chain frame {seq}: frame digest is invalid"
+        )
+    return record, digest
+
+
+def _open_index_envelope(index_reader: _JsonWindowReader) -> None:
+    """Consume the canonical index header through the frames-array
+    opening bracket."""
+    try:
+        index_reader.expect(
+            b'{"format":"'
+            + BranchStore._RECOVERY_INDEX_FORMAT.encode("utf-8")
+            + b'","version":'
+            + str(BranchStore._RECOVERY_INDEX_VERSION).encode("ascii")
+            + b',"chain_version":'
+            + str(BranchStore._RECOVERY_CHAIN_VERSION).encode("ascii")
+            + b',"frames":[',
+            "the canonical recovery index header",
+        )
+    except ValueError as exc:
+        raise _StaleIndexError(str(exc)) from exc
+
+
+def _check_index_entry(
+    index_reader: _JsonWindowReader,
+    position: int,
+    offset: int,
+    previous_digest: str,
+    digest: str,
+) -> None:
+    """Read one index entry and cross-check it against the freshly
+    authenticated chain frame."""
+    try:
+        if position > 1:
+            index_reader.expect(b",", "a ',' between index frame entries")
+        if index_reader.peek_byte() != 0x7B:
+            raise ValueError("each index frame entry must be an object")
+        entry = index_reader.decode_value()
+    except ValueError as exc:
+        raise _StaleIndexError(str(exc)) from exc
+    if not isinstance(entry, dict) or set(entry.keys()) != {
+        "seq",
+        "offset",
+        "prev",
+        "digest",
+    }:
+        raise _StaleIndexError("an index frame entry has the wrong shape")
+    indexed_seq = entry["seq"]
+    indexed_offset = entry["offset"]
+    indexed_prev = entry["prev"]
+    indexed_digest = entry["digest"]
+    if (
+        isinstance(indexed_seq, bool)
+        or not isinstance(indexed_seq, int)
+        or isinstance(indexed_offset, bool)
+        or not isinstance(indexed_offset, int)
+        or indexed_offset < 0
+        or not isinstance(indexed_prev, str)
+        or not isinstance(indexed_digest, str)
+    ):
+        raise _StaleIndexError("an index frame entry has an invalid field")
+    if (
+        indexed_seq != position
+        or indexed_offset != offset
+        or len(indexed_prev) != 64
+        or (set(indexed_prev) - BranchStore._HEX_DIGITS)
+        or len(indexed_digest) != 64
+        or (set(indexed_digest) - BranchStore._HEX_DIGITS)
+    ):
+        raise _StaleIndexError(
+            "an index frame entry does not match the chain frame"
+        )
+    if not hmac.compare_digest(indexed_prev, previous_digest):
+        raise _StaleIndexError(
+            "an index frame predecessor does not match the chain"
+        )
+    if not hmac.compare_digest(indexed_digest, digest):
+        raise _StaleIndexError(
+            "an index frame digest does not match the chain"
+        )
+
+
+def _read_index_tail(index_reader: _JsonWindowReader) -> dict[str, Any]:
+    """Consume the index array close and trailing summary, returning
+    the indexed length, head and whole-file chain digest for the final
+    comparison after the chain finishes streaming."""
+    try:
+        index_reader.expect(b'],"length":', "the index length summary")
+        length = index_reader.decode_value()
+        index_reader.expect(b',"head":"', "the index head summary")
+        indexed_head = index_reader.decode_value()
+        index_reader.expect(
+            b'","chain_digest":"', "the index chain digest summary"
+        )
+        indexed_chain_digest = index_reader.decode_value()
+        index_reader.expect(b'"}', "the index document's closing bytes")
+        index_reader.at_eof()
+    except ValueError as exc:
+        raise _StaleIndexError(str(exc)) from exc
+    return {
+        "length": length,
+        "head": indexed_head,
+        "chain_digest": indexed_chain_digest,
+    }
+
+
+def _check_index_tail(
+    index_reader: _JsonWindowReader,
+    frame_state: dict[str, Any],
+    chain_digest: str,
+) -> None:
+    """Bind the streamed index summary to the authenticated chain."""
+    tail = frame_state["index_tail"]
+    length = tail["length"]
+    if isinstance(length, bool) or not isinstance(length, int):
+        raise _StaleIndexError("the index length must be an int")
+    if length != frame_state["count"]:
+        raise _StaleIndexError("the index length does not match the chain")
+    if not hmac.compare_digest(tail["head"], frame_state["head"]):
+        raise _StaleIndexError("the index head does not match the chain")
+    indexed_chain_digest = tail["chain_digest"]
+    if not isinstance(indexed_chain_digest, str):
+        raise _StaleIndexError("the index chain digest must be a string")
+    if not hmac.compare_digest(indexed_chain_digest, chain_digest):
+        raise _StaleIndexError(
+            "the index chain digest does not match the chain file"
+        )
+
 class _SnapshotEntry:
     """One snapshot token's frozen view and remaining read allowance.
 
@@ -2288,6 +2829,39 @@ class BranchStore:
     #: Poll interval in seconds while waiting for the chain lock.
     _RECOVERY_CHAIN_LOCK_POLL = 0.05
 
+    #: Drop-in bounded-memory index for a canonical recovery chain (see
+    #: :meth:`build_recovery_audit_index`). The index is a disposable
+    #: cache: every byte is derived from the canonical chain, which
+    #: remains the sole source of truth. It is canonical compact UTF-8
+    #: JSON with no BOM and no trailing newline -- identical chains
+    #: produce identical index bytes -- recording the chain format
+    #: version, the frame count, the final frame digest and the SHA-256
+    #: of the complete chain file, plus one fixed-shape entry per frame
+    #: carrying that frame's sequence number, the byte offset of its
+    #: frame object, its predecessor link and its frame digest, so a
+    #: single frame's sealed record can be located without reading the
+    #: frames ahead of it.
+    _RECOVERY_INDEX_FORMAT = (
+        "branching-city-twin/recovery-audit-chain-index"
+    )
+    _RECOVERY_INDEX_VERSION = 1
+
+    @classmethod
+    def _validate_optional_index_path(cls, index_path: Any) -> None:
+        """Validate an optional index ``path`` argument: ``None`` selects
+        the index-free behaviour, a non-``str`` raises
+        :class:`TypeError`, and an empty string raises
+        :class:`ValueError`."""
+        if index_path is None:
+            return
+        if not isinstance(index_path, str):
+            raise TypeError(
+                "index_path must be None or a str, got "
+                f"{type(index_path).__name__}"
+            )
+        if not index_path:
+            raise ValueError("index_path must be a non-empty str")
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -3626,8 +4200,201 @@ class BranchStore:
         return digest
 
     @classmethod
+    def build_recovery_audit_index(
+        cls, path: Any, index_path: Any
+    ) -> str:
+        """Build the bounded-memory companion index for a canonical
+        recovery chain, returning the chain's head digest.
+
+        ``path`` and ``index_path`` must each be a non-empty
+        :class:`str`: a non-``str`` raises :class:`TypeError` and an
+        empty string :class:`ValueError`. A missing or unreadable chain,
+        or any failure opening, writing, flushing, replacing or syncing
+        the index, raises :class:`OSError`; no partial index is
+        published and the chain file is never modified.
+
+        Construction streams the chain once under the same exclusive
+        lock that serializes appends, re-opening and re-checking the
+        chain's file identity inside the lock, so it observes exactly
+        one complete pre- or post-append chain. The stream verifies the
+        canonical envelope encoding, frame order, predecessor links,
+        every embedded audit record's checksum and every frame digest;
+        neither all frames nor the audit bodies are materialized --
+        working memory grows with the largest single frame plus a fixed
+        buffer, never with frame count. The emitted index binds the
+        chain format version, frame count, final frame digest and the
+        SHA-256 of the complete chain file, and records each frame's
+        byte offset and digest evidence. It is canonical compact UTF-8
+        JSON with no BOM and no trailing newline, so the same chain
+        always produces the same index bytes. Publication is durable
+        and atomic (temp file, flush, fsync, replace, directory sync);
+        on any failure the previous index is left untouched and the
+        temporary file is removed.
+
+        The index is a disposable cache: its presence or absence, and
+        the success or failure of this call, never alter the generation
+        directory, business state, audits, idempotency records or log
+        attachments.
+        """
+        cls._validate_chain_path(path)
+        cls._validate_required_index_path(index_path)
+        cls._validate_index_distinct_from_chain(path, index_path)
+
+        chain_lock = _ChainLock(path)
+        try:
+            result = cls._write_index_for_locked_chain(
+                index_path, chain_lock, frozenset()
+            )
+        finally:
+            chain_lock.close()
+        return result["head"]
+
+    @staticmethod
+    def _validate_required_index_path(index_path: Any) -> None:
+        """Validate the mandatory index path of the build entry point:
+        anything that is not a :class:`str`` (including ``None``) raises
+        :class:`TypeError`, and an empty string raises
+        :class:`ValueError`."""
+        if not isinstance(index_path, str):
+            raise TypeError(
+                "index_path must be a str, got "
+                f"{type(index_path).__name__}"
+            )
+        if not index_path:
+            raise ValueError("index_path must be a non-empty str")
+
+    @staticmethod
+    def _validate_index_distinct_from_chain(
+        path: str, index_path: str
+    ) -> None:
+        """An index may never be published over the chain itself: the
+        chain file is the trusted source and index publication replaces
+        the target atomically. Aliasing the two paths (including via
+        symlink spelling) raises :class:`ValueError` before either file
+        is opened."""
+        if os.path.realpath(index_path) == os.path.realpath(path):
+            raise ValueError(
+                "index_path must not name the recovery chain file itself"
+            )
+
+    @classmethod
+    def _write_index_for_locked_chain(
+        cls,
+        index_path: str,
+        chain_lock: _ChainLock,
+        wanted: frozenset[int],
+    ) -> dict[str, Any]:
+        """Stream the locked chain once, authenticating every frame,
+        and durably atomically publish its index; return the stream
+        result (including any ``wanted`` bodies). Callers already hold
+        the shared chain lock. Working memory is bounded by the largest
+        single frame plus fixed buffers."""
+        directory = os.path.dirname(os.path.abspath(index_path))
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".recovery-index-", suffix=".tmp", dir=directory
+        )
+        replaced = False
+        try:
+            handle = os.fdopen(fd, "wb")
+            with handle:
+                handle.write(
+                    b'{"format":"'
+                    + cls._RECOVERY_INDEX_FORMAT.encode("utf-8")
+                    + b'","version":'
+                    + str(cls._RECOVERY_INDEX_VERSION).encode("ascii")
+                    + b',"chain_version":'
+                    + str(cls._RECOVERY_CHAIN_VERSION).encode("ascii")
+                    + b',"frames":['
+                )
+                result = _stream_authenticate_chain(
+                    chain_lock.fd,
+                    wanted,
+                    entry_writer=handle.write,
+                )
+                handle.write(
+                    b'],"length":'
+                    + str(result["length"]).encode("ascii")
+                    + b',"head":"'
+                    + result["head"].encode("ascii")
+                    + b'","chain_digest":"'
+                    + result["chain_digest"].encode("ascii")
+                    + b'"}'
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Re-check identity under the lock immediately before the
+            # atomic publish, so the index only ever describes a chain
+            # state that was whole and stable while observed.
+            chain_lock.recheck()
+            os.replace(tmp_path, index_path)
+            replaced = True
+            cls._fsync_directory(directory)
+        finally:
+            if not replaced:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+        return result
+
+    @classmethod
+    def _authenticate_chain_with_index(
+        cls,
+        path: str,
+        index_path: str,
+        wanted: frozenset[int],
+    ) -> dict[str, Any]:
+        """Stream-authenticate the chain with bounded memory using its
+        index, holding the shared chain lock for the whole operation
+        and re-checking the opened chain's identity under it.
+
+        The chain is fully verified lockstep against the index. When
+        the index is missing, stale, truncated or corrupt, it is
+        rebuilt from the canonical chain exactly once (still under the
+        lock) and the call proceeds; a defective chain itself raises
+        :class:`ValueError` and is never masked by the index.
+        """
+        chain_lock = _ChainLock(path)
+        try:
+            try:
+                index_fd = os.open(index_path, os.O_RDONLY)
+            except OSError:
+                # A missing, unreadable or otherwise unopenable index
+                # is just an unusable cache; rebuild below is the only
+                # remedy and itself surfaces an OSError it cannot clear.
+                index_fd = -1
+            if index_fd != -1:
+                try:
+                    try:
+                        result = _stream_authenticate_chain(
+                            chain_lock.fd,
+                            wanted,
+                            index_reader=_JsonWindowReader(index_fd),
+                        )
+                    except (_StaleIndexError, OSError):
+                        # Stale/truncated/corrupt content, or an index
+                        # read failure: the cache cannot be trusted. A
+                        # defective chain itself raises ValueError and is
+                        # deliberately not caught here.
+                        result = None
+                    if result is not None:
+                        chain_lock.recheck()
+                        return result
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(index_fd)
+            # Missing, stale, truncated or corrupt: rebuild once from
+            # the canonical chain, which is the only trusted source.
+            return cls._write_index_for_locked_chain(
+                index_path, chain_lock, wanted
+            )
+        finally:
+            chain_lock.close()
+
+    @classmethod
     def verify_recovery_audit_chain(
-        cls, path: Any, expected_head: Any
+        cls,
+        path: Any,
+        expected_head: Any,
+        index_path: Any = None,
     ) -> bool:
         """Authenticate a persistent recovery-audit chain strictly
         read-only.
@@ -3641,6 +4408,15 @@ class BranchStore:
         record, a non-consecutive sequence number or a broken
         predecessor/frame digest link -- raises :class:`ValueError`.
 
+        ``index_path`` is optional: ``None`` (the default) preserves the
+        index-free behaviour exactly, including return values and
+        exception order. When it names a file, the chain is
+        authenticated through the disposable companion index built by
+        :meth:`build_recovery_audit_index`, so working memory grows with
+        the largest single frame plus fixed buffers rather than with
+        chain length; a missing, stale, truncated or corrupt index is
+        rebuilt from the canonical chain once and the call proceeds.
+
         When the chain is internally sound, the last frame's digest is
         compared against ``expected_head`` (a 64-character lowercase
         hexadecimal string, validated like the append argument): exact
@@ -3652,14 +4428,27 @@ class BranchStore:
         """
         cls._validate_chain_path(path)
         cls._validate_head_digest(expected_head, allow_none=False)
-        frames = cls._load_recovery_chain(path)
-        if not frames:
-            raise ValueError("recovery chain document has no frames")
-        return hmac.compare_digest(frames[-1]["digest"], expected_head)
+        cls._validate_optional_index_path(index_path)
+        if index_path is not None:
+            cls._validate_index_distinct_from_chain(path, index_path)
+        if index_path is None:
+            frames = cls._load_recovery_chain(path)
+            if not frames:
+                raise ValueError("recovery chain document has no frames")
+            return hmac.compare_digest(frames[-1]["digest"], expected_head)
+        result = cls._authenticate_chain_with_index(
+            path, index_path, frozenset()
+        )
+        return hmac.compare_digest(result["head"], expected_head)
 
     @classmethod
     def diff_recovery_audit_range(
-        cls, path: Any, expected_head: Any, start: Any, end: Any
+        cls,
+        path: Any,
+        expected_head: Any,
+        start: Any,
+        end: Any,
+        index_path: Any = None,
     ) -> tuple[tuple[Any, ...], ...]:
         """Compare the audit records sealed at two chain positions,
         strictly read-only.
@@ -3670,7 +4459,10 @@ class BranchStore:
         file :class:`OSError`, any chain defect :class:`ValueError`, and a
         sound chain whose last frame does not match ``expected_head``
         raises :class:`ValueError` rather than reporting a diff over
-        unauthenticated material.
+        unauthenticated material. ``index_path`` is optional and behaves
+        as for :meth:`verify_recovery_audit_chain`; when supplied, memory
+        is bounded by the largest single frame and fixed buffers rather
+        than by range span or chain length.
 
         ``start`` and ``end`` must be non-``bool`` integers, otherwise
         :class:`TypeError`; a value below one, a start later than end,
@@ -3684,20 +4476,36 @@ class BranchStore:
         """
         cls._validate_chain_path(path)
         cls._validate_head_digest(expected_head, allow_none=False)
+        cls._validate_optional_index_path(index_path)
+        if index_path is not None:
+            cls._validate_index_distinct_from_chain(path, index_path)
         for name, value in (("start", start), ("end", end)):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(
                     f"{name} must be an int, got {type(value).__name__}"
                 )
-        frames = cls._load_recovery_chain(path)
-        if not frames:
-            raise ValueError("recovery chain document has no frames")
-        if not hmac.compare_digest(frames[-1]["digest"], expected_head):
+        wanted = frozenset((start, end))
+        if index_path is None:
+            frames = cls._load_recovery_chain(path)
+            if not frames:
+                raise ValueError("recovery chain document has no frames")
+            head = frames[-1]["digest"]
+            last = frames[-1]["seq"]
+            bodies = {
+                frame["seq"]: frame["body"] for frame in frames
+            }
+        else:
+            result = cls._authenticate_chain_with_index(
+                path, index_path, wanted
+            )
+            head = result["head"]
+            last = result["length"]
+            bodies = result["bodies"]
+        if not hmac.compare_digest(head, expected_head):
             raise ValueError(
                 "recovery chain head does not match the expected head "
                 "digest"
             )
-        last = frames[-1]["seq"]
         if start < 1 or end < 1:
             raise ValueError(
                 "range endpoints must be greater than or equal to 1"
@@ -3710,9 +4518,8 @@ class BranchStore:
             )
         if start == end:
             return ()
-        before = frames[start - 1]["body"]
-        after = frames[end - 1]["body"]
-        return cls._diff_recovery_bodies(before, after)
+        return cls._diff_recovery_bodies(bodies[start], bodies[end])
+
 
     @classmethod
     def _diff_recovery_bodies(
