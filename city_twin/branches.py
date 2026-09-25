@@ -77,9 +77,13 @@ class BranchStore:
         # a journal (or a complete load_journal recovery re-attaches one).
         # The checkpoint checksum and frame list mirror the journal file's
         # binding and frame sequence exactly; both are meaningless while
-        # the path is None.
+        # the path is None. The version is the attached file's schema
+        # version: new attachments use the current format, an attachment
+        # recovered from an old journal keeps writing that old format.
         self._journal_path: str | None = None
         self._journal_checkpoint: str | None = None
+        self._journal_checkpoint_path: str | None = None
+        self._journal_version: int = self._JOURNAL_VERSION
         self._journal_frames: list[dict[str, Any]] = []
 
     @staticmethod
@@ -111,14 +115,33 @@ class BranchStore:
             if from_event not in self._graph._at:
                 raise KeyError(from_event)
 
-            # --- Commit: the journal frame is durably written before any
-            # state becomes visible; a write failure leaves both untouched.
-            self._commit_journal_frame(
-                "create", {"name": name, "from_event": from_event}
+            # Apply the internal state change first so the frame's after
+            # summary captures it, then commit durably; on a write failure
+            # roll the internal change back. Everything happens under the
+            # state lock, so the frame and the state become visible
+            # together or not at all.
+            before_state = (
+                self._snapshot_state()
+                if self._journal_path is not None
+                else None
             )
             self._heads[name] = from_event
             self._sources[name] = from_event
             self._appends[name] = {}
+            if self._journal_path is not None:
+                after_state = self._snapshot_state()
+                try:
+                    self._commit_journal_frame(
+                        "create",
+                        {"name": name, "from_event": from_event},
+                        before_state,
+                        after_state,
+                    )
+                except BaseException:
+                    del self._heads[name]
+                    del self._sources[name]
+                    del self._appends[name]
+                    raise
 
     def append(
         self,
@@ -164,32 +187,49 @@ class BranchStore:
                 )
 
             head = self._heads[name]
+            # Snapshot the pre-commit state before the graph sees the new
+            # event so the frame's before/after summaries bracket exactly
+            # this operation; an unattached store writes no frame.
+            before_state = (
+                self._snapshot_state()
+                if self._journal_path is not None
+                else None
+            )
             added_to_graph = id not in self._graph._at
             self._graph.add(id, at_value, (head,), changes)
-
-            # --- Commit: the journal frame is durably written before the
-            # state becomes visible; a write failure rolls the graph add
-            # back so business state and the old journal stay consistent.
-            try:
-                self._commit_journal_frame(
-                    "append",
-                    {
-                        "name": name,
-                        "id": id,
-                        "at": at_value,
-                        "changes": {
-                            key: changes[key] for key in sorted(changes)
-                        },
-                    },
-                )
-            except BaseException:
-                if added_to_graph:
-                    del self._graph._at[id]
-                    del self._graph._parents[id]
-                    del self._graph._changes[id]
-                raise
+            previous_head = self._heads[name]
             self._heads[name] = id
             self._appends[name][id] = (at_value, changes)
+
+            # --- Commit: the journal frame is durably written while the
+            # state changes are already in place; a write failure rolls the
+            # graph add, head move and idempotency record back so business
+            # state and the old journal stay consistent. Everything runs
+            # under the state lock, so nothing observes the interim state.
+            if self._journal_path is not None:
+                after_state = self._snapshot_state()
+                try:
+                    self._commit_journal_frame(
+                        "append",
+                        {
+                            "name": name,
+                            "id": id,
+                            "at": at_value,
+                            "changes": {
+                                key: changes[key] for key in sorted(changes)
+                            },
+                        },
+                        before_state,
+                        after_state,
+                    )
+                except BaseException:
+                    if added_to_graph:
+                        del self._graph._at[id]
+                        del self._graph._parents[id]
+                        del self._graph._changes[id]
+                    self._heads[name] = previous_head
+                    del self._appends[name][id]
+                    raise
 
     def merge(
         self,
@@ -260,33 +300,50 @@ class BranchStore:
                     + ", ".join(sorted(overlap))
                 )
 
+            # Snapshot the pre-commit state before the graph sees the new
+            # event so the frame's before/after summaries bracket exactly
+            # this operation; an unattached store writes no frame.
+            before_state = (
+                self._snapshot_state()
+                if self._journal_path is not None
+                else None
+            )
             added_to_graph = id not in self._graph._at
             self._graph.add(id, at_value, (target_head, source_head), changes)
-
-            # --- Commit: the journal frame is durably written before the
-            # state becomes visible; a write failure rolls the graph add
-            # back so business state and the old journal stay consistent.
-            try:
-                self._commit_journal_frame(
-                    "merge",
-                    {
-                        "target": target,
-                        "source": source,
-                        "id": id,
-                        "at": at_value,
-                        "changes": {
-                            key: changes[key] for key in sorted(changes)
-                        },
-                    },
-                )
-            except BaseException:
-                if added_to_graph:
-                    del self._graph._at[id]
-                    del self._graph._parents[id]
-                    del self._graph._changes[id]
-                raise
+            previous_target_head = self._heads[target]
             self._heads[target] = id
             self._merges[id] = (target, source, at_value, changes)
+
+            # --- Commit: the journal frame is durably written while the
+            # state changes are already in place; a write failure rolls the
+            # graph add, head move and merge record back so business state
+            # and the old journal stay consistent. Everything runs under
+            # the state lock, so nothing observes the interim state.
+            if self._journal_path is not None:
+                after_state = self._snapshot_state()
+                try:
+                    self._commit_journal_frame(
+                        "merge",
+                        {
+                            "target": target,
+                            "source": source,
+                            "id": id,
+                            "at": at_value,
+                            "changes": {
+                                key: changes[key] for key in sorted(changes)
+                            },
+                        },
+                        before_state,
+                        after_state,
+                    )
+                except BaseException:
+                    if added_to_graph:
+                        del self._graph._at[id]
+                        del self._graph._parents[id]
+                        del self._graph._changes[id]
+                    self._heads[target] = previous_target_head
+                    del self._merges[id]
+                    raise
 
     def create_snapshot(self, max_reads: int) -> str:
         """Freeze the current graph, heads and records into a snapshot token.
@@ -1229,11 +1286,18 @@ class BranchStore:
     # Crash-recoverable operation journal
     # ------------------------------------------------------------------
 
-    #: Journal format version emitted by :meth:`enable_journal` and by every
-    #: journaled commit.
-    _JOURNAL_VERSION = 1
+    #: Journal format version emitted by newly enabled and rotated
+    #: journals and by every commit they receive. Version 2 frames carry
+    #: canonical before/after business-state digests that make a swapped,
+    #: duplicated or reordered history fail recovery even after the
+    #: sequence numbers and ``prev`` chain have been rebuilt; version 1
+    #: journals remain readable, and an attachment recovered from one
+    #: keeps appending in that file's version.
+    _JOURNAL_VERSION = 2
+    _JOURNAL_READABLE_VERSIONS = (1, 2)
     _JOURNAL_DOCUMENT_KEYS = ("schema_version", "checkpoint", "frames")
-    _JOURNAL_FRAME_KEYS = ("seq", "op", "params", "prev")
+    _JOURNAL_FRAME_KEYS_V1 = ("seq", "op", "params", "prev")
+    _JOURNAL_FRAME_KEYS_V2 = ("seq", "op", "params", "before", "after", "prev")
     _JOURNAL_CREATE_PARAMS = ("name", "from_event")
     _JOURNAL_APPEND_PARAMS = ("name", "id", "at", "changes")
     _JOURNAL_MERGE_PARAMS = ("target", "source", "id", "at", "changes")
@@ -1316,6 +1380,8 @@ class BranchStore:
                 os.fsync(handle.fileno())
 
             self._journal_checkpoint = checksum
+            self._journal_checkpoint_path = checkpoint_path
+            self._journal_version = self._JOURNAL_VERSION
             self._journal_frames = []
             self._journal_path = journal_path
         return None
@@ -1333,13 +1399,20 @@ class BranchStore:
         :class:`TypeError`). Filesystem failures on either path raise
         :class:`OSError`. The checkpoint is parsed and verified exactly
         like :meth:`load_checkpoint`; the journal must then be UTF-8
-        without a BOM, valid JSON without duplicate keys, carry the
-        supported format version, be bound to the checkpoint's checksum
-        and hold frames with the exact expected fields, consecutive
-        sequence numbers starting at one and an unbroken SHA-256 chain.
-        Invalid UTF-8 or JSON, truncation, duplicate or out-of-order
-        frames, a broken chain, a wrong binding or a frame that conflicts
-        with the replayed state all raise :class:`ValueError`.
+        without a BOM, valid JSON without duplicate keys, carry a
+        supported format version (1 or 2), be bound to the checkpoint's
+        checksum and hold frames with the exact expected fields,
+        consecutive sequence numbers starting at one and an unbroken
+        SHA-256 chain. Version 2 frames additionally carry canonical
+        before/after business-state summaries; recovery recomputes the
+        state summary around every replayed frame, so a swapped,
+        duplicated or reordered history is rejected with
+        :class:`ValueError` even after the sequence numbers and the
+        ``prev`` chain were rebuilt. Invalid UTF-8 or JSON, truncation,
+        duplicate or out-of-order frames, a broken chain or summary
+        link, a wrong binding or a frame that conflicts with the
+        replayed state all raise :class:`ValueError`; version 1 journals
+        without the summary fields remain fully readable.
 
         Only frames whose sequence number is at most ``through`` are
         replayed: ``None`` replays the whole journal, ``0`` restores only
@@ -1371,7 +1444,7 @@ class BranchStore:
             )
 
         state, checksum = cls._read_checkpoint_state(checkpoint_path)
-        frames, bound = cls._read_journal_frames(journal_path)
+        frames, bound, version = cls._read_journal_frames(journal_path)
         if not hmac.compare_digest(bound, checksum):
             raise ValueError(
                 "journal is not bound to this checkpoint"
@@ -1391,33 +1464,298 @@ class BranchStore:
             upto = through
 
         store = cls._store_from_snapshot(state)
-        store._replay_journal_frames(frames[:upto])
+        store._replay_journal_frames(frames[:upto], checksum)
         if upto == last:
             # A complete recovery re-attaches the journal so later commits
             # extend the same chain; the parsed frames are fresh local
-            # objects, so nothing is shared with the caller.
+            # objects, so nothing is shared with the caller. The recovered
+            # attachment keeps the file's schema version.
             store._journal_checkpoint = checksum
+            store._journal_checkpoint_path = checkpoint_path
+            store._journal_version = version
             store._journal_frames = frames
             store._journal_path = journal_path
         return store
 
+    def rotate_journal(self, checkpoint_path: Any, journal_path: Any) -> None:
+        """Freeze the current state into a fresh checkpoint and empty journal.
+
+        Rotation is only allowed on a store that is attached to a journal
+        after a complete recovery to that journal's end (the state produced
+        by :meth:`enable_journal` or a full :meth:`load_journal`); calling
+        it on a detached store raises :class:`RuntimeError`. The current
+        business state is fixed as the new checkpoint, and a new, empty
+        version-2 journal is created bound to that checkpoint's checksum;
+        from then on commits are written only to the new journal, whose
+        frame sequence starts again at one. The method returns ``None``.
+
+        ``checkpoint_path`` and ``journal_path`` are validated in that
+        signature order: a non-``str`` raises :class:`TypeError`, an empty
+        string :class:`ValueError`, and two paths naming the same file
+        raise :class:`ValueError`; either target already existing raises
+        :class:`OSError` and neither is overwritten. Every open, write,
+        flush, directory-sync or replace failure likewise raises
+        :class:`OSError` and leaves both targets absent.
+
+        Rotation runs under the same lock that serializes create, append
+        and merge, so it observes one consistent instant -- checkpoint
+        binding, audit and idempotency records and the current journal
+        end -- and blocks every concurrent commit. The bound checkpoint
+        and journal on disk are re-read and replayed to prove they end in
+        exactly the live state before anything is published; a mismatch
+        raises :class:`ValueError` and the attached journal is not
+        rotated. Both new files are fully flushed and fsync-ed (their
+        directories synced) before the in-memory attachment switches; on
+        any failure the store keeps writing the old journal, its business
+        state is item-wise unchanged, and the old checkpoint and journal
+        stay byte-for-byte intact for archive recovery. A store restored
+        from the new checkpoint alone behaves identically -- replay,
+        branch heads, audit, conflicts and idempotency -- to the store at
+        the rotation instant.
+        """
+        for value, name in (
+            (checkpoint_path, "checkpoint_path"),
+            (journal_path, "journal_path"),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"{name} must be a str, got {type(value).__name__}"
+                )
+            if not value:
+                raise ValueError(f"{name} must be a non-empty str")
+        if os.path.abspath(checkpoint_path) == os.path.abspath(journal_path):
+            raise ValueError(
+                "checkpoint_path and journal_path must name different files"
+            )
+
+        with self._state_lock:
+            if self._journal_path is None:
+                raise RuntimeError(
+                    "no journal is attached to this store; rotation "
+                    "requires enable_journal or a complete load_journal"
+                )
+
+            # Refuse to touch either target that is already there; lstat
+            # also catches dangling symlinks. Both checks pass before any
+            # temporary file is created, so an existing target is never
+            # overwritten.
+            for target, name in (
+                (checkpoint_path, "checkpoint_path"),
+                (journal_path, "journal_path"),
+            ):
+                try:
+                    os.lstat(target)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    raise
+                else:
+                    raise FileExistsError(
+                        f"{name} already exists: {target!r}"
+                    )
+            # --- Build and verify the rotation instant as one view. ---
+            state = self._snapshot_state()
+            payload = self._checkpoint_payload(state)
+            new_checksum = hashlib.sha256(
+                self._canonical_json(payload).encode("utf-8")
+            ).hexdigest()
+
+            # Re-read and replay the bound checkpoint plus the on-disk
+            # journal to prove checkpoint, audit/idempotency records and
+            # the journal end describe exactly the live state.
+            bound_state, bound_checksum = self._read_checkpoint_state(
+                self._journal_checkpoint_path
+            )
+            if not hmac.compare_digest(
+                bound_checksum, self._journal_checkpoint
+            ):
+                raise ValueError(
+                    "bound checkpoint no longer matches the attached journal"
+                )
+            disk_frames, disk_bound, disk_version = (
+                self._read_journal_frames(self._journal_path)
+            )
+            if not hmac.compare_digest(disk_bound, bound_checksum):
+                raise ValueError(
+                    "journal on disk is not bound to its checkpoint"
+                )
+            if disk_version != self._journal_version:
+                raise ValueError(
+                    "journal version on disk no longer matches the "
+                    "attached journal"
+                )
+            if disk_frames != self._journal_frames:
+                raise ValueError(
+                    "journal on disk no longer matches the recovered "
+                    "journal end"
+                )
+            verifier = self._store_from_snapshot(bound_state)
+            verifier._replay_journal_frames(disk_frames, bound_checksum)
+            with verifier._state_lock:
+                end_summary = self._state_summary(verifier._snapshot_state())
+            if not hmac.compare_digest(end_summary, new_checksum):
+                raise ValueError(
+                    "live state does not match the checkpoint and journal "
+                    "end; refusing to rotate"
+                )
+
+            checkpoint_document = self._canonical_json(
+                {
+                    "schema_version": self._CHECKPOINT_VERSION,
+                    "payload": payload,
+                    "checksum": new_checksum,
+                }
+            ).encode("utf-8")
+            journal_document = self._canonical_json(
+                {
+                    "schema_version": self._JOURNAL_VERSION,
+                    "checkpoint": new_checksum,
+                    "frames": [],
+                }
+            ).encode("utf-8")
+
+            # --- Publish both files durably before switching anything.
+            # Each goes to a temp file in its target directory, fully
+            # written, flushed and fsync-ed, then atomically replaced into
+            # place; the directories are fsync-ed only after both replaces
+            # succeed. Any failure unpublishes a file that already landed
+            # and removes the temporary files, so neither target survives
+            # a failed rotation.
+            cp_directory = os.path.dirname(os.path.abspath(checkpoint_path))
+            journal_directory = os.path.dirname(
+                os.path.abspath(journal_path)
+            )
+            cp_tmp: str | None = None
+            journal_tmp: str | None = None
+            cp_published = False
+            journal_published = False
+            directories_synced = False
+
+            def remove_tmp(path: str | None) -> None:
+                if path is not None:
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+
+            try:
+                cp_tmp = self._write_durable_temp(
+                    cp_directory,
+                    ".checkpoint-",
+                    checkpoint_document,
+                )
+                journal_tmp = self._write_durable_temp(
+                    journal_directory,
+                    ".journal-",
+                    journal_document,
+                )
+                os.replace(cp_tmp, checkpoint_path)
+                cp_tmp = None
+                cp_published = True
+                os.replace(journal_tmp, journal_path)
+                journal_tmp = None
+                journal_published = True
+                self._fsync_directory(cp_directory)
+                self._fsync_directory(journal_directory)
+                directories_synced = True
+            except BaseException:
+                if not directories_synced:
+                    if journal_published:
+                        with contextlib.suppress(OSError):
+                            os.remove(journal_path)
+                    if cp_published:
+                        with contextlib.suppress(OSError):
+                            os.remove(checkpoint_path)
+                remove_tmp(cp_tmp)
+                remove_tmp(journal_tmp)
+                # Make the unpublishing itself durable; secondary failures
+                # must not mask the original error.
+                if cp_published or journal_published:
+                    with contextlib.suppress(OSError):
+                        self._fsync_directory(journal_directory)
+                    with contextlib.suppress(OSError):
+                        self._fsync_directory(cp_directory)
+                raise
+
+            # Both files are durable. Switch the attachment only now; the
+            # business state itself is intentionally untouched.
+            self._journal_checkpoint = new_checksum
+            self._journal_checkpoint_path = checkpoint_path
+            self._journal_version = self._JOURNAL_VERSION
+            self._journal_frames = []
+            self._journal_path = journal_path
+        return None
+
+    @staticmethod
+    def _write_durable_temp(
+        directory: str, prefix: str, data: bytes
+    ) -> str:
+        """Create a temp file in ``directory`` holding ``data``, flushed
+        and fsync-ed; return its path. The caller replaces it onto the
+        target and removes it on any failure."""
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=prefix, suffix=".tmp", dir=directory
+        )
+        try:
+            try:
+                handle = os.fdopen(fd, "wb")
+            except BaseException:
+                # fdopen only reaches here without taking ownership of fd.
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+                raise
+            with handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            raise
+        return tmp_path
+
+    @staticmethod
+    def _fsync_directory(directory: str) -> None:
+        """Fsync a directory so a freshly replaced directory entry is
+        durable across a crash; raises :class:`OSError` on failure."""
+        flags = os.O_RDONLY
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(directory, flags | directory_flag)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def _commit_journal_frame(
-        self, op: str, params: dict[str, object]
+        self,
+        op: str,
+        params: dict[str, object],
+        before_state: dict[str, object] | None,
+        after_state: dict[str, object] | None,
     ) -> None:
         """Append one frame to the attached journal, if any.
 
         Must run under :attr:`_state_lock`, after the operation's
-        validation (and any graph-level conflict check) has succeeded but
-        before its state mutation becomes visible. The full journal
-        document -- version, bound checkpoint checksum and the frame
-        sequence including the new frame -- is written to a temporary
-        file in the journal's directory, flushed, fsync-ed and atomically
-        moved onto the journal path; only then is the frame recorded in
-        memory. Any open, write, flush or replace failure raises
-        :class:`OSError`, leaves the previous journal file byte-for-byte
-        untouched and records nothing, so the caller can keep or roll
-        back business state to match the old journal. Because the write
-        happens under the state lock, the journal's frame order is
+        validation (and any graph-level conflict check) has succeeded.
+        The caller applies the operation's internal state changes first,
+        passes the pre/post business-state snapshots bracketing them, and
+        rolls every internal change back if this raises; the durable
+        frame therefore either lands together with the matching state or
+        neither does. ``before_state``/``after_state`` are only needed
+        while a journal is attached. Version 2 frames additionally record
+        the canonical before/after state summaries, so a history whose
+        frames were swapped, duplicated or reordered cannot be made to
+        recover by renumbering and rebuilding the ``prev`` chain.
+
+        The full journal document -- version, bound checkpoint checksum
+        and the frame sequence including the new frame -- is written to a
+        temporary file in the journal's directory, flushed, fsync-ed and
+        atomically moved onto the journal path; only then is the frame
+        recorded in memory. Any open, write, flush or replace failure
+        raises :class:`OSError`, leaves the previous journal file
+        byte-for-byte untouched and records nothing, so the caller can
+        roll business state back to match the old journal. Because the
+        write happens under the state lock, the journal's frame order is
         exactly the commit order of heads, audit and idempotency records.
         """
         if self._journal_path is None:
@@ -1426,14 +1764,32 @@ class BranchStore:
             prev = self._journal_frame_digest(self._journal_frames[-1])
         else:
             prev = self._journal_checkpoint
-        frame = {
+        frame: dict[str, object] = {
             "seq": len(self._journal_frames) + 1,
             "op": op,
             "params": params,
-            "prev": prev,
         }
+        if self._journal_version >= 2:
+            frame["before"] = self._state_summary(before_state)
+            frame["after"] = self._state_summary(after_state)
+        frame["prev"] = prev
         self._write_journal_document(self._journal_frames + [frame])
         self._journal_frames.append(frame)
+
+    @classmethod
+    def _state_summary(cls, state: dict[str, object]) -> str:
+        """SHA-256 over a business-state snapshot's canonical checkpoint
+        payload.
+
+        The digest is taken over exactly the bytes :meth:`save_checkpoint`
+        checksummed, so equal business states always summarize alike and
+        a frame's before/after pair pins both endpoints of its transition
+        independently of its operation parameters.
+        """
+        payload = cls._checkpoint_payload(state)
+        return hashlib.sha256(
+            cls._canonical_json(payload).encode("utf-8")
+        ).hexdigest()
 
     def _write_journal_document(
         self, frames: list[dict[str, object]]
@@ -1447,7 +1803,7 @@ class BranchStore:
         untouched and the temporary file is removed.
         """
         document = {
-            "schema_version": self._JOURNAL_VERSION,
+            "schema_version": self._journal_version,
             "checkpoint": self._journal_checkpoint,
             "frames": frames,
         }
@@ -1485,13 +1841,14 @@ class BranchStore:
     @classmethod
     def _read_journal_frames(
         cls, path: str
-    ) -> tuple[list[dict[str, object]], str]:
+    ) -> tuple[list[dict[str, object]], str, int]:
         """Read, parse and fully validate a journal file.
 
-        Returns the canonical frame list and the bound checkpoint
-        checksum. Filesystem failures propagate as :class:`OSError`;
-        every content defect raises :class:`ValueError`. The caller
-        validates ``path``'s type and emptiness.
+        Returns the canonical frame list, the bound checkpoint checksum
+        and the document's schema version. Filesystem failures propagate
+        as :class:`OSError`; every content defect raises
+        :class:`ValueError`. The caller validates ``path``'s type and
+        emptiness.
         """
         with open(path, "rb") as handle:
             raw = handle.read()
@@ -1513,10 +1870,11 @@ class BranchStore:
     @classmethod
     def _parse_journal_document(
         cls, document: Any
-    ) -> tuple[list[dict[str, object]], str]:
+    ) -> tuple[list[dict[str, object]], str, int]:
         """Validate the journal envelope, frame fields, consecutive
-        numbering and the hash chain; return canonical frames and the
-        bound checkpoint checksum."""
+        numbering, the hash chain and (version 2) the state-summary
+        links; return canonical frames, the bound checkpoint checksum
+        and the schema version."""
         if not isinstance(document, dict):
             raise ValueError("journal top-level JSON value must be an object")
         if set(document.keys()) != set(cls._JOURNAL_DOCUMENT_KEYS):
@@ -1528,7 +1886,7 @@ class BranchStore:
         version = document["schema_version"]
         if isinstance(version, bool) or not isinstance(version, int):
             raise ValueError("journal 'schema_version' must be an int")
-        if version != cls._JOURNAL_VERSION:
+        if version not in cls._JOURNAL_READABLE_VERSIONS:
             raise ValueError(f"unsupported journal schema_version {version!r}")
 
         checksum = document["checkpoint"]
@@ -1546,8 +1904,12 @@ class BranchStore:
 
         frames: list[dict[str, object]] = []
         prev = checksum
+        # Version 2 additionally threads the expected state summary: the
+        # first frame must leave the checkpoint state, and each frame's
+        # before summary must equal the previous frame's after summary.
+        expected_state = checksum
         for index, raw_frame in enumerate(raw_frames):
-            frame = cls._parse_journal_frame(raw_frame, index)
+            frame = cls._parse_journal_frame(raw_frame, index, version)
             expected_seq = index + 1
             if frame["seq"] != expected_seq:
                 raise ValueError(
@@ -1558,20 +1920,39 @@ class BranchStore:
                 raise ValueError(
                     f"journal frame {expected_seq}: hash chain is broken"
                 )
+            if version >= 2:
+                if not hmac.compare_digest(
+                    frame["before"], expected_state
+                ):
+                    raise ValueError(
+                        f"journal frame {expected_seq}: before-state "
+                        "summary does not extend the preceding history"
+                    )
+                expected_state = frame["after"]
             prev = cls._journal_frame_digest(frame)
             frames.append(frame)
-        return frames, checksum
+        return frames, checksum, version
 
     @classmethod
     def _parse_journal_frame(
-        cls, raw: Any, index: int
+        cls, raw: Any, index: int, version: int
     ) -> dict[str, object]:
         """Strict structural parse of one journal frame into its canonical
         form (fixed key order, change keys sorted)."""
         label = f"journal frame at index {index}"
         if not isinstance(raw, dict):
             raise ValueError(f"{label} must be an object")
-        if set(raw.keys()) != set(cls._JOURNAL_FRAME_KEYS):
+        expected_keys = (
+            cls._JOURNAL_FRAME_KEYS_V2
+            if version >= 2
+            else cls._JOURNAL_FRAME_KEYS_V1
+        )
+        if set(raw.keys()) != set(expected_keys):
+            if version >= 2:
+                raise ValueError(
+                    f"{label} must contain exactly the keys 'seq', 'op', "
+                    "'params', 'before', 'after' and 'prev'"
+                )
             raise ValueError(
                 f"{label} must contain exactly the keys 'seq', 'op', "
                 "'params' and 'prev'"
@@ -1590,6 +1971,23 @@ class BranchStore:
             raise ValueError(
                 f"{label}: prev must be a 64-character lowercase hex string"
             )
+
+        before: str | None = None
+        after: str | None = None
+        if version >= 2:
+            for field_name, value in (
+                ("before", raw["before"]),
+                ("after", raw["after"]),
+            ):
+                if not isinstance(value, str) or len(value) != 64 or (
+                    set(value) - cls._HEX_DIGITS
+                ):
+                    raise ValueError(
+                        f"{label}: {field_name} must be a 64-character "
+                        "lowercase hex string"
+                    )
+            before = raw["before"]
+            after = raw["after"]
 
         op = raw["op"]
         if op not in ("create", "append", "merge"):
@@ -1653,10 +2051,15 @@ class BranchStore:
                 "changes": {key: changes[key] for key in sorted(changes)},
             }
 
-        return {"seq": seq, "op": op, "params": canonical, "prev": prev}
+        frame = {"seq": seq, "op": op, "params": canonical}
+        if version >= 2:
+            frame["before"] = before
+            frame["after"] = after
+        frame["prev"] = prev
+        return frame
 
     def _replay_journal_frames(
-        self, frames: list[dict[str, object]]
+        self, frames: list[dict[str, object]], base_checksum: str
     ) -> None:
         """Replay validated journal frames onto this store.
 
@@ -1666,10 +2069,26 @@ class BranchStore:
         would be a no-op or a conflict against the replayed state can
         never come from a well-formed journal, so it raises
         :class:`ValueError`.
+
+        Version 2 frames are independently re-checked frame by frame: the
+        running store's canonical state summary must equal each frame's
+        ``before`` summary immediately before its operation and its
+        ``after`` summary immediately afterwards, starting from the bound
+        checkpoint's checksum. Renumbering frames and rebuilding their
+        ``prev`` chain cannot repair a swapped, duplicated or reordered
+        history, because the recomputed summaries still disagree.
         """
+        current_summary = base_checksum
         for frame in frames:
             op = frame["op"]
             params = frame["params"]
+            if "before" in frame and not hmac.compare_digest(
+                frame["before"], current_summary
+            ):
+                raise ValueError(
+                    f"journal frame {frame['seq']}: recorded before-state "
+                    "summary does not match the replayed state"
+                )
             try:
                 if op == "create":
                     if params["name"] in self._heads:
@@ -1705,6 +2124,15 @@ class BranchStore:
                     f"journal frame {frame['seq']} does not replay "
                     f"cleanly: {exc}"
                 ) from exc
+            if "after" in frame:
+                current_summary = self._state_summary(self._snapshot_state())
+                if not hmac.compare_digest(
+                    frame["after"], current_summary
+                ):
+                    raise ValueError(
+                        f"journal frame {frame['seq']}: recorded after-state "
+                        "summary does not match the replayed state"
+                    )
 
     def audit_merge(self, id: str) -> dict[str, object]:
         """Return an audit record for the merge event ``id``.

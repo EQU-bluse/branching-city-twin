@@ -68,7 +68,7 @@ class EnableJournalTests(JournalTestBase):
         self.assertEqual(
             list(doc), ["schema_version", "checkpoint", "frames"]
         )
-        self.assertEqual(doc["schema_version"], 1)
+        self.assertEqual(doc["schema_version"], 2)
         self.assertEqual(doc["frames"], [])
         self.assertEqual(doc["checkpoint"], _document(self.cp)["checksum"])
 
@@ -205,9 +205,27 @@ class JournalFrameTests(JournalTestBase):
         self.assertEqual(first["prev"], doc["checkpoint"])
         self.assertEqual(second["prev"], _frame_digest(first))
         for frame in doc["frames"]:
-            self.assertEqual(list(frame), ["seq", "op", "params", "prev"])
+            self.assertEqual(
+                list(frame),
+                ["seq", "op", "params", "before", "after", "prev"],
+            )
             self.assertEqual(len(frame["prev"]), 64)
             self.assertEqual(frame["prev"], frame["prev"].lower())
+            self.assertEqual(len(frame["before"]), 64)
+            self.assertEqual(len(frame["after"]), 64)
+        # The first frame leaves the bound checkpoint state, and the
+        # summaries chain the states independently of the prev links.
+        self.assertEqual(first["before"], doc["checkpoint"])
+        self.assertEqual(second["before"], first["after"])
+        # The summaries describe the checkpoint payload format.
+        for frame in doc["frames"]:
+            for field in ("before", "after"):
+                self.assertEqual(
+                    frame[field], frame[field].lower()
+                )
+                self.assertTrue(
+                    all(c in "0123456789abcdef" for c in frame[field])
+                )
 
     def test_idempotent_retries_write_no_frames(self) -> None:
         store = self.make_journaled_store()
@@ -507,7 +525,7 @@ class CorruptJournalTests(JournalTestBase):
     def test_duplicate_json_key_rejected(self) -> None:
         raw = _read(self.journal).decode("utf-8")
         dup = raw.replace(
-            '"schema_version":1', '"schema_version":1,"schema_version":1', 1
+            '"schema_version":2', '"schema_version":2,"schema_version":2', 1
         )
         with open(self.journal, "w", encoding="utf-8") as handle:
             handle.write(dup)
@@ -526,7 +544,7 @@ class CorruptJournalTests(JournalTestBase):
         self.assert_bad(doc)
 
     def test_unsupported_version(self) -> None:
-        for bad in (2, True, "1"):
+        for bad in (3, True, "1"):
             doc = json.loads(json.dumps(self.good))
             doc["schema_version"] = bad
             self.assert_bad(doc)
@@ -649,6 +667,201 @@ class CorruptJournalTests(JournalTestBase):
             BranchStore.load_journal(self.cp, self.journal, None)
         self.assertEqual(_read(self.cp), cp_before)
         self.assertEqual(_read(self.journal), journal_before)
+
+
+class VersionOneJournalTests(JournalTestBase):
+    """Old version-1 journals (frames without state summaries) stay
+    readable, and a fully recovered one keeps appending in version 1."""
+
+    def build_v1_history(self) -> BranchStore:
+        store = self.make_journaled_store()
+        store.append("main", "m2", 2, {"a": 1})
+        store.create("side", "m1")
+        store.append("side", "s1", 3, {"s": 1})
+        store.merge("main", "side", "M2", 4, {"c": 1})
+        # Rewrite the version-2 journal as version 1, stripping the
+        # before/after summaries and rebuilding only the prev chain.
+        doc = _document(self.journal)
+        v1_frames = []
+        prev = doc["checkpoint"]
+        for index, frame in enumerate(doc["frames"]):
+            stripped = {
+                "seq": index + 1,
+                "op": frame["op"],
+                "params": frame["params"],
+                "prev": prev,
+            }
+            v1_frames.append(stripped)
+            prev = _frame_digest(stripped)
+        v1 = {
+            "schema_version": 1,
+            "checkpoint": doc["checkpoint"],
+            "frames": v1_frames,
+        }
+        with open(self.journal, "wb") as handle:
+            handle.write(_canonical(v1))
+        return store
+
+    def test_v1_journal_recovers(self) -> None:
+        store = self.build_v1_history()
+        restored = BranchStore.load_journal(self.cp, self.journal, None)
+        self.assertEqual(restored.audit_log(), store.audit_log())
+        for name in ("main", "feature", "side"):
+            self.assertEqual(restored.replay(name), store.replay(name))
+
+    def test_v1_prefix_recovery(self) -> None:
+        self.build_v1_history()
+        restored = BranchStore.load_journal(self.cp, self.journal, 1)
+        self.assertEqual(restored.head("main"), "m2")
+        with self.assertRaises(KeyError):
+            restored.head("side")
+
+    def test_v1_recovery_keeps_appending_in_version_1(self) -> None:
+        self.build_v1_history()
+        restored = BranchStore.load_journal(self.cp, self.journal, None)
+        restored.append("main", "m3", 5, {"a": 2})
+        doc = _document(self.journal)
+        self.assertEqual(doc["schema_version"], 1)
+        self.assertEqual(
+            list(doc["frames"][-1]), ["seq", "op", "params", "prev"]
+        )
+        self.assertEqual(doc["frames"][-1]["seq"], 5)
+        # The extended version-1 journal still recovers.
+        again = BranchStore.load_journal(self.cp, self.journal, None)
+        self.assertEqual(again.head("main"), "m3")
+
+    def test_v1_frame_with_summary_field_is_rejected(self) -> None:
+        self.build_v1_history()
+        doc = _document(self.journal)
+        doc["frames"][0]["before"] = "0" * 64
+        prev = doc["checkpoint"]
+        for index, frame in enumerate(doc["frames"]):
+            frame["seq"] = index + 1
+            frame["prev"] = prev
+            prev = _frame_digest(frame)
+        with open(self.journal, "wb") as handle:
+            handle.write(_canonical(doc))
+        with self.assertRaises(ValueError):
+            BranchStore.load_journal(self.cp, self.journal, None)
+
+    def test_v2_frame_missing_summary_is_rejected(self) -> None:
+        self.make_journaled_store().append("main", "m2", 2, {"a": 1})
+        doc = _document(self.journal)
+        del doc["frames"][0]["after"]
+        with open(self.journal, "wb") as handle:
+            handle.write(_canonical(doc))
+        with self.assertRaises(ValueError):
+            BranchStore.load_journal(self.cp, self.journal, None)
+
+
+class OrderingProofTests(JournalTestBase):
+    """Version 2 must reject swapped/duplicated/reordered frames even
+    when the attacker renumbers and rebuilds both hash chains."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        store = self.make_journaled_store()
+        store.append("main", "m2", 2, {"a": 1})
+        store.append("main", "m3", 3, {"a": 2})
+        store.create("side", "m1")
+        store.append("side", "s1", 4, {"s": 1})
+        self.checkpoint = _document(self.cp)["checksum"]
+
+    def write(self, doc) -> None:
+        with open(self.journal, "wb") as handle:
+            handle.write(_canonical(doc))
+
+    def rebuild_chains(self, doc) -> None:
+        """Renumber, rebuild the prev frame chain AND thread the
+        per-frame before/after summaries as if the attacker relinked
+        them; each frame keeps its own recorded summary values."""
+        prev = doc["checkpoint"]
+        state = doc["checkpoint"]
+        for index, frame in enumerate(doc["frames"]):
+            frame["seq"] = index + 1
+            frame["prev"] = prev
+            frame["before"] = state
+            state = frame["after"]
+            prev = _frame_digest(frame)
+
+    def assert_recovery_rejected(self, doc) -> None:
+        self.write(doc)
+        with self.assertRaises(ValueError):
+            BranchStore.load_journal(self.cp, self.journal, None)
+
+    def test_swapped_frames_rejected(self) -> None:
+        doc = _document(self.journal)
+        doc["frames"][0], doc["frames"][1] = (
+            doc["frames"][1],
+            doc["frames"][0],
+        )
+        self.rebuild_chains(doc)
+        self.assert_recovery_rejected(doc)
+
+    def test_reordered_frames_rejected(self) -> None:
+        doc = _document(self.journal)
+        doc["frames"] = [
+            doc["frames"][3],
+            doc["frames"][0],
+            doc["frames"][2],
+            doc["frames"][1],
+        ]
+        self.rebuild_chains(doc)
+        self.assert_recovery_rejected(doc)
+
+    def test_duplicated_frame_rejected(self) -> None:
+        doc = _document(self.journal)
+        duplicate = json.loads(json.dumps(doc["frames"][0]))
+        doc["frames"].insert(1, duplicate)
+        self.rebuild_chains(doc)
+        self.assert_recovery_rejected(doc)
+
+    def test_renumbered_but_summaries_untouched_rejected(self) -> None:
+        # Swap with only the prev chain rebuilt; summaries stay frozen.
+        doc = _document(self.journal)
+        doc["frames"][0], doc["frames"][1] = (
+            doc["frames"][1],
+            doc["frames"][0],
+        )
+        prev = doc["checkpoint"]
+        for index, frame in enumerate(doc["frames"]):
+            frame["seq"] = index + 1
+            frame["prev"] = prev
+            prev = _frame_digest(frame)
+        self.assert_recovery_rejected(doc)
+
+    def test_forged_after_summary_rejected(self) -> None:
+        doc = _document(self.journal)
+        doc["frames"][0]["after"] = "f" * 64
+        self.rebuild_chains(doc)
+        self.assert_recovery_rejected(doc)
+
+    def test_forged_before_summary_rejected(self) -> None:
+        doc = _document(self.journal)
+        doc["frames"][1]["before"] = "a" * 64
+        # No rebuild: the forged before must be caught on its own (it
+        # also breaks the downstream prev chain).
+        self.assert_recovery_rejected(doc)
+
+    def test_summary_disagreement_with_params_rejected(self) -> None:
+        # Keep the summary chain consistent but change an operation
+        # parameter, then rebuild the prev chain only.
+        doc = _document(self.journal)
+        doc["frames"][0]["params"]["at"] = 8
+        prev = doc["checkpoint"]
+        for index, frame in enumerate(doc["frames"]):
+            frame["seq"] = index + 1
+            frame["prev"] = prev
+            prev = _frame_digest(frame)
+        self.assert_recovery_rejected(doc)
+
+    def test_malformed_summary_fields_rejected(self) -> None:
+        for bad in ("", "abc", "Z" * 64, 1, None):
+            doc = _document(self.journal)
+            doc["frames"][0]["before"] = bad
+            self.write(doc)
+            with self.assertRaises(ValueError):
+                BranchStore.load_journal(self.cp, self.journal, None)
 
 
 class ConcurrentJournalTests(unittest.TestCase):
