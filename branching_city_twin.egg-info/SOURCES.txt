@@ -30,6 +30,7 @@ tests/test_journal.py
 tests/test_lifetime_evolution.py
 tests/test_rank_impacts.py
 tests/test_recovery_audit.py
+tests/test_recovery_audit_chain.py
 tests/test_replay_at.py
 tests/test_rotate_generation.py
 tests/test_rotate_journal.py
