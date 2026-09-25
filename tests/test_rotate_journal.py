@@ -234,21 +234,21 @@ class RotateJournalValidationTests(RotateJournalTestBase):
             store.rotate_journal(self.cp2, bad_journal)
         self.assertFalse(os.path.exists(self.cp2))
 
-    def test_checkpoint_replaced_first_failure_unpublishes_it(self) -> None:
+    def test_checkpoint_published_first_failure_unpublishes_it(self) -> None:
         store = self.make_journaled_store()
         journal_before = _read(self.journal)
         audit_before = store.audit_log()
-        # The checkpoint replace succeeds; the journal replace fails, so
+        # The checkpoint publish succeeds; the journal publish fails, so
         # the already-published checkpoint must be removed again.
-        real_replace = os.replace
+        real_link = os.link
 
         def flaky(src, dst, *args, **kwargs):
             if os.path.abspath(dst) == os.path.abspath(self.journal2):
                 raise OSError("boom")
-            return real_replace(src, dst, *args, **kwargs)
+            return real_link(src, dst, *args, **kwargs)
 
         with mock.patch(
-            "city_twin.branches.os.replace", side_effect=flaky
+            "city_twin.branches.os.link", side_effect=flaky
         ):
             with self.assertRaises(OSError):
                 store.rotate_journal(self.cp2, self.journal2)
@@ -263,6 +263,34 @@ class RotateJournalValidationTests(RotateJournalTestBase):
         store.rotate_journal(self.cp2, self.journal2)
         self.assertTrue(os.path.exists(self.cp2))
         self.assertTrue(os.path.exists(self.journal2))
+
+    def test_target_occupied_in_race_raises_and_is_not_overwritten(
+        self,
+    ) -> None:
+        store = self.make_journaled_store()
+        journal_before = _read(self.journal)
+        # A competitor wins the race for the checkpoint target after the
+        # pre-check but before the atomic publish: the rotation must
+        # raise OSError and leave the competitor's bytes intact.
+        real_link = os.link
+
+        def racing(src, dst, *args, **kwargs):
+            if os.path.abspath(dst) == os.path.abspath(self.cp2):
+                with open(self.cp2, "wb") as handle:
+                    handle.write(b"raced")
+            return real_link(src, dst, *args, **kwargs)
+
+        with mock.patch(
+            "city_twin.branches.os.link", side_effect=racing
+        ):
+            with self.assertRaises(OSError):
+                store.rotate_journal(self.cp2, self.journal2)
+        self.assertEqual(_read(self.cp2), b"raced")
+        self.assertFalse(os.path.exists(self.journal2))
+        self.assertEqual(_read(self.journal), journal_before)
+        # The store still writes the old journal.
+        store.append("main", "m4", 7, {"a": 4})
+        self.assertEqual(len(_document(self.journal)["frames"]), 4)
 
     def test_directory_fsync_failure_aborts_and_cleans_up(self) -> None:
         store = self.make_journaled_store()
