@@ -2239,6 +2239,29 @@ class BranchStore:
         "complete",
     )
 
+    #: Recovery audit record layout: version, canonical key order of the
+    #: record and of each per-generation entry. The checksum covers the
+    #: recovery decision and all evidence -- everything except itself.
+    _RECOVERY_AUDIT_VERSION = 1
+    _RECOVERY_AUDIT_KEYS = (
+        "version",
+        "selected",
+        "pointer",
+        "generations",
+        "checksum",
+    )
+    _RECOVERY_AUDIT_GENERATION_KEYS = (
+        "name",
+        "number",
+        "depends_on",
+        "valid",
+        "reason",
+        "manifest",
+        "checkpoint",
+        "journal",
+        "replay",
+    )
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -2475,22 +2498,27 @@ class BranchStore:
         journal's binding to the checkpoint, and an actual replay of the
         journal to its end. A broken chain, a half-finished generation,
         a digest mismatch, a missing file or unparsable content marks
-        the generation invalid; it is reported, never trusted. The
-        highest-numbered generation on the valid digest chain is
-        selected -- the ``CURRENT`` pointer is only a hint, so a
-        missing, stale or corrupt pointer still falls back to the
-        evidence. If no generation is valid, :class:`ValueError` is
-        raised.
+        the generation invalid; it is reported, never trusted. Only a
+        fully valid generation anchors the digest chain for its
+        successors: every dependent of an invalid generation is itself
+        invalid -- even when it quotes the invalid predecessor's
+        manifest digest -- and the chain never skips across the break.
+        The highest-numbered valid generation is selected -- the
+        ``CURRENT`` pointer is only a hint, so a missing, stale or
+        corrupt pointer still falls back to the evidence. If no
+        generation is valid, :class:`ValueError` is raised.
 
         Returns ``(store, report)``: the recovered store, attached to
         the selected generation's journal so it can keep committing
         (each commit re-points the manifest), and a report whose keys
         are ordered ``selected``, ``current``, ``ignored`` -- the
         selected generation's name, the pointer's content (``None`` if
-        missing or unreadable as text), and the invalid generations in
-        ascending number order, each a dict with ``name`` and the
-        definitive ``reason``. A failed load changes no business, audit,
-        idempotency or query state anywhere.
+        missing, undecodable, whitespace-padded or not a legal
+        generation name; a legal name is reported verbatim, stale or
+        not), and the invalid generations in ascending number order,
+        each a dict with ``name`` and the definitive ``reason``. A
+        failed load changes no business, audit, idempotency or query
+        state anywhere.
         """
         if not isinstance(root, str):
             raise TypeError(
@@ -2500,11 +2528,67 @@ class BranchStore:
             raise ValueError("root must be a non-empty str")
 
         cls._require_generation_root(root, need_write=False)
+        pointer, entries = cls._scan_generation_evidence(root)
+
+        selected: dict[str, Any] | None = None
+        for entry in entries:
+            if entry["valid"]:
+                selected = entry
+        if selected is None:
+            raise ValueError(
+                f"no valid generation found under {root!r}"
+            )
+        store, frames, version, checksum = selected["recovered"]
+        generation_dir = os.path.join(root, selected["name"])
+        store._journal_checkpoint = checksum
+        store._journal_checkpoint_path = os.path.join(
+            generation_dir, cls._GENERATION_CHECKPOINT
+        )
+        store._journal_version = version
+        store._journal_frames = frames
+        store._journal_path = os.path.join(
+            generation_dir, cls._GENERATION_JOURNAL
+        )
+        store._journal_manifest_path = os.path.join(
+            generation_dir, cls._GENERATION_MANIFEST
+        )
+        store._journal_manifest = selected["manifest_document"]
+        report: dict[str, object] = {
+            "selected": selected["name"],
+            "current": pointer.get("name"),
+            "ignored": [
+                {"name": entry["name"], "reason": entry["reason"]}
+                for entry in entries
+                if not entry["valid"]
+            ],
+        }
+        return store, report
+
+    @classmethod
+    def _scan_generation_evidence(
+        cls, root: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Read-only evidence scan shared by recovery and its audit.
+
+        Returns ``(pointer, entries)``. ``pointer`` describes the
+        ``CURRENT`` pointer: ``{"status": "missing"}`` when absent,
+        ``{"status": "ok", "name": ...}`` when it holds a legal
+        generation name (reported verbatim, stale or not) and
+        ``{"status": "corrupt", "digest": ...}`` when its content is
+        undecodable, whitespace-padded or illegally named -- a corrupt
+        pointer's raw bytes are never echoed, only their digest.
+        ``entries`` holds one evidence dict per legally named
+        generation directory in ascending number order with the name,
+        number, chain dependency, validity, definitive reason, file
+        digests, end-replay conclusion and, for valid generations, the
+        recovered store material. Only a fully valid generation anchors
+        the digest chain for its successors. Nothing is modified.
+        """
         entries = os.listdir(root)
 
         # The CURRENT pointer is only a hint: missing, stale or corrupt,
         # it never changes the evidence-based selection below.
-        current: str | None = None
+        pointer: dict[str, Any] = {"status": "missing"}
         try:
             with open(
                 os.path.join(root, cls._GENERATION_POINTER), "rb"
@@ -2513,29 +2597,60 @@ class BranchStore:
         except FileNotFoundError:
             pointer_raw = None
         if pointer_raw is not None:
+            pointer_name: str | None = None
             try:
-                pointer_text = pointer_raw.decode("utf-8").strip()
+                pointer_text = pointer_raw.decode("utf-8")
             except UnicodeDecodeError:
-                pointer_text = ""
-            if pointer_text:
-                current = pointer_text
+                pointer_text = None
+            if (
+                pointer_text is not None
+                and pointer_text == pointer_text.strip()
+                and cls._generation_number(pointer_text) is not None
+            ):
+                pointer_name = pointer_text
+            if pointer_name is None:
+                pointer = {
+                    "status": "corrupt",
+                    "digest": hashlib.sha256(pointer_raw).hexdigest(),
+                }
+            else:
+                pointer = {"status": "ok", "name": pointer_name}
 
         candidates: list[tuple[int, str]] = []
-        for entry in entries:
-            number = cls._generation_number(entry)
+        for entry_name in entries:
+            number = cls._generation_number(entry_name)
             if number is None:
                 continue
-            if not os.path.isdir(os.path.join(root, entry)):
+            if not os.path.isdir(os.path.join(root, entry_name)):
                 continue
-            candidates.append((number, entry))
+            candidates.append((number, entry_name))
         candidates.sort()
 
-        ignored: list[dict[str, str]] = []
-        selected: dict[str, Any] | None = None
+        # A generation anchors the digest chain for its successors only
+        # when it is itself fully valid -- manifest, checkpoint, journal
+        # binding and end replay. An invalid predecessor invalidates
+        # every dependent successor in number order; the chain never
+        # skips across the break.
+        scanned: list[dict[str, Any]] = []
         lower_exists = False
+        lower_valid = False
         lower_digest: str | None = None
+        lower_name: str | None = None
         for number, name in candidates:
             generation_dir = os.path.join(root, name)
+            evidence: dict[str, Any] = {
+                "name": name,
+                "number": number,
+                "depends_on": lower_name,
+                "valid": False,
+                "reason": None,
+                "manifest": None,
+                "checkpoint": None,
+                "journal": None,
+                "replay": "skipped",
+                "recovered": None,
+                "manifest_document": None,
+            }
             manifest_path = os.path.join(
                 generation_dir, cls._GENERATION_MANIFEST
             )
@@ -2543,79 +2658,59 @@ class BranchStore:
                 with open(manifest_path, "rb") as handle:
                     manifest_bytes = handle.read()
             except FileNotFoundError:
-                ignored.append(
-                    {"name": name, "reason": "manifest is missing"}
-                )
-                lower_exists = True
-                lower_digest = None
-                continue
-            manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
-
-            reason, manifest = cls._parse_generation_manifest(
-                manifest_bytes, name, number
-            )
-            if reason is None and manifest["complete"] is not True:
-                reason = "manifest is not marked complete"
-            if reason is None:
-                previous = manifest["previous"]
-                if not lower_exists:
-                    if previous is not None:
-                        reason = (
-                            "digest chain is broken: no earlier "
-                            "generation exists"
-                        )
-                elif lower_digest is None:
-                    reason = (
-                        "digest chain is broken: the previous "
-                        "generation's manifest is missing"
-                    )
-                elif not hmac.compare_digest(previous, lower_digest):
-                    reason = "digest chain is broken"
-            if reason is None:
-                reason, recovered = cls._verify_generation_files(
-                    generation_dir, manifest
-                )
-            if reason is not None:
-                ignored.append({"name": name, "reason": reason})
+                manifest_bytes = None
+            reason: str | None
+            if manifest_bytes is None:
+                reason = "manifest is missing"
             else:
-                store, frames, version, checksum = recovered
-                selected = {
-                    "name": name,
-                    "dir": generation_dir,
-                    "store": store,
-                    "frames": frames,
-                    "version": version,
-                    "checksum": checksum,
-                    "manifest": manifest,
-                }
+                evidence["manifest"] = hashlib.sha256(
+                    manifest_bytes
+                ).hexdigest()
+                reason, manifest = cls._parse_generation_manifest(
+                    manifest_bytes, name, number
+                )
+                if reason is None and manifest["complete"] is not True:
+                    reason = "manifest is not marked complete"
+                if reason is None:
+                    previous = manifest["previous"]
+                    if not lower_exists:
+                        if previous is not None:
+                            reason = (
+                                "digest chain is broken: no earlier "
+                                "generation exists"
+                            )
+                    elif not lower_valid:
+                        reason = (
+                            "digest chain is broken: the previous "
+                            "generation is invalid"
+                        )
+                    elif not isinstance(previous, str) or (
+                        lower_digest is None
+                        or not hmac.compare_digest(previous, lower_digest)
+                    ):
+                        reason = "digest chain is broken"
+                if reason is None:
+                    reason, recovered, digests = (
+                        cls._verify_generation_files(
+                            generation_dir, manifest
+                        )
+                    )
+                    evidence["checkpoint"] = digests["checkpoint"]
+                    evidence["journal"] = digests["journal"]
+                    evidence["replay"] = (
+                        "ok" if reason is None else "failed"
+                    )
+                    if reason is None:
+                        evidence["recovered"] = recovered
+                        evidence["manifest_document"] = manifest
+            evidence["valid"] = reason is None
+            evidence["reason"] = reason
+            scanned.append(evidence)
             lower_exists = True
-            lower_digest = manifest_digest
-
-        if selected is None:
-            raise ValueError(
-                f"no valid generation found under {root!r}"
-            )
-        store = selected["store"]
-        generation_dir = selected["dir"]
-        store._journal_checkpoint = selected["checksum"]
-        store._journal_checkpoint_path = os.path.join(
-            generation_dir, cls._GENERATION_CHECKPOINT
-        )
-        store._journal_version = selected["version"]
-        store._journal_frames = selected["frames"]
-        store._journal_path = os.path.join(
-            generation_dir, cls._GENERATION_JOURNAL
-        )
-        store._journal_manifest_path = os.path.join(
-            generation_dir, cls._GENERATION_MANIFEST
-        )
-        store._journal_manifest = selected["manifest"]
-        report: dict[str, object] = {
-            "selected": selected["name"],
-            "current": current,
-            "ignored": ignored,
-        }
-        return store, report
+            lower_valid = reason is None
+            lower_digest = evidence["manifest"]
+            lower_name = name
+        return pointer, scanned
 
     @classmethod
     def _parse_generation_manifest(
@@ -2687,16 +2782,25 @@ class BranchStore:
     @classmethod
     def _verify_generation_files(
         cls, generation_dir: str, manifest: dict[str, Any]
-    ) -> tuple[str | None, tuple[Any, ...] | None]:
+    ) -> tuple[
+        str | None, tuple[Any, ...] | None, dict[str, str | None]
+    ]:
         """Verify a generation's data files against its manifest and
         replay the journal to its end.
 
         Checks both files' digests, the checkpoint and journal content,
         the journal's binding to the checkpoint and an actual recovery;
-        returns ``(None, (store, frames, version, checksum))`` on
-        success or ``(reason, None)`` naming the first defect. Missing
-        files are defects; other read failures raise :class:`OSError`.
+        returns ``(None, (store, frames, version, checksum), digests)``
+        on success or ``(reason, None, digests)`` naming the first
+        defect. ``digests`` records each data file's SHA-256 digest
+        (``None`` while the file is missing) whatever the outcome.
+        Missing files are defects; other read failures raise
+        :class:`OSError`.
         """
+        digests: dict[str, str | None] = {
+            "checkpoint": None,
+            "journal": None,
+        }
         checkpoint_path = os.path.join(
             generation_dir, cls._GENERATION_CHECKPOINT
         )
@@ -2707,40 +2811,397 @@ class BranchStore:
             with open(checkpoint_path, "rb") as handle:
                 checkpoint_bytes = handle.read()
         except FileNotFoundError:
-            return "checkpoint file is missing", None
+            return "checkpoint file is missing", None, digests
+        digests["checkpoint"] = hashlib.sha256(
+            checkpoint_bytes
+        ).hexdigest()
         if not hmac.compare_digest(
-            hashlib.sha256(checkpoint_bytes).hexdigest(),
-            manifest["checkpoint"],
+            digests["checkpoint"], manifest["checkpoint"]
         ):
-            return "checkpoint digest mismatch", None
+            return "checkpoint digest mismatch", None, digests
         try:
             with open(journal_path, "rb") as handle:
                 journal_bytes = handle.read()
         except FileNotFoundError:
-            return "journal file is missing", None
+            return "journal file is missing", None, digests
+        digests["journal"] = hashlib.sha256(journal_bytes).hexdigest()
         if not hmac.compare_digest(
-            hashlib.sha256(journal_bytes).hexdigest(),
-            manifest["journal"],
+            digests["journal"], manifest["journal"]
         ):
-            return "journal digest mismatch", None
+            return "journal digest mismatch", None, digests
         try:
             state, checksum = cls._read_checkpoint_state(checkpoint_path)
         except ValueError as exc:
-            return f"checkpoint is invalid: {exc}", None
+            return f"checkpoint is invalid: {exc}", None, digests
         try:
             frames, bound, version = cls._read_journal_frames(
                 journal_path
             )
         except ValueError as exc:
-            return f"journal is invalid: {exc}", None
+            return f"journal is invalid: {exc}", None, digests
         if not hmac.compare_digest(bound, checksum):
-            return "journal is not bound to the checkpoint", None
+            return "journal is not bound to the checkpoint", None, digests
         store = cls._store_from_snapshot(state)
         try:
             store._replay_journal_frames(frames, checksum)
         except ValueError as exc:
-            return f"journal does not replay cleanly: {exc}", None
-        return None, (store, frames, version, checksum)
+            return (
+                f"journal does not replay cleanly: {exc}", None, digests
+            )
+        return None, (store, frames, version, checksum), digests
+
+    @classmethod
+    def export_recovery_audit(cls, root: Any) -> str:
+        """Export a canonical recovery audit record for ``root``.
+
+        ``root`` is validated exactly as in
+        :meth:`load_latest_generation` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`; a
+        missing root, a non-directory, a failed enumeration or a failed
+        read raise :class:`OSError`) and scanned strictly read-only
+        under the same evidence rules. If no generation is valid,
+        :class:`ValueError` is raised.
+
+        The returned record is a compact UTF-8 JSON string -- no
+        whitespace, no trailing newline, byte-for-byte identical for
+        identical evidence -- whose keys are ordered ``version``,
+        ``selected``, ``pointer``, ``generations``, ``checksum``: the
+        record layout version, the recovery decision, the ``CURRENT``
+        pointer's status (a corrupt pointer contributes only its
+        content digest, never its raw bytes), every generation's
+        validity, dependency, ignore reason, file digests and
+        end-replay conclusion in ascending number order, and a SHA-256
+        checksum covering the recovery decision and all evidence.
+        Nothing is created, modified or cleaned up.
+        """
+        if not isinstance(root, str):
+            raise TypeError(
+                f"root must be a str, got {type(root).__name__}"
+            )
+        if not root:
+            raise ValueError("root must be a non-empty str")
+
+        cls._require_generation_root(root, need_write=False)
+        pointer, entries = cls._scan_generation_evidence(root)
+        payload = cls._recovery_audit_payload(pointer, entries)
+        if payload["selected"] is None:
+            raise ValueError(
+                f"no valid generation found under {root!r}"
+            )
+        record = dict(payload)
+        record["checksum"] = hashlib.sha256(
+            cls._canonical_json(payload).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(record)
+
+    @classmethod
+    def verify_recovery_audit(cls, root: Any, record: Any) -> bool:
+        """Re-verify a recovery audit ``record`` against ``root``.
+
+        ``root`` is validated first, exactly as in
+        :meth:`load_latest_generation` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`; a
+        missing root, a non-directory, a failed enumeration or a failed
+        read raise :class:`OSError`). ``record`` must then be a
+        non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`); an empty, unparsable, duplicate-keyed,
+        structurally invalid, wrongly versioned, non-canonically
+        encoded or checksum-mismatched record raises
+        :class:`ValueError`.
+
+        The evidence under ``root`` is then re-scanned read-only and
+        the recovery decision and all file evidence are compared with
+        the record: identical returns ``True``; any difference --
+        including no recoverable generation remaining -- is an evidence
+        change and returns ``False``. Nothing is modified either way.
+        """
+        if not isinstance(root, str):
+            raise TypeError(
+                f"root must be a str, got {type(root).__name__}"
+            )
+        if not root:
+            raise ValueError("root must be a non-empty str")
+
+        cls._require_generation_root(root, need_write=False)
+        payload = cls._parse_recovery_audit_record(record)
+        pointer, entries = cls._scan_generation_evidence(root)
+        current = cls._recovery_audit_payload(pointer, entries)
+        if current["selected"] is None:
+            # A legal record always names a recoverable generation;
+            # none left means the evidence changed.
+            return False
+        return current == payload
+
+    @classmethod
+    def _recovery_audit_payload(
+        cls,
+        pointer: dict[str, Any],
+        entries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Assemble the canonical recovery-decision-plus-evidence
+        payload -- everything the record's checksum covers."""
+        if pointer["status"] == "ok":
+            pointer_record: dict[str, Any] = {
+                "status": "ok",
+                "name": pointer["name"],
+            }
+        elif pointer["status"] == "corrupt":
+            # A corrupt pointer's raw bytes are never echoed into the
+            # record; only their digest is kept.
+            pointer_record = {
+                "status": "corrupt",
+                "sha256": pointer["digest"],
+            }
+        else:
+            pointer_record = {"status": "missing"}
+        selected: str | None = None
+        generations: list[dict[str, Any]] = []
+        for entry in entries:
+            generations.append(
+                {
+                    "name": entry["name"],
+                    "number": entry["number"],
+                    "depends_on": entry["depends_on"],
+                    "valid": entry["valid"],
+                    "reason": entry["reason"],
+                    "manifest": entry["manifest"],
+                    "checkpoint": entry["checkpoint"],
+                    "journal": entry["journal"],
+                    "replay": entry["replay"],
+                }
+            )
+            if entry["valid"]:
+                selected = entry["name"]
+        return {
+            "version": cls._RECOVERY_AUDIT_VERSION,
+            "selected": selected,
+            "pointer": pointer_record,
+            "generations": generations,
+        }
+
+    @classmethod
+    def _parse_recovery_audit_record(cls, record: Any) -> dict[str, Any]:
+        """Validate a recovery audit record string and return its
+        checksum-covered payload.
+
+        Every defect -- wrong type, empty, unparsable, duplicate keys,
+        structural or field violations, a non-canonical encoding or a
+        checksum mismatch -- raises :class:`TypeError` for a
+        non-:class:`str` and :class:`ValueError` otherwise.
+        """
+        if not isinstance(record, str):
+            raise TypeError(
+                f"record must be a str, got {type(record).__name__}"
+            )
+        if not record:
+            raise ValueError("record must be a non-empty str")
+        try:
+            document = json.loads(
+                record, object_pairs_hook=cls._reject_duplicate_json_keys
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"recovery audit record is not valid JSON: {exc}"
+            ) from exc
+        if not isinstance(document, dict) or (
+            list(document.keys()) != list(cls._RECOVERY_AUDIT_KEYS)
+        ):
+            raise ValueError(
+                "recovery audit record must be an object with exactly "
+                "the keys 'version', 'selected', 'pointer', "
+                "'generations' and 'checksum' in order"
+            )
+        version = document["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError(
+                "recovery audit record 'version' must be an int"
+            )
+        if version != cls._RECOVERY_AUDIT_VERSION:
+            raise ValueError(
+                f"unsupported recovery audit record version {version!r}"
+            )
+        selected = document["selected"]
+        if not isinstance(selected, str) or (
+            cls._generation_number(selected) is None
+        ):
+            raise ValueError(
+                "recovery audit record 'selected' must be a legal "
+                "generation name"
+            )
+        cls._validate_recovery_audit_pointer(document["pointer"])
+        generations = document["generations"]
+        if not isinstance(generations, list):
+            raise ValueError(
+                "recovery audit record 'generations' must be a list"
+            )
+        previous_name: str | None = None
+        previous_number = -1
+        last_valid_name: str | None = None
+        for entry in generations:
+            if not isinstance(entry, dict) or (
+                list(entry.keys())
+                != list(cls._RECOVERY_AUDIT_GENERATION_KEYS)
+            ):
+                raise ValueError(
+                    "recovery audit generation entries must be objects "
+                    "with exactly the keys 'name', 'number', "
+                    "'depends_on', 'valid', 'reason', 'manifest', "
+                    "'checkpoint', 'journal' and 'replay' in order"
+                )
+            name = entry["name"]
+            number = (
+                cls._generation_number(name)
+                if isinstance(name, str)
+                else None
+            )
+            if number is None:
+                raise ValueError(
+                    "recovery audit generation 'name' must be a legal "
+                    "generation name"
+                )
+            entry_number = entry["number"]
+            if (
+                isinstance(entry_number, bool)
+                or not isinstance(entry_number, int)
+                or entry_number != number
+                or number <= previous_number
+            ):
+                raise ValueError(
+                    "recovery audit generations must carry their own "
+                    "number in strictly ascending order"
+                )
+            if entry["depends_on"] != previous_name:
+                raise ValueError(
+                    "recovery audit generation 'depends_on' must name "
+                    "the previous entry"
+                )
+            valid = entry["valid"]
+            if not isinstance(valid, bool):
+                raise ValueError(
+                    "recovery audit generation 'valid' must be a bool"
+                )
+            reason = entry["reason"]
+            if reason is not None and not isinstance(reason, str):
+                raise ValueError(
+                    "recovery audit generation 'reason' must be null "
+                    "or a string"
+                )
+            if valid != (reason is None):
+                raise ValueError(
+                    "recovery audit generation 'valid' and 'reason' "
+                    "disagree"
+                )
+            replay = entry["replay"]
+            if replay not in ("ok", "failed", "skipped"):
+                raise ValueError(
+                    "recovery audit generation 'replay' must be 'ok', "
+                    "'failed' or 'skipped'"
+                )
+            if (replay == "ok") != valid:
+                raise ValueError(
+                    "recovery audit generation 'replay' and 'valid' "
+                    "disagree"
+                )
+            for field in ("manifest", "checkpoint", "journal"):
+                value = entry[field]
+                if value is not None and not cls._is_hex_digest(value):
+                    raise ValueError(
+                        f"recovery audit generation {field!r} must be "
+                        "null or a 64-character lowercase hex string"
+                    )
+            if valid and (
+                entry["manifest"] is None
+                or entry["checkpoint"] is None
+                or entry["journal"] is None
+            ):
+                raise ValueError(
+                    "recovery audit valid generations must carry all "
+                    "file digests"
+                )
+            previous_name = name
+            previous_number = number
+            if valid:
+                last_valid_name = name
+        if last_valid_name is None or selected != last_valid_name:
+            raise ValueError(
+                "recovery audit record 'selected' does not name the "
+                "newest valid generation"
+            )
+        checksum = document["checksum"]
+        if not cls._is_hex_digest(checksum):
+            raise ValueError(
+                "recovery audit record 'checksum' must be a "
+                "64-character lowercase hex string"
+            )
+        if cls._canonical_json(document) != record:
+            raise ValueError(
+                "recovery audit record is not in canonical form"
+            )
+        payload = {
+            key: document[key] for key in cls._RECOVERY_AUDIT_KEYS[:-1]
+        }
+        expected = hashlib.sha256(
+            cls._canonical_json(payload).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(checksum, expected):
+            raise ValueError(
+                "recovery audit record checksum mismatch"
+            )
+        return payload
+
+    @classmethod
+    def _validate_recovery_audit_pointer(cls, pointer: Any) -> None:
+        """Validate a record's ``pointer`` member."""
+        if not isinstance(pointer, dict):
+            raise ValueError(
+                "recovery audit record 'pointer' must be an object"
+            )
+        status = pointer.get("status")
+        if status == "missing":
+            if list(pointer.keys()) != ["status"]:
+                raise ValueError(
+                    "recovery audit pointer 'missing' takes no further "
+                    "keys"
+                )
+        elif status == "ok":
+            if list(pointer.keys()) != ["status", "name"]:
+                raise ValueError(
+                    "recovery audit pointer 'ok' must carry exactly "
+                    "'status' and 'name'"
+                )
+            name = pointer["name"]
+            if not isinstance(name, str) or (
+                cls._generation_number(name) is None
+            ):
+                raise ValueError(
+                    "recovery audit pointer 'name' must be a legal "
+                    "generation name"
+                )
+        elif status == "corrupt":
+            if list(pointer.keys()) != ["status", "sha256"]:
+                raise ValueError(
+                    "recovery audit pointer 'corrupt' must carry "
+                    "exactly 'status' and 'sha256'"
+                )
+            if not cls._is_hex_digest(pointer["sha256"]):
+                raise ValueError(
+                    "recovery audit pointer 'sha256' must be a "
+                    "64-character lowercase hex string"
+                )
+        else:
+            raise ValueError(
+                "recovery audit pointer 'status' must be 'missing', "
+                "'ok' or 'corrupt'"
+            )
+
+    @classmethod
+    def _is_hex_digest(cls, value: Any) -> bool:
+        """``True`` for a 64-character lowercase hex string."""
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and not (set(value) - cls._HEX_DIGITS)
+        )
 
     def audit_merge(self, id: str) -> dict[str, object]:
         """Return an audit record for the merge event ``id``.

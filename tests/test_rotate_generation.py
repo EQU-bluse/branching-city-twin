@@ -485,24 +485,29 @@ class LoadLatestGenerationTests(GenerationTestBase):
         # Generation 1's journal holds the m4 commit that followed it.
         self.assertEqual(recovered.head("main"), "m4")
 
-    def test_corrupt_data_file_invalidates_only_that_generation(
-        self,
-    ) -> None:
+    def test_corrupt_data_file_invalidates_dependents(self) -> None:
         self.rotate_three()
-        # Corrupt generation 2's checkpoint bytes; its manifest is
-        # untouched, so generation 3's chain link still verifies.
+        # Corrupt generation 2's checkpoint bytes. Its manifest is
+        # untouched, so generation 3 still quotes its digest -- but an
+        # invalid generation never anchors the chain, so every
+        # dependent successor is invalid too and the break is never
+        # skipped.
         checkpoint_path = os.path.join(
             self.generation_dir(2), "checkpoint.json"
         )
         with open(checkpoint_path, "ab") as handle:
             handle.write(b" ")
         recovered, report = BranchStore.load_latest_generation(self.root)
-        self.assertEqual(report["selected"], "generation-0000000000000003")
+        self.assertEqual(report["selected"], "generation-0000000000000001")
         self.assertEqual(
             [entry["name"] for entry in report["ignored"]],
-            ["generation-0000000000000002"],
+            ["generation-0000000000000002", "generation-0000000000000003"],
         )
-        self.assertEqual(recovered.head("main"), "m5")
+        reasons = [entry["reason"] for entry in report["ignored"]]
+        self.assertIn("digest", reasons[0])
+        self.assertIn("chain", reasons[1])
+        # Generation 1's journal holds the m4 commit that followed it.
+        self.assertEqual(recovered.head("main"), "m4")
 
     def test_missing_files_and_half_finished_are_invalid(self) -> None:
         self.rotate_three()
