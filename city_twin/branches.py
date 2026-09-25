@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import heapq
 import hmac
@@ -13,8 +14,14 @@ import os
 import stat
 import tempfile
 import threading
+import time
 import uuid
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from city_twin.event_graph import EventGraph
 
@@ -2275,6 +2282,21 @@ class BranchStore:
     #: digest, which is never the digest of a real frame.
     _RECOVERY_CHAIN_GENESIS_PREV = "0" * 64
 
+    #: Suffix of the fixed coordination lock file that serializes
+    #: appends to one chain file across processes (see
+    #: :meth:`append_recovery_audit_chain`). The lock file lives next to
+    #: the chain file, is never removed and never carries audit content;
+    #: it only bears the operating-system exclusive lock.
+    _RECOVERY_CHAIN_LOCK_SUFFIX = ".lock"
+    #: Pause between two non-blocking lock attempts while waiting.
+    _RECOVERY_CHAIN_LOCK_POLL_SECONDS = 0.02
+
+    #: In-process gates keyed by canonical lock-file path, so threads of
+    #: this process serialize on the same monitor before (and while)
+    #: contending for the operating-system lock.
+    _chain_locks_guard = threading.Lock()
+    _chain_locks: dict[str, threading.Lock] = {}
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -3374,8 +3396,137 @@ class BranchStore:
                     os.remove(tmp_path)
 
     @classmethod
+    def _validate_chain_timeout(cls, timeout: Any) -> float | None:
+        """Validate the optional lock-wait ``timeout`` of
+        :meth:`append_recovery_audit_chain`: ``None`` waits
+        indefinitely, otherwise a non-``bool`` :class:`int` or
+        :class:`float` of finite, non-negative seconds is required. A
+        wrong type raises :class:`TypeError`; a negative, NaN or
+        infinite value raises :class:`ValueError`."""
+        if timeout is None:
+            return None
+        if isinstance(timeout, bool) or not isinstance(
+            timeout, (int, float)
+        ):
+            raise TypeError(
+                "timeout must be None, an int or a float, got "
+                f"{type(timeout).__name__}"
+            )
+        value = float(timeout)
+        if math.isnan(value) or math.isinf(value) or value < 0:
+            raise ValueError(
+                "timeout must be a finite, non-negative number of seconds"
+            )
+        return value
+
+    @staticmethod
+    def _lock_file_exclusive(fd: int) -> None:
+        """One non-blocking attempt at the operating-system exclusive
+        lock on ``fd``. Contention raises :class:`BlockingIOError`; any
+        other system failure propagates as :class:`OSError`."""
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EDEADLK):
+                    raise BlockingIOError(
+                        errno.EAGAIN, "recovery chain lock is held"
+                    ) from exc
+                raise
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock_file(fd: int) -> None:
+        """Release the operating-system lock on ``fd`` acquired by
+        :meth:`_lock_file_exclusive`."""
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @classmethod
+    @contextlib.contextmanager
+    def _recovery_chain_lock(
+        cls, path: str, timeout: float | None
+    ) -> Any:
+        """Hold the cross-process exclusive lock coordinating appends
+        to the chain file at ``path``.
+
+        The lock file is derived from the chain file's canonical path,
+        so every spelling of the same chain file competes for one
+        operating-system lock; it is created if missing, never removed
+        and never written to. ``timeout`` is the already-validated
+        wait budget in seconds (``None`` waits indefinitely); a wait
+        that outlasts a finite budget raises :class:`TimeoutError`,
+        while a failure to create, open or lock the lock file
+        propagates :class:`OSError` before the chain file is touched.
+        The lock is released on every exit path, and the operating
+        system releases it if the process dies while holding it.
+        """
+        lock_path = (
+            os.path.realpath(path) + cls._RECOVERY_CHAIN_LOCK_SUFFIX
+        )
+        with cls._chain_locks_guard:
+            gate = cls._chain_locks.setdefault(
+                lock_path, threading.Lock()
+            )
+        deadline = (
+            None if timeout is None else time.monotonic() + timeout
+        )
+        if deadline is None:
+            gate.acquire()
+        elif not gate.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        ):
+            raise TimeoutError(
+                "timed out waiting for the recovery chain lock"
+            )
+        fd: int | None = None
+        locked = False
+        try:
+            fd = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
+                0o644,
+            )
+            while True:
+                try:
+                    cls._lock_file_exclusive(fd)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if deadline is not None and (
+                        time.monotonic() >= deadline
+                    ):
+                        raise TimeoutError(
+                            "timed out waiting for the recovery chain "
+                            "lock"
+                        )
+                    if deadline is None:
+                        pause = cls._RECOVERY_CHAIN_LOCK_POLL_SECONDS
+                    else:
+                        pause = min(
+                            cls._RECOVERY_CHAIN_LOCK_POLL_SECONDS,
+                            max(0.0, deadline - time.monotonic()),
+                        )
+                    time.sleep(pause)
+            try:
+                yield
+            finally:
+                if locked:
+                    with contextlib.suppress(OSError):
+                        cls._unlock_file(fd)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            gate.release()
+
+    @classmethod
     def append_recovery_audit_chain(
-        cls, root: Any, path: Any, previous: Any
+        cls, root: Any, path: Any, previous: Any, timeout: Any = None
     ) -> str:
         """Append one fresh recovery-audit sample to a persistent,
         tamper-evident chain, returning the new head digest.
@@ -3391,11 +3542,37 @@ class BranchStore:
         caller-saved previous head digest: it must be ``None`` or a
         64-character lowercase hexadecimal string, otherwise
         :class:`TypeError` for the wrong type and :class:`ValueError` for
-        an illegal format.
+        an illegal format. ``timeout`` is validated last: ``None``
+        (the default) waits for the append lock indefinitely, while a
+        non-``bool`` :class:`int` or :class:`float` bounds the wait in
+        seconds -- any other type raises :class:`TypeError`, a
+        negative, NaN or infinite value raises :class:`ValueError`, and
+        a wait outlasting a finite budget raises
+        :class:`TimeoutError`.
+
+        Appends to the same chain file are serialized across processes
+        by an operating-system exclusive lock on a fixed coordination
+        file derived from the chain file's canonical path (every
+        spelling of the same chain file competes for one lock, on
+        Windows and POSIX alike). A failure to create, open or lock
+        that file raises :class:`OSError` before the chain file or any
+        generation evidence is touched; the lock file itself is never
+        removed and never carries audit content. The evidence export,
+        the authentication of the existing chain, the frame sealing and
+        the durable atomic replacement all happen inside the same lock
+        hold, and the lock is released only after the directory sync
+        completes -- or by the operating system if the process dies,
+        so a later call can always proceed.
 
         The first frame may only be created with ``previous`` equal to
         ``None``; once the chain exists, ``previous`` must equal the
-        current last frame's digest. A mismatch raises
+        current last frame's digest. The chain is re-read and fully
+        re-authenticated under the lock, never from a pre-lock
+        observation, so of any number of callers racing with the same
+        valid old head at most one append succeeds: the others find a
+        moved head and raise :class:`RuntimeError` without overwriting
+        the winning frame, and likewise only one of several concurrent
+        first-time creators can create the chain. A mismatch raises
         :class:`RuntimeError` and leaves the file byte-for-byte
         unchanged.
 
@@ -3415,53 +3592,64 @@ class BranchStore:
 
         The whole chain is rewritten in the same directory and durably
         atomically replaced; a failure leaves the old chain
-        byte-for-byte untouched and exposes no partial frame. Nothing
-        under ``root`` -- the pointer, generations, business state,
-        audits or idempotency records -- is modified.
+        byte-for-byte untouched, exposes no partial frame to
+        concurrent :meth:`verify_recovery_audit_chain` or
+        :meth:`diff_recovery_audit_range` readers, and removes the
+        temporary file it created. Nothing under ``root`` -- the
+        pointer, generations, business state, audits or idempotency
+        records -- is modified, and waiting for the lock, a timeout, a
+        stale-head conflict or a process crash never changes them
+        either.
         """
         cls._validate_recovery_root(root)
         cls._validate_chain_path(path)
         cls._validate_head_digest(previous, allow_none=True)
+        timeout_value = cls._validate_chain_timeout(timeout)
 
-        # Export first so a directory with no recoverable generation
-        # raises ValueError before the chain file is consulted.
-        record = cls.export_recovery_audit(root)
+        with cls._recovery_chain_lock(path, timeout_value):
+            # Export first so a directory with no recoverable generation
+            # raises ValueError before the chain file is consulted. The
+            # export, the re-read below and the replacement all happen
+            # under the same lock hold.
+            record = cls.export_recovery_audit(root)
 
-        try:
-            frames = cls._load_recovery_chain(path)
-        except FileNotFoundError:
-            frames = []
-        if not frames:
-            if previous is not None:
-                raise RuntimeError(
-                    "no recovery chain exists yet, so the previous head "
-                    "digest must be None"
-                )
-            prev = cls._RECOVERY_CHAIN_GENESIS_PREV
-        else:
-            if previous is None:
-                raise RuntimeError(
-                    "recovery chain already exists, so the previous head "
-                    "digest is required"
-                )
-            if not hmac.compare_digest(frames[-1]["digest"], previous):
-                raise RuntimeError(
-                    "previous head digest does not match the current end "
-                    "of the recovery chain"
-                )
-            prev = frames[-1]["digest"]
-        seq = len(frames) + 1
-        digest = cls._recovery_chain_frame_digest(seq, prev, record)
-        frames.append(
-            {
-                "seq": seq,
-                "prev": prev,
-                "record": record,
-                "digest": digest,
-            }
-        )
-        cls._write_recovery_chain(path, frames)
-        return digest
+            # Re-read and fully authenticate the chain under the lock;
+            # a head observed before locking is never reused.
+            try:
+                frames = cls._load_recovery_chain(path)
+            except FileNotFoundError:
+                frames = []
+            if not frames:
+                if previous is not None:
+                    raise RuntimeError(
+                        "no recovery chain exists yet, so the previous "
+                        "head digest must be None"
+                    )
+                prev = cls._RECOVERY_CHAIN_GENESIS_PREV
+            else:
+                if previous is None:
+                    raise RuntimeError(
+                        "recovery chain already exists, so the previous "
+                        "head digest is required"
+                    )
+                if not hmac.compare_digest(frames[-1]["digest"], previous):
+                    raise RuntimeError(
+                        "previous head digest does not match the current "
+                        "end of the recovery chain"
+                    )
+                prev = frames[-1]["digest"]
+            seq = len(frames) + 1
+            digest = cls._recovery_chain_frame_digest(seq, prev, record)
+            frames.append(
+                {
+                    "seq": seq,
+                    "prev": prev,
+                    "record": record,
+                    "digest": digest,
+                }
+            )
+            cls._write_recovery_chain(path, frames)
+            return digest
 
     @classmethod
     def verify_recovery_audit_chain(

@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
 from city_twin.branches import BranchStore
@@ -740,6 +742,294 @@ class DiffRecoveryAuditRangeTests(RecoveryAuditChainTestBase):
         self.assertTrue(all(c[3] is not None for c in again if c[2] != "added"))
         self.assertEqual(_read(self.chain), before)
         self.assertEqual(self.snapshot(), root_before)
+
+
+def _hold_lock_process(
+    lock_path: str, ready, release: object, held: object
+) -> None:
+    """Child process: hold the OS lock on ``lock_path`` until told to
+    release it, proving the lock is released by the operating system
+    when the process exits."""
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        BranchStore._lock_file_exclusive(fd)
+        ready.set()
+        release.wait(30)
+    finally:
+        os.close(fd)
+    held.set()
+
+
+class AppendRecoveryAuditChainLockTests(RecoveryAuditChainTestBase):
+    def lock_path(self) -> str:
+        return os.path.realpath(self.chain) + ".lock"
+
+    def test_timeout_validation(self) -> None:
+        self.rotate_three()
+        for bad in (True, False, "1", b"1", [1], (1,), {}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    BranchStore.append_recovery_audit_chain(
+                        self.root, self.chain, None, timeout=bad
+                    )
+        for bad in (-1, -0.5, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    BranchStore.append_recovery_audit_chain(
+                        self.root, self.chain, None, timeout=bad
+                    )
+        self.assertFalse(os.path.exists(self.chain))
+
+    def test_timeout_validated_after_root_path_and_previous(self) -> None:
+        self.rotate_three()
+        # A bad root still wins over a bad timeout.
+        with self.assertRaises(TypeError):
+            BranchStore.append_recovery_audit_chain(
+                1, self.chain, None, timeout="x"
+            )
+        # A bad path still wins over a bad timeout.
+        with self.assertRaises(TypeError):
+            BranchStore.append_recovery_audit_chain(
+                self.root, 1, None, timeout="x"
+            )
+        # A bad head digest still wins over a bad timeout.
+        with self.assertRaises(TypeError):
+            BranchStore.append_recovery_audit_chain(
+                self.root, self.chain, 1, timeout="x"
+            )
+        with self.assertRaises(ValueError):
+            BranchStore.append_recovery_audit_chain(
+                self.root, self.chain, "g" * 64, timeout=-1
+            )
+
+    def test_timeout_accepts_int_and_float(self) -> None:
+        self.rotate_three()
+        head = BranchStore.append_recovery_audit_chain(
+            self.root, self.chain, None, timeout=5
+        )
+        self.assertIsInstance(head, str)
+        second = BranchStore.append_recovery_audit_chain(
+            self.root, self.chain, head, timeout=2.5
+        )
+        self.assertIsInstance(second, str)
+        third = BranchStore.append_recovery_audit_chain(
+            self.root, self.chain, second, timeout=0
+        )
+        self.assertIsInstance(third, str)
+        self.assertEqual(
+            len(self.chain_document()["frames"]), 3
+        )
+
+    def test_contended_lock_times_out_without_touching_chain(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        before = _read(self.chain)
+        root_before = self.snapshot()
+        with BranchStore._recovery_chain_lock(self.chain, None):
+            with self.assertRaises(TimeoutError):
+                BranchStore.append_recovery_audit_chain(
+                    self.root, self.chain, head, timeout=0.3
+                )
+        self.assertEqual(_read(self.chain), before)
+        self.assertEqual(self.snapshot(), root_before)
+        # The chain still appends normally once the lock is free.
+        self.assertIsInstance(self.append_frame(head), str)
+
+    def test_zero_timeout_fails_fast_when_locked(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        before = _read(self.chain)
+        with BranchStore._recovery_chain_lock(self.chain, None):
+            with self.assertRaises(TimeoutError):
+                BranchStore.append_recovery_audit_chain(
+                    self.root, self.chain, head, timeout=0
+                )
+        self.assertEqual(_read(self.chain), before)
+
+    def test_equivalent_paths_share_one_lock(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        dotted = os.path.join(self.tmp.name, ".", "chain.json")
+        self.assertNotEqual(dotted, self.chain)
+        with BranchStore._recovery_chain_lock(dotted, None):
+            with self.assertRaises(TimeoutError):
+                BranchStore.append_recovery_audit_chain(
+                    self.root, self.chain, head, timeout=0.2
+                )
+
+    def test_lock_file_is_fixed_empty_and_not_temp_residue(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        self.append_frame(head)
+        lock_path = self.lock_path()
+        self.assertTrue(os.path.exists(lock_path))
+        # The coordination file never carries audit content.
+        self.assertEqual(_read(lock_path), b"")
+        # No temporary chain files remain after success or failure.
+        leftovers = [
+            name
+            for name in os.listdir(self.tmp.name)
+            if name.startswith(".recovery-chain-")
+        ]
+        self.assertEqual(leftovers, [])
+        with self.assertRaises(RuntimeError):
+            self.append_frame(head)
+        self.assertEqual(
+            [
+                name
+                for name in os.listdir(self.tmp.name)
+                if name.startswith(".recovery-chain-")
+            ],
+            [],
+        )
+
+    def test_concurrent_same_head_appends_one_winner(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        before = self.snapshot()
+        results: list[object] = []
+        barrier = threading.Barrier(8)
+
+        def contend() -> None:
+            barrier.wait()
+            try:
+                results.append(
+                    BranchStore.append_recovery_audit_chain(
+                        self.root, self.chain, head, timeout=10
+                    )
+                )
+            except RuntimeError as exc:
+                results.append(exc)
+
+        threads = [
+            threading.Thread(target=contend) for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        winners = [r for r in results if isinstance(r, str)]
+        losers = [r for r in results if isinstance(r, RuntimeError)]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(len(losers), 7)
+        # Exactly one frame was appended, sealed by the winner.
+        frames = self.chain_document()["frames"]
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[-1]["digest"], winners[0])
+        self.assertEqual(frames[-1]["prev"], head)
+        # The losers did not overwrite the winning frame.
+        self.assertTrue(
+            BranchStore.verify_recovery_audit_chain(
+                self.chain, winners[0]
+            )
+        )
+        # Nothing under the generation root changed.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_concurrent_first_creation_one_winner(self) -> None:
+        self.rotate_three()
+        results: list[object] = []
+        barrier = threading.Barrier(6)
+
+        def contend() -> None:
+            barrier.wait()
+            try:
+                results.append(
+                    BranchStore.append_recovery_audit_chain(
+                        self.root, self.chain, None, timeout=10
+                    )
+                )
+            except RuntimeError as exc:
+                results.append(exc)
+
+        threads = [
+            threading.Thread(target=contend) for _ in range(6)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        winners = [r for r in results if isinstance(r, str)]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(len(results), 6)
+        frames = self.chain_document()["frames"]
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["digest"], winners[0])
+
+    def test_concurrent_verify_reads_whole_documents(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        stop = threading.Event()
+        failures: list[object] = []
+
+        def read_repeatedly() -> None:
+            while not stop.is_set():
+                try:
+                    # Every read is a complete canonical document, so
+                    # parsing and full authentication never fail; the
+                    # head comparison itself may legitimately be False
+                    # for a stale expected head.
+                    document = json.loads(_read(self.chain))
+                    digest = document["frames"][-1]["digest"]
+                    BranchStore.verify_recovery_audit_chain(
+                        self.chain, digest
+                    )
+                    try:
+                        BranchStore.diff_recovery_audit_range(
+                            self.chain,
+                            digest,
+                            1,
+                            len(document["frames"]),
+                        )
+                    except ValueError as exc:
+                        # The only acceptable race: the chain advanced
+                        # between the read and the diff, so the
+                        # authenticated head no longer matches. A
+                        # partial document would surface as a different
+                        # validation failure.
+                        if "head does not match" not in str(exc):
+                            raise
+                except Exception as exc:  # pragma: no cover
+                    failures.append(exc)
+                    return
+
+        reader = threading.Thread(target=read_repeatedly)
+        reader.start()
+        for _ in range(10):
+            head = self.append_frame(head)
+        stop.set()
+        reader.join()
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            len(self.chain_document()["frames"]), 11
+        )
+
+    def test_lock_released_after_process_exit(self) -> None:
+        self.rotate_three()
+        head = self.append_frame(None)
+        ctx = multiprocessing.get_context("spawn")
+        ready = ctx.Event()
+        release = ctx.Event()
+        held = ctx.Event()
+        child = ctx.Process(
+            target=_hold_lock_process,
+            args=(self.lock_path(), ready, release, held),
+        )
+        child.start()
+        try:
+            self.assertTrue(ready.wait(30))
+            before = _read(self.chain)
+            with self.assertRaises(TimeoutError):
+                BranchStore.append_recovery_audit_chain(
+                    self.root, self.chain, head, timeout=0.3
+                )
+            self.assertEqual(_read(self.chain), before)
+        finally:
+            release.set()
+            child.join(30)
+        self.assertTrue(held.is_set())
+        # Once the other process let go, the append proceeds.
+        self.assertIsInstance(self.append_frame(head), str)
 
 
 if __name__ == "__main__":
