@@ -10,6 +10,7 @@ import itertools
 import json
 import math
 import os
+import stat
 import tempfile
 import threading
 import uuid
@@ -85,6 +86,12 @@ class BranchStore:
         self._journal_checkpoint_path: str | None = None
         self._journal_version: int = self._JOURNAL_VERSION
         self._journal_frames: list[dict[str, Any]] = []
+        # Generation context: set only while the attachment lives inside
+        # a rotation generation (rotate_generation or a
+        # load_latest_generation recovery), so every committed frame also
+        # re-points the generation's manifest at the new journal digest.
+        self._journal_manifest_path: str | None = None
+        self._journal_manifest: dict[str, Any] | None = None
 
     @staticmethod
     def _require_nonempty_str(value: Any, name: str) -> None:
@@ -1616,11 +1623,16 @@ class BranchStore:
 
             # --- Publish both files durably before switching anything.
             # Each goes to a temp file in its target directory, fully
-            # written, flushed and fsync-ed, then atomically replaced into
-            # place; the directories are fsync-ed only after both replaces
-            # succeed. Any failure unpublishes a file that already landed
-            # and removes the temporary files, so neither target survives
-            # a failed rotation.
+            # written, flushed and fsync-ed, then atomically published
+            # without overwriting: a hard link onto the target fails with
+            # FileExistsError if a concurrent writer occupied it after
+            # the lstat checks above, so an occupied target is never
+            # overwritten on Linux or Windows (NTFS hard links); the temp
+            # name is unlinked once the link lands. The directories are
+            # fsync-ed only after both publishes succeed. Any failure
+            # unpublishes a file that already landed and removes the
+            # temporary files, so neither target survives a failed
+            # rotation.
             cp_directory = os.path.dirname(os.path.abspath(checkpoint_path))
             journal_directory = os.path.dirname(
                 os.path.abspath(journal_path)
@@ -1647,12 +1659,14 @@ class BranchStore:
                     ".journal-",
                     journal_document,
                 )
-                os.replace(cp_tmp, checkpoint_path)
-                cp_tmp = None
+                os.link(cp_tmp, checkpoint_path)
                 cp_published = True
-                os.replace(journal_tmp, journal_path)
-                journal_tmp = None
+                os.unlink(cp_tmp)
+                cp_tmp = None
+                os.link(journal_tmp, journal_path)
                 journal_published = True
+                os.unlink(journal_tmp)
+                journal_tmp = None
                 self._fsync_directory(cp_directory)
                 self._fsync_directory(journal_directory)
                 directories_synced = True
@@ -1676,12 +1690,16 @@ class BranchStore:
                 raise
 
             # Both files are durable. Switch the attachment only now; the
-            # business state itself is intentionally untouched.
+            # business state itself is intentionally untouched. The new
+            # journal lives outside any generation, so no manifest is
+            # re-pointed on later commits.
             self._journal_checkpoint = new_checksum
             self._journal_checkpoint_path = checkpoint_path
             self._journal_version = self._JOURNAL_VERSION
             self._journal_frames = []
             self._journal_path = journal_path
+            self._journal_manifest_path = None
+            self._journal_manifest = None
         return None
 
     @staticmethod
@@ -1716,8 +1734,15 @@ class BranchStore:
 
     @staticmethod
     def _fsync_directory(directory: str) -> None:
-        """Fsync a directory so a freshly replaced directory entry is
-        durable across a crash; raises :class:`OSError` on failure."""
+        """Fsync a directory so a freshly published directory entry is
+        durable across a crash; raises :class:`OSError` on failure.
+
+        Windows cannot fsync a directory through :func:`os.open`; the
+        durable commit the platform offers there is the file-level fsync
+        already performed on every published file, so the directory sync
+        is skipped and each platform uses its available durable commit."""
+        if os.name == "nt":
+            return
         flags = os.O_RDONLY
         directory_flag = getattr(os, "O_DIRECTORY", 0)
         fd = os.open(directory, flags | directory_flag)
@@ -1773,7 +1798,11 @@ class BranchStore:
             frame["before"] = self._state_summary(before_state)
             frame["after"] = self._state_summary(after_state)
         frame["prev"] = prev
-        self._write_journal_document(self._journal_frames + [frame])
+        journal_data = self._write_journal_document(
+            self._journal_frames + [frame]
+        )
+        if self._journal_manifest_path is not None:
+            self._commit_generation_manifest(journal_data)
         self._journal_frames.append(frame)
 
     @classmethod
@@ -1793,14 +1822,16 @@ class BranchStore:
 
     def _write_journal_document(
         self, frames: list[dict[str, object]]
-    ) -> None:
+    ) -> bytes:
         """Serialize the journal document and atomically replace the file.
 
         The bytes are UTF-8 (no BOM), compact JSON with no trailing
         newline, written to a temporary file in the journal's directory,
         flushed and fsync-ed, then atomically moved onto the journal
         path; on any failure the previous file is left byte-for-byte
-        untouched and the temporary file is removed.
+        untouched and the temporary file is removed. Returns the exact
+        bytes published, so a generation manifest can be re-pointed at
+        the new journal digest.
         """
         document = {
             "schema_version": self._journal_version,
@@ -1808,9 +1839,18 @@ class BranchStore:
             "frames": frames,
         }
         data = self._canonical_json(document).encode("utf-8")
-        directory = os.path.dirname(os.path.abspath(self._journal_path))
+        self._replace_durable(self._journal_path, data, ".journal-")
+        return data
+
+    @staticmethod
+    def _replace_durable(path: str, data: bytes, prefix: str) -> None:
+        """Write ``data`` to a temp file beside ``path``, flush and
+        fsync it, then atomically replace ``path``; on any failure the
+        previous file is left byte-for-byte untouched and the temporary
+        file is removed."""
+        directory = os.path.dirname(os.path.abspath(path))
         fd, tmp_path = tempfile.mkstemp(
-            prefix=".journal-", suffix=".tmp", dir=directory
+            prefix=prefix, suffix=".tmp", dir=directory
         )
         replaced = False
         try:
@@ -1825,12 +1865,50 @@ class BranchStore:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_path, self._journal_path)
+            os.replace(tmp_path, path)
             replaced = True
         finally:
             if not replaced:
                 with contextlib.suppress(OSError):
                     os.remove(tmp_path)
+
+    def _commit_generation_manifest(self, journal_data: bytes) -> None:
+        """Re-point the attached generation's manifest at the journal
+        document just committed.
+
+        Runs under :attr:`_state_lock` right after the journal file was
+        durably replaced. The manifest is rewritten (temp file, fsync,
+        atomic replace) with the new journal digest; every other field --
+        including the previous-generation digest chain -- is carried over
+        unchanged, so the manifest always vouches for exactly the journal
+        on disk. If the manifest cannot be committed, the previous
+        journal bytes are restored best-effort so the generation stays
+        consistent and the caller can roll the business state back; a
+        crash between the journal and manifest commits leaves a digest
+        mismatch that :meth:`load_latest_generation` reports as an
+        invalid, half-committed generation instead of trusting it.
+        """
+        old_journal_data = self._canonical_json(
+            {
+                "schema_version": self._journal_version,
+                "checkpoint": self._journal_checkpoint,
+                "frames": self._journal_frames,
+            }
+        ).encode("utf-8")
+        manifest = dict(self._journal_manifest)
+        manifest["journal"] = hashlib.sha256(journal_data).hexdigest()
+        data = self._canonical_json(manifest).encode("utf-8")
+        try:
+            self._replace_durable(
+                self._journal_manifest_path, data, ".manifest-"
+            )
+        except BaseException:
+            with contextlib.suppress(OSError):
+                self._replace_durable(
+                    self._journal_path, old_journal_data, ".journal-"
+                )
+            raise
+        self._journal_manifest = manifest
 
     @classmethod
     def _journal_frame_digest(cls, frame: dict[str, object]) -> str:
@@ -2133,6 +2211,536 @@ class BranchStore:
                         f"journal frame {frame['seq']}: recorded after-state "
                         "summary does not match the replayed state"
                     )
+
+    # ------------------------------------------------------------------
+    # Auditable rotation generations
+    # ------------------------------------------------------------------
+
+    #: On-disk layout of a generation root: a ``CURRENT`` pointer file
+    #: names the newest completely published generation, and each
+    #: directory named ``generation-`` plus sixteen decimal digits holds
+    #: exactly a checkpoint, an empty journal and a manifest chaining the
+    #: previous generation's manifest digest and vouching for both data
+    #: files' digests.
+    _GENERATION_PREFIX = "generation-"
+    _GENERATION_DIGITS = 16
+    _GENERATION_CHECKPOINT = "checkpoint.json"
+    _GENERATION_JOURNAL = "journal.json"
+    _GENERATION_MANIFEST = "manifest.json"
+    _GENERATION_POINTER = "CURRENT"
+    _GENERATION_MANIFEST_VERSION = 1
+    _GENERATION_MANIFEST_KEYS = (
+        "schema_version",
+        "generation",
+        "number",
+        "previous",
+        "checkpoint",
+        "journal",
+        "complete",
+    )
+
+    @classmethod
+    def _generation_number(cls, name: str) -> int | None:
+        """Number of a legal generation directory name, else ``None``."""
+        if not name.startswith(cls._GENERATION_PREFIX):
+            return None
+        digits = name[len(cls._GENERATION_PREFIX):]
+        if len(digits) != cls._GENERATION_DIGITS or (
+            set(digits) - set("0123456789")
+        ):
+            return None
+        return int(digits)
+
+    @staticmethod
+    def _require_generation_root(root: str, need_write: bool) -> None:
+        """Validate that ``root`` names an existing, usable directory.
+
+        A missing root, a non-directory and (for rotation) a directory
+        that is not readable and writable all raise :class:`OSError`.
+        """
+        st = os.stat(root)
+        if not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(
+                f"generation root is not a directory: {root!r}"
+            )
+        if need_write and not os.access(root, os.R_OK | os.W_OK):
+            raise PermissionError(
+                f"generation root is not readable and writable: {root!r}"
+            )
+
+    def rotate_generation(self, root: Any) -> str:
+        """Publish the current state as a new generation under ``root``.
+
+        ``root`` must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`) naming
+        an existing directory that is readable and writable; a missing
+        root, a non-directory, insufficient permissions or a failed
+        directory sync raise :class:`OSError`.
+
+        The new generation is numbered one above the highest completely
+        published generation found under ``root`` (one if there is none)
+        and named ``generation-`` plus sixteen decimal digits. It holds
+        exactly three files: a checkpoint of the live business state, an
+        empty version-2 journal bound to that checkpoint, and a manifest
+        recording the previous generation's manifest digest (``null``
+        for the first generation), both data files' SHA-256 digests and
+        the completion marker. Half-finished directories left by an
+        interrupted rotation are forensic material: they never count
+        towards the numbering and are never reused, cleaned up or
+        overwritten -- if the computed target is occupied, the call
+        raises :class:`OSError` and overwrites nothing.
+
+        Everything runs under the same lock that serializes create,
+        append and merge, so the checkpoint captures one consistent
+        instant and concurrent commits block. The generation directory
+        and its files are written, flushed, fsync-ed and published
+        without overwriting (hard links, as in :meth:`rotate_journal`),
+        the generation directory is synced, and only then is the
+        ``CURRENT`` pointer atomically re-pointed and the root directory
+        synced. A crash midway may leave forensic material behind, but
+        it never switches this instance's attachment and never makes a
+        half-finished generation valid; on a raised failure the
+        half-built generation is removed best-effort and this store
+        keeps its current attachment and business state.
+
+        On success the store attaches to the new generation's journal,
+        whose frames start again at one, and every later commit also
+        re-points the manifest at the new journal digest; older
+        generations stay byte-for-byte untouched. Returns the new
+        generation's name.
+        """
+        if not isinstance(root, str):
+            raise TypeError(
+                f"root must be a str, got {type(root).__name__}"
+            )
+        if not root:
+            raise ValueError("root must be a non-empty str")
+
+        with self._state_lock:
+            self._require_generation_root(root, need_write=True)
+            entries = os.listdir(root)
+
+            # Numbering follows the highest completely published
+            # generation (a parseable manifest carrying the completion
+            # marker); anything half-finished is forensic material and
+            # neither counts nor is reused.
+            best = 0
+            best_digest: str | None = None
+            for entry in entries:
+                number = self._generation_number(entry)
+                if number is None or number <= best:
+                    continue
+                if not os.path.isdir(os.path.join(root, entry)):
+                    continue
+                manifest_path = os.path.join(
+                    root, entry, self._GENERATION_MANIFEST
+                )
+                try:
+                    with open(manifest_path, "rb") as handle:
+                        manifest_bytes = handle.read()
+                except OSError:
+                    continue
+                try:
+                    document = json.loads(manifest_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                if not isinstance(document, dict) or (
+                    document.get("complete") is not True
+                ):
+                    continue
+                best = number
+                best_digest = hashlib.sha256(manifest_bytes).hexdigest()
+
+            number = best + 1
+            name = (
+                f"{self._GENERATION_PREFIX}"
+                f"{number:0{self._GENERATION_DIGITS}d}"
+            )
+            generation_dir = os.path.join(root, name)
+            checkpoint_path = os.path.join(
+                generation_dir, self._GENERATION_CHECKPOINT
+            )
+            journal_path = os.path.join(
+                generation_dir, self._GENERATION_JOURNAL
+            )
+            manifest_path = os.path.join(
+                generation_dir, self._GENERATION_MANIFEST
+            )
+
+            state = self._snapshot_state()
+            payload = self._checkpoint_payload(state)
+            checksum = hashlib.sha256(
+                self._canonical_json(payload).encode("utf-8")
+            ).hexdigest()
+            checkpoint_data = self._canonical_json(
+                {
+                    "schema_version": self._CHECKPOINT_VERSION,
+                    "payload": payload,
+                    "checksum": checksum,
+                }
+            ).encode("utf-8")
+            journal_data = self._canonical_json(
+                {
+                    "schema_version": self._JOURNAL_VERSION,
+                    "checkpoint": checksum,
+                    "frames": [],
+                }
+            ).encode("utf-8")
+            manifest: dict[str, Any] = {
+                "schema_version": self._GENERATION_MANIFEST_VERSION,
+                "generation": name,
+                "number": number,
+                "previous": best_digest,
+                "checkpoint": hashlib.sha256(checkpoint_data).hexdigest(),
+                "journal": hashlib.sha256(journal_data).hexdigest(),
+                "complete": True,
+            }
+            manifest_data = self._canonical_json(manifest).encode("utf-8")
+
+            # Durable, no-overwrite publish: the fresh directory and each
+            # file appear exactly once (a concurrent occupant raises
+            # OSError and is never overwritten), the generation directory
+            # is synced, and only then is the CURRENT pointer atomically
+            # re-pointed and the root directory synced.
+            os.mkdir(generation_dir)
+            published: list[str] = []
+            tmps: list[str] = []
+            pointer_updated = False
+            try:
+                for prefix, target, data in (
+                    (".checkpoint-", checkpoint_path, checkpoint_data),
+                    (".journal-", journal_path, journal_data),
+                    (".manifest-", manifest_path, manifest_data),
+                ):
+                    tmp = self._write_durable_temp(
+                        generation_dir, prefix, data
+                    )
+                    tmps.append(tmp)
+                    os.link(tmp, target)
+                    published.append(target)
+                    os.unlink(tmp)
+                    tmps.pop()
+                self._fsync_directory(generation_dir)
+                pointer_tmp = self._write_durable_temp(
+                    root, ".current-", name.encode("utf-8")
+                )
+                tmps.append(pointer_tmp)
+                os.replace(
+                    pointer_tmp,
+                    os.path.join(root, self._GENERATION_POINTER),
+                )
+                tmps.pop()
+                pointer_updated = True
+                self._fsync_directory(root)
+            except BaseException:
+                for tmp in tmps:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+                if not pointer_updated:
+                    for target in reversed(published):
+                        with contextlib.suppress(OSError):
+                            os.remove(target)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(generation_dir)
+                raise
+
+            # Everything is durable and the pointer has landed; only now
+            # does this instance switch to the new generation's journal.
+            self._journal_checkpoint = checksum
+            self._journal_checkpoint_path = checkpoint_path
+            self._journal_version = self._JOURNAL_VERSION
+            self._journal_frames = []
+            self._journal_path = journal_path
+            self._journal_manifest_path = manifest_path
+            self._journal_manifest = manifest
+            return name
+
+    @classmethod
+    def load_latest_generation(
+        cls, root: Any
+    ) -> tuple["BranchStore", dict[str, object]]:
+        """Recover a store from the newest valid generation under ``root``.
+
+        ``root`` must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`) naming
+        an existing directory; a missing root, a non-directory, a failed
+        directory enumeration or a failed file read raise
+        :class:`OSError`. The check is strictly read-only: the ``CURRENT``
+        pointer and every legally named ``generation-`` directory are
+        inspected, and nothing is modified, cleaned up or removed.
+
+        Every candidate generation must verify, in order, its manifest
+        structure, the completion marker, the digest chain to the
+        previous generation's manifest, both data files' digests, the
+        journal's binding to the checkpoint, and an actual replay of the
+        journal to its end. A broken chain, a half-finished generation,
+        a digest mismatch, a missing file or unparsable content marks
+        the generation invalid; it is reported, never trusted. The
+        highest-numbered generation on the valid digest chain is
+        selected -- the ``CURRENT`` pointer is only a hint, so a
+        missing, stale or corrupt pointer still falls back to the
+        evidence. If no generation is valid, :class:`ValueError` is
+        raised.
+
+        Returns ``(store, report)``: the recovered store, attached to
+        the selected generation's journal so it can keep committing
+        (each commit re-points the manifest), and a report whose keys
+        are ordered ``selected``, ``current``, ``ignored`` -- the
+        selected generation's name, the pointer's content (``None`` if
+        missing or unreadable as text), and the invalid generations in
+        ascending number order, each a dict with ``name`` and the
+        definitive ``reason``. A failed load changes no business, audit,
+        idempotency or query state anywhere.
+        """
+        if not isinstance(root, str):
+            raise TypeError(
+                f"root must be a str, got {type(root).__name__}"
+            )
+        if not root:
+            raise ValueError("root must be a non-empty str")
+
+        cls._require_generation_root(root, need_write=False)
+        entries = os.listdir(root)
+
+        # The CURRENT pointer is only a hint: missing, stale or corrupt,
+        # it never changes the evidence-based selection below.
+        current: str | None = None
+        try:
+            with open(
+                os.path.join(root, cls._GENERATION_POINTER), "rb"
+            ) as handle:
+                pointer_raw = handle.read()
+        except FileNotFoundError:
+            pointer_raw = None
+        if pointer_raw is not None:
+            try:
+                pointer_text = pointer_raw.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                pointer_text = ""
+            if pointer_text:
+                current = pointer_text
+
+        candidates: list[tuple[int, str]] = []
+        for entry in entries:
+            number = cls._generation_number(entry)
+            if number is None:
+                continue
+            if not os.path.isdir(os.path.join(root, entry)):
+                continue
+            candidates.append((number, entry))
+        candidates.sort()
+
+        ignored: list[dict[str, str]] = []
+        selected: dict[str, Any] | None = None
+        lower_exists = False
+        lower_digest: str | None = None
+        for number, name in candidates:
+            generation_dir = os.path.join(root, name)
+            manifest_path = os.path.join(
+                generation_dir, cls._GENERATION_MANIFEST
+            )
+            try:
+                with open(manifest_path, "rb") as handle:
+                    manifest_bytes = handle.read()
+            except FileNotFoundError:
+                ignored.append(
+                    {"name": name, "reason": "manifest is missing"}
+                )
+                lower_exists = True
+                lower_digest = None
+                continue
+            manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+
+            reason, manifest = cls._parse_generation_manifest(
+                manifest_bytes, name, number
+            )
+            if reason is None and manifest["complete"] is not True:
+                reason = "manifest is not marked complete"
+            if reason is None:
+                previous = manifest["previous"]
+                if not lower_exists:
+                    if previous is not None:
+                        reason = (
+                            "digest chain is broken: no earlier "
+                            "generation exists"
+                        )
+                elif lower_digest is None:
+                    reason = (
+                        "digest chain is broken: the previous "
+                        "generation's manifest is missing"
+                    )
+                elif not hmac.compare_digest(previous, lower_digest):
+                    reason = "digest chain is broken"
+            if reason is None:
+                reason, recovered = cls._verify_generation_files(
+                    generation_dir, manifest
+                )
+            if reason is not None:
+                ignored.append({"name": name, "reason": reason})
+            else:
+                store, frames, version, checksum = recovered
+                selected = {
+                    "name": name,
+                    "dir": generation_dir,
+                    "store": store,
+                    "frames": frames,
+                    "version": version,
+                    "checksum": checksum,
+                    "manifest": manifest,
+                }
+            lower_exists = True
+            lower_digest = manifest_digest
+
+        if selected is None:
+            raise ValueError(
+                f"no valid generation found under {root!r}"
+            )
+        store = selected["store"]
+        generation_dir = selected["dir"]
+        store._journal_checkpoint = selected["checksum"]
+        store._journal_checkpoint_path = os.path.join(
+            generation_dir, cls._GENERATION_CHECKPOINT
+        )
+        store._journal_version = selected["version"]
+        store._journal_frames = selected["frames"]
+        store._journal_path = os.path.join(
+            generation_dir, cls._GENERATION_JOURNAL
+        )
+        store._journal_manifest_path = os.path.join(
+            generation_dir, cls._GENERATION_MANIFEST
+        )
+        store._journal_manifest = selected["manifest"]
+        report: dict[str, object] = {
+            "selected": selected["name"],
+            "current": current,
+            "ignored": ignored,
+        }
+        return store, report
+
+    @classmethod
+    def _parse_generation_manifest(
+        cls, data: bytes, name: str, number: int
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Validate a generation manifest's encoding, JSON and structure.
+
+        Returns ``(None, manifest)`` on success, or ``(reason, None)``
+        naming the first structural defect found."""
+        if data.startswith(b"\xef\xbb\xbf"):
+            return "manifest must be UTF-8 without a BOM", None
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return "manifest is not valid UTF-8", None
+        try:
+            document = json.loads(
+                text, object_pairs_hook=cls._reject_duplicate_json_keys
+            )
+        except ValueError as exc:
+            return f"manifest is not valid JSON: {exc}", None
+        if not isinstance(document, dict):
+            return "manifest top-level JSON value must be an object", None
+        if set(document.keys()) != set(cls._GENERATION_MANIFEST_KEYS):
+            return (
+                "manifest must contain exactly the keys 'schema_version', "
+                "'generation', 'number', 'previous', 'checkpoint', "
+                "'journal' and 'complete'"
+            ), None
+        version = document["schema_version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            return "manifest 'schema_version' must be an int", None
+        if version != cls._GENERATION_MANIFEST_VERSION:
+            return (
+                f"unsupported manifest schema_version {version!r}"
+            ), None
+        if document["generation"] != name:
+            return (
+                "manifest 'generation' does not name its directory"
+            ), None
+        num = document["number"]
+        if isinstance(num, bool) or not isinstance(num, int):
+            return "manifest 'number' must be an int", None
+        if num != number:
+            return (
+                "manifest 'number' does not match its directory name"
+            ), None
+        previous = document["previous"]
+        if previous is not None and (
+            not isinstance(previous, str)
+            or len(previous) != 64
+            or set(previous) - cls._HEX_DIGITS
+        ):
+            return (
+                "manifest 'previous' must be null or a 64-character "
+                "lowercase hex string"
+            ), None
+        for field in ("checkpoint", "journal"):
+            value = document[field]
+            if not isinstance(value, str) or len(value) != 64 or (
+                set(value) - cls._HEX_DIGITS
+            ):
+                return (
+                    f"manifest {field!r} must be a 64-character "
+                    "lowercase hex string"
+                ), None
+        return None, document
+
+    @classmethod
+    def _verify_generation_files(
+        cls, generation_dir: str, manifest: dict[str, Any]
+    ) -> tuple[str | None, tuple[Any, ...] | None]:
+        """Verify a generation's data files against its manifest and
+        replay the journal to its end.
+
+        Checks both files' digests, the checkpoint and journal content,
+        the journal's binding to the checkpoint and an actual recovery;
+        returns ``(None, (store, frames, version, checksum))`` on
+        success or ``(reason, None)`` naming the first defect. Missing
+        files are defects; other read failures raise :class:`OSError`.
+        """
+        checkpoint_path = os.path.join(
+            generation_dir, cls._GENERATION_CHECKPOINT
+        )
+        journal_path = os.path.join(
+            generation_dir, cls._GENERATION_JOURNAL
+        )
+        try:
+            with open(checkpoint_path, "rb") as handle:
+                checkpoint_bytes = handle.read()
+        except FileNotFoundError:
+            return "checkpoint file is missing", None
+        if not hmac.compare_digest(
+            hashlib.sha256(checkpoint_bytes).hexdigest(),
+            manifest["checkpoint"],
+        ):
+            return "checkpoint digest mismatch", None
+        try:
+            with open(journal_path, "rb") as handle:
+                journal_bytes = handle.read()
+        except FileNotFoundError:
+            return "journal file is missing", None
+        if not hmac.compare_digest(
+            hashlib.sha256(journal_bytes).hexdigest(),
+            manifest["journal"],
+        ):
+            return "journal digest mismatch", None
+        try:
+            state, checksum = cls._read_checkpoint_state(checkpoint_path)
+        except ValueError as exc:
+            return f"checkpoint is invalid: {exc}", None
+        try:
+            frames, bound, version = cls._read_journal_frames(
+                journal_path
+            )
+        except ValueError as exc:
+            return f"journal is invalid: {exc}", None
+        if not hmac.compare_digest(bound, checksum):
+            return "journal is not bound to the checkpoint", None
+        store = cls._store_from_snapshot(state)
+        try:
+            store._replay_journal_frames(frames, checksum)
+        except ValueError as exc:
+            return f"journal does not replay cleanly: {exc}", None
+        return None, (store, frames, version, checksum)
 
     def audit_merge(self, id: str) -> dict[str, object]:
         """Return an audit record for the merge event ``id``.
