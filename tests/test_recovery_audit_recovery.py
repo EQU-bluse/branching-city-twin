@@ -932,5 +932,254 @@ class ConcurrencyTests(RecoveryPublicationTestBase):
         )
 
 
+class PhaseStateMatrixTests(RecoveryPublicationTestBase):
+    """The recovery judgment cross-checks the record's phase against
+    both targets' current digests: only state combinations the
+    publication protocol itself can leave behind are converged, and a
+    contradiction raises :class:`ValueError` with every byte of
+    evidence retained -- two targets superficially agreeing never
+    justifies deleting the record."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.grow_chain(5)
+        self.build()
+        self.old_index = _read(self.index)
+        self.old_progress = _read(self.progress)
+        self.grow_chain(3, start=20)
+
+    def publish_capturing_records(self) -> list:
+        writes: list[bytes] = []
+        orig = BranchStore._write_cache_recovery_record
+
+        def spy(recovery_path, data):
+            writes.append(bytes(data))
+            return orig(recovery_path, data)
+
+        with mock.patch.object(
+            BranchStore,
+            "_write_cache_recovery_record",
+            staticmethod(spy),
+        ):
+            self.build()
+        return [json.loads(w.decode("utf-8")) for w in writes]
+
+    def install_record(self, document: dict) -> None:
+        with open(self.recovery, "wb") as handle:
+            handle.write(
+                BranchStore._canonical_json(document).encode("utf-8")
+            )
+
+    def restore_targets(self, index: bytes, progress: bytes) -> None:
+        with open(self.index, "wb") as handle:
+            handle.write(index)
+        with open(self.progress, "wb") as handle:
+            handle.write(progress)
+
+    def assert_contradiction_keeps_evidence(
+        self, document: dict, index: bytes, progress: bytes
+    ) -> None:
+        self.restore_targets(index, progress)
+        self.install_record(document)
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        # Record, targets and any surviving backups stay for forensics.
+        self.assertTrue(os.path.exists(self.recovery))
+        self.assertEqual(_read(self.index), index)
+        self.assertEqual(_read(self.progress), progress)
+
+    def test_prepared_phase_with_both_targets_new_is_contradiction(self) -> None:
+        records = self.publish_capturing_records()
+        self.assertEqual(records[0]["phase"], "prepared")
+        self.assert_contradiction_keeps_evidence(
+            records[0], _read(self.index), _read(self.progress)
+        )
+
+    def test_prepared_phase_with_only_progress_new_is_contradiction(self) -> None:
+        records = self.publish_capturing_records()
+        self.assert_contradiction_keeps_evidence(
+            records[0], self.old_index, _read(self.progress)
+        )
+
+    def test_final_phase_with_progress_back_on_old_is_contradiction(self) -> None:
+        records = self.publish_capturing_records()
+        self.assertEqual(records[-1]["phase"], "progress")
+        self.assert_contradiction_keeps_evidence(
+            records[-1], _read(self.index), self.old_progress
+        )
+
+    def test_final_phase_with_both_targets_old_is_contradiction(self) -> None:
+        records = self.publish_capturing_records()
+        self.assert_contradiction_keeps_evidence(
+            records[-1], self.old_index, self.old_progress
+        )
+
+    def test_interrupted_rollback_residual_is_cleaned_up(self) -> None:
+        # (index, old, old): a previous recovery restored both targets
+        # and died before removing the record; finish the cleanup.
+        records = self.publish_capturing_records()
+        self.assertEqual(records[1]["phase"], "index")
+        self.restore_targets(self.old_index, self.old_progress)
+        self.install_record(records[1])
+        self.recover_now()
+        self.assertEqual(_read(self.index), self.old_index)
+        self.assertEqual(_read(self.progress), self.old_progress)
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+
+    def test_missing_required_backup_is_contradiction(self) -> None:
+        self.kill_publication_at("progress_replace")
+        record = self.record_document()
+        os.remove(os.path.join(self.tmp.name, record["index"]["backup"]))
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        self.assertTrue(os.path.exists(self.recovery))
+        backups = [
+            name
+            for name in os.listdir(self.tmp.name)
+            if name.startswith(".recovery-cache-backup-")
+        ]
+        self.assertEqual(len(backups), 1)
+
+    def test_identical_bytes_republication_interruption_converges(self) -> None:
+        # Republishing an unchanged chain records equal old and new
+        # digests; a death before the first phase advance must still
+        # converge instead of reading the state as a contradiction.
+        self.build()
+        index_before = _read(self.index)
+        progress_before = _read(self.progress)
+        self.kill_publication_at("index_replace")
+        self.assertEqual(self.record_document()["phase"], "prepared")
+        self.recover_now()
+        self.assertEqual(_read(self.index), index_before)
+        self.assertEqual(_read(self.progress), progress_before)
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+
+
+class RecordlessMixedVersionTests(RecoveryPublicationTestBase):
+    """With no recovery record the two caches must form one complete
+    version; a mixed version no valid record explains raises
+    :class:`ValueError` instead of being silently rebuilt."""
+
+    def test_progress_ahead_of_index_without_record(self) -> None:
+        self.grow_chain(4)
+        self.build()
+        old_index = _read(self.index)
+        self.grow_chain(3, start=20)
+        self.build()
+        with open(self.index, "wb") as handle:
+            handle.write(old_index)
+        self.assertFalse(os.path.exists(self.recovery))
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        with self.assertRaises(ValueError):
+            self.build()
+
+    def test_progress_without_index_without_record(self) -> None:
+        self.grow_chain(4)
+        self.build()
+        os.remove(self.index)
+        with self.assertRaises(ValueError):
+            self.recover_now()
+
+    def test_index_ahead_at_same_segment_size_without_record(self) -> None:
+        self.grow_chain(4)
+        self.build()
+        old_progress = _read(self.progress)
+        self.grow_chain(3, start=20)
+        self.build()
+        with open(self.progress, "wb") as handle:
+            handle.write(old_progress)
+        with self.assertRaises(ValueError):
+            self.recover_now()
+
+    def test_index_ahead_across_segment_size_change_is_complete(self) -> None:
+        self.grow_chain(4)
+        self.build()
+        self.grow_chain(2, start=20)
+        # Five frames with a segment size of ten has no complete
+        # segment: an index-only publication leaves the stale cursor.
+        head = BranchStore.build_recovery_audit_segments(
+            self.chain, self.index, 10, self.progress, self.recovery
+        )
+        self.assertEqual(head, self.head)
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+        # The lagging cursor at a different segment size is a complete
+        # version: recovery accepts it and a normal build goes on.
+        self.recover_now()
+        self.assertEqual(self.build(), self.head)
+        self.assertEqual(self.residue(), [])
+
+    def test_consistent_caches_without_record_pass(self) -> None:
+        self.grow_chain(4)
+        self.build()
+        self.recover_now()
+        self.assertEqual(self.residue(), [])
+
+
+class IndexOnlyPublicationRecoveryTests(RecoveryPublicationTestBase):
+    """An index-only publication (no complete segment yet) is also
+    driven through the recovery record: no target is ever replaced
+    outside the protocol."""
+
+    def test_index_only_publication_leaves_no_recovery_material(self) -> None:
+        head = self.grow_chain(1)
+        self.assertEqual(self.build(), head)
+        self.assertTrue(os.path.exists(self.index))
+        self.assertFalse(os.path.exists(self.progress))
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+
+    def test_index_only_death_before_replace_restores_absence(self) -> None:
+        self.grow_chain(1)
+        self.kill_publication_at("index_replace")
+        self.assertTrue(os.path.exists(self.recovery))
+        self.assertEqual(self.record_document()["phase"], "prepared")
+        self.recover_now()
+        self.assertFalse(os.path.exists(self.index))
+        self.assertFalse(os.path.exists(self.progress))
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+        self.assertEqual(self.build(), self.head)
+
+    def test_index_only_death_after_replace_restores_absence(self) -> None:
+        self.grow_chain(1)
+        self.kill_publication_at("record_after_index")
+        self.assertEqual(self.record_document()["phase"], "prepared")
+        self.assertTrue(os.path.exists(self.index))
+        self.recover_now()
+        self.assertFalse(os.path.exists(self.index))
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+        self.assertEqual(self.build(), self.head)
+
+    def test_index_only_record_describes_unchanged_progress(self) -> None:
+        self.grow_chain(4)
+        self.build()
+        self.grow_chain(1, start=20)
+        captured: dict[str, bytes] = {}
+        orig_write = BranchStore._write_cache_recovery_record
+
+        def spy(recovery_path, data):
+            captured.setdefault("data", bytes(data))
+            return orig_write(recovery_path, data)
+
+        with mock.patch.object(
+            BranchStore,
+            "_write_cache_recovery_record",
+            staticmethod(spy),
+        ):
+            BranchStore.build_recovery_audit_segments(
+                self.chain, self.index, 10, self.progress, self.recovery
+            )
+        document = json.loads(captured["data"].decode("utf-8"))
+        progress = document["progress"]
+        self.assertTrue(progress["old_exists"])
+        self.assertEqual(progress["old_digest"], progress["new_digest"])
+        self.assertEqual(self.residue(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5458,17 +5458,26 @@ class BranchStore:
         """Classify a target's on-disk bytes against a recovery record:
         ``"new"`` when it holds the published bytes, ``"old"`` when it
         holds the recorded previous bytes (or is absent as recorded),
-        anything else -- missing-while-recorded or unknown third bytes
-        -- raises :class:`ValueError`, because such a state cannot be
-        completed or rolled back safely."""
+        ``"same"`` when the recorded old and new digests coincide so the
+        bytes are both versions at once (a publication that changed
+        nothing, or a target the publication never replaced), anything
+        else -- missing-while-recorded or unknown third bytes -- raises
+        :class:`ValueError`, because such a state cannot be completed or
+        rolled back safely."""
         exists = os.path.lexists(target)
         if exists:
             digest = cls._sha256_file(target)
-            if hmac.compare_digest(digest, described["new_digest"]):
-                return "new"
-            if described["old_exists"] and hmac.compare_digest(
+            matches_new = hmac.compare_digest(
+                digest, described["new_digest"]
+            )
+            matches_old = described["old_exists"] and hmac.compare_digest(
                 digest, described["old_digest"]
-            ):
+            )
+            if matches_new and matches_old:
+                return "same"
+            if matches_new:
+                return "new"
+            if matches_old:
                 return "old"
             raise ValueError(
                 "recovery target content matches neither the recorded old "
@@ -5481,6 +5490,70 @@ class BranchStore:
             "existed"
         )
 
+    @staticmethod
+    def _cache_state_options(state: str) -> tuple[str, ...]:
+        """The concrete versions a classified target state can stand
+        for: ``"same"`` bytes are the recorded old and the recorded new
+        version at once, every other state is exactly one."""
+        if state == "same":
+            return ("old", "new")
+        return (state,)
+
+    @classmethod
+    def _reject_mixed_caches_without_record(
+        cls, index_path: str, progress_path: str
+    ) -> None:
+        """Reject a mixed cache version that no valid recovery record
+        explains. The caller holds the chain lock and no record exists.
+
+        Every two-cache publication removes its record only after the
+        complete new version of both targets is on disk, and an
+        index-only publication (no complete segment yet, so no progress
+        cursor is written) never leaves the progress cursor ahead of the
+        segment index. Without a record the caches are therefore a
+        complete version exactly when the cursor is absent, lags the
+        index only across a segment-size change, or pins the same frame
+        count and head. A cursor without an index, a cursor ahead of the
+        index, the two caches pinning different heads at the same frame
+        count, or a cursor lagging the index at the same segment size is
+        a mixed version the protocol could never have left behind and
+        raises :class:`ValueError`. A cache too defective to parse is
+        not provably mixed: it is left to the usual single rebuild."""
+        index_exists = os.path.lexists(index_path)
+        progress_exists = os.path.lexists(progress_path)
+        if not progress_exists:
+            return
+        if not index_exists:
+            raise ValueError(
+                "recovery cache progress cursor exists without its "
+                "segment index and no recovery record explains the "
+                "mixed version"
+            )
+        binding = cls._read_recovery_chain_segments(index_path)
+        payload = cls._read_recovery_progress(progress_path)
+        if binding is None or payload is None:
+            return
+        index_size, _version, index_frames, index_head, _fingerprint = (
+            binding
+        )
+        progress_frames = payload["frames"]
+        mixed = (
+            progress_frames > index_frames
+            or (
+                progress_frames == index_frames
+                and not hmac.compare_digest(payload["head"], index_head)
+            )
+            or (
+                progress_frames < index_frames
+                and payload["segment_size"] == index_size
+            )
+        )
+        if mixed:
+            raise ValueError(
+                "recovery caches hold mixed versions and no recovery "
+                "record explains the divergence"
+            )
+
     @classmethod
     def _recover_cache_publication_locked(
         cls,
@@ -5492,26 +5565,43 @@ class BranchStore:
         process. The caller holds the chain lock and invokes this before
         any cache, index or progress is used.
 
-        With no recovery record there is nothing to do. Otherwise the
-        record is parsed and checksummed strictly; when both targets
-        hold the recorded new bytes the new version is completed and the
-        old-version backups are removed. Every other recoverable state
+        With no recovery record the caches must form one complete
+        version (see :meth:`_reject_mixed_caches_without_record`); a
+        mixed version no valid record explains raises
+        :class:`ValueError`. Otherwise the record is parsed and
+        checksummed strictly and its phase is cross-checked against both
+        targets' current bytes: only a state combination the
+        publication protocol itself can have left behind is converged.
+        When both targets hold the recorded new bytes and the phase
+        allows committing (a replacement's record was still due, or
+        cleanup was interrupted) the new version is completed and the
+        old-version backups are removed. Every other reachable state
         rolls both targets back: a target still holding the new bytes is
         either restored byte-for-byte from its named backup or, when it
         did not exist before, removed; a target already holding the old
         bytes is left alone (an earlier recovery attempt may have
-        crashed after restoring it). Backups and the directory are synced
-        as each restoration lands, and the record is removed only after
-        every restoration, cleanup and directory sync has succeeded.
+        crashed after restoring it). Backups and the directory are
+        synced as each restoration lands, and the record is removed only
+        after every restoration, cleanup and directory sync has
+        succeeded.
 
-        An unparseable record, bad fields/checksum, target bytes from an
-        unknown version or corrupt backup content raises
-        :class:`ValueError` and leaves every target, backup and the
-        record untouched as evidence; a missing parent directory or any
-        open, read, write, flush, replace, delete or sync failure raises
-        :class:`OSError`, also with all recovery material retained.
+        A phase that contradicts the target digests (both targets new
+        while the record says nothing was replaced, or any target back
+        on the old version after the final phase was recorded) is
+        unreachable and raises :class:`ValueError` -- the targets
+        superficially agreeing never justifies deleting the record. An
+        unparseable record, bad fields/checksum, target bytes from an
+        unknown version or a missing or corrupt required backup also
+        raises :class:`ValueError` and leaves every target, backup and
+        the record untouched as evidence; a missing parent directory or
+        any open, read, write, flush, replace, delete or sync failure
+        raises :class:`OSError`, also with all recovery material
+        retained.
         """
         if not os.path.lexists(recovery_path):
+            cls._reject_mixed_caches_without_record(
+                index_path, progress_path
+            )
             return
         directory = os.path.dirname(os.path.abspath(recovery_path))
         with open(recovery_path, "rb") as handle:
@@ -5526,7 +5616,47 @@ class BranchStore:
             label: cls._cache_target_state(target, described)
             for label, target, described in targets
         }
-        if states["index"] == "new" and states["progress"] == "new":
+        phase = record["phase"]
+        # Committing is only possible once the record shows the index
+        # replacement landed (a later replacement or the cleanup may
+        # still have been in flight) and both targets hold the recorded
+        # new bytes.
+        commit_allowed = phase in (
+            cls._RECOVERY_CACHE_PHASE_INDEX,
+            cls._RECOVERY_CACHE_PHASE_PROGRESS,
+        ) and all(
+            state in ("new", "same") for state in states.values()
+        )
+        # The (index, progress) version combinations each phase can
+        # have left behind, including the residuals of a recovery
+        # attempt that was itself interrupted mid-rollback. The final
+        # phase is never rolled back, so it admits no rollback state.
+        rollback_states = {
+            cls._RECOVERY_CACHE_PHASE_PREPARED: (
+                ("old", "old"),
+                ("new", "old"),
+            ),
+            cls._RECOVERY_CACHE_PHASE_INDEX: (
+                ("old", "old"),
+                ("new", "old"),
+                ("old", "new"),
+                ("new", "new"),
+            ),
+        }
+        rollback_allowed = phase in rollback_states and any(
+            (index_state, progress_state) in rollback_states[phase]
+            for index_state in cls._cache_state_options(states["index"])
+            for progress_state in cls._cache_state_options(
+                states["progress"]
+            )
+        )
+        if not commit_allowed and not rollback_allowed:
+            raise ValueError(
+                "recovery record phase contradicts the cache target "
+                "contents"
+            )
+
+        if commit_allowed:
             # Both replacements (and their directory entries) survived:
             # complete the new version by discarding the old bytes. An
             # earlier attempt may already have removed some backups
@@ -5555,6 +5685,11 @@ class BranchStore:
                 continue
             backup_path = os.path.join(directory, described["backup"])
             if states[label] == "new":
+                if not os.path.lexists(backup_path):
+                    raise ValueError(
+                        "recovery backup needed to restore a target is "
+                        "missing"
+                    )
                 backup_digest = cls._sha256_file(backup_path)
                 if not hmac.compare_digest(
                     backup_digest, described["old_digest"]
@@ -5602,26 +5737,33 @@ class BranchStore:
         index_path: str,
         index_tmp: str,
         progress_path: str,
-        progress_tmp: str,
+        progress_tmp: str | None,
         recovery_path: str,
     ) -> None:
-        """Publish the new index and progress caches under the
-        cross-process recovery protocol. The caller holds the chain
-        lock and has already flushed and fsync-ed both temp files; this
-        routine owns the durable publication sequence and cleanup.
+        """Publish the new caches under the cross-process recovery
+        protocol. The caller holds the chain lock and has already
+        flushed and fsync-ed every temp file; this routine owns the
+        durable publication sequence and cleanup.
 
-        Both pre-existing targets are streamed byte-for-byte into
-        durable backups in the shared directory first. The recovery
+        ``progress_tmp`` is ``None`` for an index-only publication (no
+        complete segment exists yet, so no new cursor was built): the
+        progress target is then recorded unchanged -- its current bytes
+        as both the old and the new version, or its continued absence --
+        and never replaced, but it still appears in the record so no
+        target is ever replaced outside the protocol.
+
+        Every pre-existing target is streamed byte-for-byte into a
+        durable backup in the shared directory first. The recovery
         record -- version, phase, both targets' old/new existence and
         SHA-256 digests and the backup names, covered by a checksum over
         every other field -- is then durably published *before* the
         first target is replaced. After each atomic replacement (and its
         directory syncs) the record is rewritten and synced with the
-        advanced phase. Only once both targets carry the new bytes are
-        the old backups and, last, the record removed, so a process
-        dying at any point leaves the next entry-point call enough
-        durable evidence to commit the complete new version or restore
-        the complete old one.
+        advanced phase. Only once every replacement has landed are the
+        old backups and, last, the record removed, so a process dying at
+        any point leaves the next entry-point call enough durable
+        evidence to commit the complete new version or restore the
+        complete old one.
 
         Any in-process failure first converges the on-disk publication
         with the same recovery routine the next process would run, so
@@ -5637,7 +5779,6 @@ class BranchStore:
                 (index_path, index_tmp),
                 (progress_path, progress_tmp),
             ):
-                new_digest = cls._sha256_file(tmp_path)
                 if os.path.lexists(target):
                     old_digest = cls._sha256_file(target)
                     backup_path = cls._backup_cache_file(target)
@@ -5653,6 +5794,11 @@ class BranchStore:
                     old_digest = ""
                     backup_path = None
                     backup_name = ""
+                new_digest = (
+                    cls._sha256_file(tmp_path)
+                    if tmp_path is not None
+                    else old_digest
+                )
                 prepared.append(
                     {
                         "target": target,
@@ -5692,14 +5838,17 @@ class BranchStore:
                     progress_desc,
                 ),
             )
-            phases = (
+            phases = [
                 (index_path, index_tmp, cls._RECOVERY_CACHE_PHASE_INDEX),
-                (
-                    progress_path,
-                    progress_tmp,
-                    cls._RECOVERY_CACHE_PHASE_PROGRESS,
-                ),
-            )
+            ]
+            if progress_tmp is not None:
+                phases.append(
+                    (
+                        progress_path,
+                        progress_tmp,
+                        cls._RECOVERY_CACHE_PHASE_PROGRESS,
+                    )
+                )
             for target, tmp_path, phase in phases:
                 cls._fsync_directory(directory)
                 os.replace(tmp_path, target)
@@ -5740,9 +5889,10 @@ class BranchStore:
                         with contextlib.suppress(OSError):
                             os.remove(backup_path)
             for entry in prepared:
-                if os.path.lexists(entry["tmp"]):
+                tmp_path = entry["tmp"]
+                if tmp_path is not None and os.path.lexists(tmp_path):
                     with contextlib.suppress(OSError):
-                        os.remove(entry["tmp"])
+                        os.remove(tmp_path)
             raise
 
     @classmethod
@@ -6792,12 +6942,12 @@ class BranchStore:
                             "authenticated chain"
                         )
                     publications.append((progress_path, progress_tmp))
-            if recovery_path is not None and progress_tmp is not None:
-                # Both caches are being replaced: publish them under the
-                # cross-process recovery protocol. An index-only update
-                # (no complete segment exists yet, so no progress temp
-                # was built) has no second version to protect and uses
-                # the single-cache rollback path instead; any earlier
+            if recovery_path is not None:
+                # Every cache publication with a recovery path goes
+                # through the cross-process recovery protocol -- an
+                # index-only update (no complete segment exists yet, so
+                # no progress temp was built) included, with the
+                # progress target recorded unchanged. Any earlier
                 # two-cache publication was already resolved before the
                 # caches were read.
                 cls._publish_caches_recovery_locked(
@@ -7043,7 +7193,7 @@ class BranchStore:
                         with contextlib.suppress(OSError):
                             os.remove(progress_tmp)
                     return count, head, captured
-            if recovery_path is not None and progress_tmp is not None:
+            if recovery_path is not None:
                 cls._publish_caches_recovery_locked(
                     index_path,
                     index_tmp,
@@ -7102,13 +7252,17 @@ class BranchStore:
         (otherwise :class:`ValueError`). Given a recovery path, every
         call first finishes an earlier process's interrupted
         publication: when the index and progress both carry the
-        recorded new version the new version is completed and the old
-        backups are removed, and every other recoverable state is
-        rolled back to the old version byte-for-byte (restoring absence
-        when the old target did not exist); only then does
-        authentication, a resuming build or a query begin. An
-        unparseable, malformed or checksum-bad recovery record, a
-        target matching neither recorded digest or a corrupt backup
+        recorded new version and the recorded phase allows committing,
+        the new version is completed and the old backups are removed,
+        and every other reachable state is rolled back to the old
+        version byte-for-byte (restoring absence when the old target did
+        not exist); only then does authentication, a resuming build or a
+        query begin. With no record present the two caches must form one
+        complete version -- a mixed index/progress version no valid
+        record explains raises :class:`ValueError`, as does a record
+        phase that contradicts the target digests. An unparseable,
+        malformed or checksum-bad recovery record, a target matching
+        neither recorded digest or a missing or corrupt required backup
         raises :class:`ValueError` with all targets, backups and the
         record preserved as evidence; a missing parent directory or a
         failed open, read, write, flush, replace, delete or directory
