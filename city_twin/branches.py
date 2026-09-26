@@ -5452,24 +5452,50 @@ class BranchStore:
                     os.remove(tmp_path)
 
     @classmethod
+    def _remove_cache_record_temps(
+        cls, directory: str, recovery_path: str
+    ) -> None:
+        """Remove leftover temp files of interrupted recovery-record
+        writes from ``directory``. Every such file is provably protocol
+        owned: record temps carry the protocol's own fixed prefix and
+        are only ever created and consumed while the chain lock is
+        held, so any survivor is debris from a dead process. The record
+        itself and every other directory entry are left untouched;
+        listing or removal failures propagate as :class:`OSError`."""
+        record_name = os.path.basename(os.path.abspath(recovery_path))
+        for name in os.listdir(directory):
+            if name == record_name:
+                continue
+            if name.startswith(".recovery-cache-record-") and (
+                name.endswith(".tmp")
+            ):
+                os.remove(os.path.join(directory, name))
+
+    @classmethod
     def _cache_target_state(
         cls, target: str, described: dict[str, Any]
     ) -> str:
         """Classify a target's on-disk bytes against a recovery record:
-        ``"new"`` when it holds the published bytes, ``"old"`` when it
-        holds the recorded previous bytes (or is absent as recorded),
-        anything else -- missing-while-recorded or unknown third bytes
-        -- raises :class:`ValueError`, because such a state cannot be
-        completed or rolled back safely."""
+        ``"old"`` when it holds the recorded previous bytes (or is
+        absent as recorded), ``"new"`` when it holds the published
+        bytes, anything else -- missing-while-recorded or unknown third
+        bytes -- raises :class:`ValueError`, because such a state cannot
+        be completed or rolled back safely.
+
+        When the recorded old and new digests coincide (a republication
+        of identical bytes) the target satisfies both; it is reported as
+        ``"old"`` so a lagging record phase can never condemn a target
+        that was simply never displaced, and finishing either way is
+        byte-for-byte equivalent."""
         exists = os.path.lexists(target)
         if exists:
             digest = cls._sha256_file(target)
-            if hmac.compare_digest(digest, described["new_digest"]):
-                return "new"
             if described["old_exists"] and hmac.compare_digest(
                 digest, described["old_digest"]
             ):
                 return "old"
+            if hmac.compare_digest(digest, described["new_digest"]):
+                return "new"
             raise ValueError(
                 "recovery target content matches neither the recorded old "
                 "nor new digest"
@@ -5493,23 +5519,37 @@ class BranchStore:
         any cache, index or progress is used.
 
         With no recovery record there is nothing to do. Otherwise the
-        record is parsed and checksummed strictly; when both targets
-        hold the recorded new bytes the new version is completed and the
-        old-version backups are removed. Every other recoverable state
-        rolls both targets back: a target still holding the new bytes is
-        either restored byte-for-byte from its named backup or, when it
-        did not exist before, removed; a target already holding the old
-        bytes is left alone (an earlier recovery attempt may have
-        crashed after restoring it). Backups and the directory are synced
-        as each restoration lands, and the record is removed only after
-        every restoration, cleanup and directory sync has succeeded.
+        record is parsed and checksummed strictly and the decision
+        weighs the recorded phase, both targets' current bytes against
+        their recorded old and new digests, and the state of the named
+        backups. Only state combinations the publication protocol can
+        have produced are acted on: when both targets hold the recorded
+        new bytes and the phase permits committing, the new version is
+        completed by discarding the old backups, any leftover
+        record-write temp and, last, the record; every other producible
+        state rolls both targets back -- a target still holding the new
+        bytes is either restored byte-for-byte from its named backup or,
+        when it did not exist before, removed, and a target already
+        holding the old bytes is left alone (an earlier recovery attempt
+        may have crashed after restoring it). Backups and the directory
+        are synced as each restoration lands, and the record is removed
+        only after every restoration, cleanup and directory sync has
+        succeeded, so an interrupted recovery is simply continued from
+        the persisted record by the next call.
 
-        An unparseable record, bad fields/checksum, target bytes from an
-        unknown version or corrupt backup content raises
-        :class:`ValueError` and leaves every target, backup and the
-        record untouched as evidence; a missing parent directory or any
-        open, read, write, flush, replace, delete or sync failure raises
-        :class:`OSError`, also with all recovery material retained.
+        A ``prepared`` record can never coexist with new-version bytes
+        in the progress target -- the progress replacement only starts
+        after the index-phase record is durable -- so that combination
+        is a contradiction, never a commit: the superficial agreement of
+        both targets with the new digests must not delete the backups
+        and record that are the only evidence. An unparseable record,
+        bad fields/checksum, such an unreachable phase/digest
+        combination, target bytes from an unknown version, or a required
+        backup that is missing or corrupt raises :class:`ValueError` and
+        leaves every target, backup, temp and the record untouched as
+        evidence; a missing parent directory or any open, read, write,
+        flush, replace, delete or sync failure raises :class:`OSError`,
+        also with all recovery material retained.
         """
         if not os.path.lexists(recovery_path):
             return
@@ -5526,12 +5566,34 @@ class BranchStore:
             label: cls._cache_target_state(target, described)
             for label, target, described in targets
         }
+        if record["phase"] == cls._RECOVERY_CACHE_PHASE_PREPARED and (
+            states["progress"] == "new"
+        ):
+            raise ValueError(
+                "recovery record phase 'prepared' contradicts the "
+                "progress target's new-version bytes"
+            )
         if states["index"] == "new" and states["progress"] == "new":
             # Both replacements (and their directory entries) survived:
-            # complete the new version by discarding the old bytes. An
-            # earlier attempt may already have removed some backups
-            # before dying short of the record unlink, so their absence
-            # here is expected.
+            # complete the new version by discarding the old bytes.
+            # Every surviving backup is verified against the recorded
+            # old digest before anything is removed -- corrupt evidence
+            # is never deleted quietly. An earlier attempt may already
+            # have removed some backups before dying short of the record
+            # unlink, so their absence here is expected.
+            for _label, _target, described in targets:
+                if not described["old_exists"]:
+                    continue
+                backup_path = os.path.join(directory, described["backup"])
+                if os.path.lexists(backup_path):
+                    backup_digest = cls._sha256_file(backup_path)
+                    if not hmac.compare_digest(
+                        backup_digest, described["old_digest"]
+                    ):
+                        raise ValueError(
+                            "recovery backup content does not match the "
+                            "recorded old digest"
+                        )
             for _label, _target, described in targets:
                 if described["old_exists"]:
                     backup_path = os.path.join(
@@ -5539,13 +5601,14 @@ class BranchStore:
                     )
                     if os.path.lexists(backup_path):
                         os.remove(backup_path)
+            cls._remove_cache_record_temps(directory, recovery_path)
             cls._fsync_directory(directory)
             os.remove(recovery_path)
             cls._fsync_directory(directory)
             return
 
         # Rollback path: verify every backup before any target is
-        # restored or any backup unlinked. A target still carrying the
+        # restored or any backup unlinked. A target still holding the
         # new bytes requires its backup to be present and byte-for-byte
         # the recorded old bytes; a target already on the old bytes has
         # no need for its backup, but a surviving backup that is corrupt
@@ -5555,6 +5618,11 @@ class BranchStore:
                 continue
             backup_path = os.path.join(directory, described["backup"])
             if states[label] == "new":
+                if not os.path.lexists(backup_path):
+                    raise ValueError(
+                        "recovery backup required to restore a target is "
+                        "missing"
+                    )
                 backup_digest = cls._sha256_file(backup_path)
                 if not hmac.compare_digest(
                     backup_digest, described["old_digest"]
@@ -5586,12 +5654,14 @@ class BranchStore:
                 os.remove(target)
             cls._fsync_directory(directory)
         # Every target is back on the old version now; discard the
-        # backups that are still present and, only last, the record.
+        # backups that are still present and any temp an interrupted
+        # record write left behind and, only last, the record.
         for _label, _target, described in targets:
             if described["old_exists"]:
                 backup_path = os.path.join(directory, described["backup"])
                 if os.path.lexists(backup_path):
                     os.remove(backup_path)
+        cls._remove_cache_record_temps(directory, recovery_path)
         cls._fsync_directory(directory)
         os.remove(recovery_path)
         cls._fsync_directory(directory)
@@ -5627,8 +5697,12 @@ class BranchStore:
         with the same recovery routine the next process would run, so
         the raising call never strands a mixed version; failures of that
         convergence propagate as :class:`OSError` with all evidence
-        retained. The canonical chain and all generation state are
-        untouched either way.
+        retained. When no durable record exists the targets must still
+        hold exactly the old bytes; any that do not are a mixed version
+        without a valid record, which raises :class:`ValueError` with
+        every target, backup and temp retained for forensics. The
+        canonical chain and all generation state are untouched either
+        way.
         """
         directory = os.path.dirname(os.path.abspath(index_path))
         prepared: list[dict[str, Any]] = []
@@ -5714,6 +5788,7 @@ class BranchStore:
             for entry in prepared:
                 if entry["backup_path"] is not None:
                     os.remove(entry["backup_path"])
+            cls._remove_cache_record_temps(directory, recovery_path)
             cls._fsync_directory(directory)
             os.remove(recovery_path)
             cls._fsync_directory(directory)
@@ -5729,6 +5804,30 @@ class BranchStore:
                     index_path, progress_path, recovery_path
                 )
             else:
+                # The record was never durable, so no replacement from
+                # this call could have become visible and every target
+                # must still hold its recorded old bytes. A target that
+                # does not is a mixed version without a valid record:
+                # retain every target, backup and temp as evidence and
+                # raise ValueError instead of cleaning anything up.
+                disturbed = False
+                for entry in prepared:
+                    target = entry["target"]
+                    if os.path.lexists(target):
+                        if not entry["old_exists"] or (
+                            not hmac.compare_digest(
+                                cls._sha256_file(target),
+                                entry["old_digest"],
+                            )
+                        ):
+                            disturbed = True
+                    elif entry["old_exists"]:
+                        disturbed = True
+                if disturbed:
+                    raise ValueError(
+                        "cache targets no longer hold the old version "
+                        "and no durable recovery record exists"
+                    )
                 # The record was never durable, so no replacement could
                 # have become visible: discard this call's backups and
                 # temps without touching the targets.

@@ -21,6 +21,15 @@ These tests cover:
   index/progress version;
 * malformed records, digest/phase contradictions and corrupt backups
   raising :class:`ValueError` with all evidence retained;
+* unreachable phase/digest combinations -- a ``prepared`` record
+  coexisting with new-version progress bytes -- never committing or
+  rolling back, and missing or corrupt required backups raising
+  :class:`ValueError` with record, targets, backups and temps kept;
+* commit and rollback cleanup removing only protocol-owned temp files
+  and never other directory entries;
+* identical republications under a lagging record phase recovering
+  cleanly, and a disturbed target without a durable record raising
+  :class:`ValueError`;
 * missing directories and failed restore/cleanup/sync steps raising
   :class:`OSError` without swallowing files later recovery needs;
 * argument validation order, type/value errors, aliasing and the
@@ -702,6 +711,167 @@ class RecordAndEvidenceFailureTests(RecoveryPublicationTestBase):
         self.recover_now()
         self.assertFalse(os.path.exists(self.recovery))
         self.assertEqual(self.residue(), [])
+
+
+class RecoveryStateMachineClosureTests(RecoveryPublicationTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.grow_chain(5)
+        self.build()
+        self.old_index = _read(self.index)
+        self.old_progress = _read(self.progress)
+        self.grow_chain(3, start=20)
+
+    def _rewrite_record_phase(self, phase: str) -> None:
+        document = self.record_document()
+        raw = BranchStore._cache_recovery_record_bytes(
+            phase, document["index"], document["progress"]
+        )
+        with open(self.recovery, "wb") as handle:
+            handle.write(raw)
+
+    def _backups(self) -> list:
+        return [
+            name
+            for name in os.listdir(self.tmp.name)
+            if name.startswith(".recovery-cache-backup-")
+        ]
+
+    def test_prepared_record_with_new_targets_is_contradiction(self) -> None:
+        # Both targets carry the new version but the record says
+        # "prepared" -- a combination the protocol cannot produce, so
+        # the superficial agreement must not delete the evidence.
+        self.kill_publication_at("record_after_progress")
+        self._rewrite_record_phase("prepared")
+        new_index = _read(self.index)
+        new_progress = _read(self.progress)
+        backups = self._backups()
+        self.assertEqual(len(backups), 2)
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        self.assertEqual(self.record_document()["phase"], "prepared")
+        self.assertEqual(_read(self.index), new_index)
+        self.assertEqual(_read(self.progress), new_progress)
+        self.assertEqual(self._backups(), backups)
+
+    def test_prepared_record_with_new_progress_only_is_contradiction(
+        self,
+    ) -> None:
+        self.kill_publication_at("record_after_progress")
+        record = self.record_document()
+        os.replace(
+            os.path.join(self.tmp.name, record["index"]["backup"]),
+            self.index,
+        )
+        self._rewrite_record_phase("prepared")
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        self.assertTrue(os.path.exists(self.recovery))
+        self.assertEqual(_read(self.index), self.old_index)
+        self.assertNotEqual(_read(self.progress), self.old_progress)
+
+    def test_missing_required_backup_is_value_error(self) -> None:
+        self.kill_publication_at("progress_replace")
+        record = self.record_document()
+        os.remove(os.path.join(self.tmp.name, record["index"]["backup"]))
+        new_index = _read(self.index)
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        # Everything still needed for forensics is retained.
+        self.assertTrue(os.path.exists(self.recovery))
+        self.assertEqual(_read(self.index), new_index)
+        self.assertEqual(_read(self.progress), self.old_progress)
+        self.assertEqual(len(self._backups()), 1)
+
+    def test_commit_with_corrupt_backup_is_value_error(self) -> None:
+        self.kill_publication_at("cleanup")
+        record = self.record_document()
+        backup_path = os.path.join(
+            self.tmp.name, record["index"]["backup"]
+        )
+        with open(backup_path, "wb") as handle:
+            handle.write(b"corrupt backup bytes")
+        orphan = os.path.join(self.tmp.name, ".recovery-cache-record-zz.tmp")
+        with open(orphan, "wb") as handle:
+            handle.write(b"orphan")
+        new_index = _read(self.index)
+        with self.assertRaises(ValueError):
+            self.recover_now()
+        # The corrupt backup, the orphan temp and the record all stay.
+        self.assertEqual(_read(backup_path), b"corrupt backup bytes")
+        self.assertEqual(_read(orphan), b"orphan")
+        self.assertTrue(os.path.exists(self.recovery))
+        self.assertEqual(_read(self.index), new_index)
+
+    def test_commit_cleanup_removes_only_protocol_temps(self) -> None:
+        self.kill_publication_at("cleanup")
+        orphan = os.path.join(self.tmp.name, ".recovery-cache-record-zz.tmp")
+        with open(orphan, "wb") as handle:
+            handle.write(b"orphan")
+        unrelated = os.path.join(self.tmp.name, "unrelated.txt")
+        with open(unrelated, "wb") as handle:
+            handle.write(b"keep")
+        new_index = _read(self.index)
+        new_progress = _read(self.progress)
+        self.recover_now()
+        self.assertEqual(_read(self.index), new_index)
+        self.assertEqual(_read(self.progress), new_progress)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertEqual(_read(unrelated), b"keep")
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+
+    def test_rollback_cleanup_removes_only_protocol_temps(self) -> None:
+        self.kill_publication_at("progress_replace")
+        orphan = os.path.join(self.tmp.name, ".recovery-cache-record-zz.tmp")
+        with open(orphan, "wb") as handle:
+            handle.write(b"orphan")
+        unrelated = os.path.join(self.tmp.name, "unrelated.txt")
+        with open(unrelated, "wb") as handle:
+            handle.write(b"keep")
+        self.recover_now()
+        self.assertEqual(_read(self.index), self.old_index)
+        self.assertEqual(_read(self.progress), self.old_progress)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertEqual(_read(unrelated), b"keep")
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+
+    def test_identical_republication_recovers_cleanly(self) -> None:
+        # Rebuilding an unchanged chain republishes identical bytes; a
+        # crash leaving a "prepared" record is an ordinary reachable
+        # state, not a contradiction.
+        self.assertEqual(self.build(), self.head)
+        same_index = _read(self.index)
+        same_progress = _read(self.progress)
+        self.kill_publication_at("index_replace")
+        self.assertEqual(self.record_document()["phase"], "prepared")
+        self.recover_now()
+        self.assertEqual(_read(self.index), same_index)
+        self.assertEqual(_read(self.progress), same_progress)
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertEqual(self.residue(), [])
+        self.assertEqual(self.build(), self.head)
+
+    def test_disturbed_target_without_record_is_value_error(self) -> None:
+        def disturbing_write(recovery_path, data):
+            # The record never becomes durable, yet a target moves.
+            with open(self.index, "ab") as handle:
+                handle.write(b"x")
+            raise OSError("simulated record write failure")
+
+        with mock.patch.object(
+            BranchStore,
+            "_write_cache_recovery_record",
+            staticmethod(disturbing_write),
+        ):
+            with self.assertRaises(ValueError):
+                self.build()
+        self.assertFalse(os.path.exists(self.recovery))
+        self.assertNotEqual(_read(self.index), self.old_index)
+        self.assertEqual(_read(self.progress), self.old_progress)
+        # The backups of the old version are retained as evidence.
+        self.assertTrue(self._backups())
 
 
 class PreparationFailureTests(RecoveryPublicationTestBase):
