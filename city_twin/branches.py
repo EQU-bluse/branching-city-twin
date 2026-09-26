@@ -253,6 +253,80 @@ class _CanonicalJsonStream:
             "recovery chain is not valid JSON: unexpected content"
         )
 
+    #: Largest single object :meth:`read_raw_object` will return. A
+    #: legal segment record is a small fixed-shape object, so this bound
+    #: is generous while keeping the raw read memory-bounded on a
+    #: damaged document.
+    _RAW_OBJECT_LIMIT = 65536
+
+    def read_raw_object(self) -> bytes:
+        """Read the JSON object starting at the current byte and
+        return its exact bytes, braces included, without
+        canonicalizing. Nested objects/arrays are tracked and string
+        contents (with escapes) are skipped; an unexpected end or an
+        object longer than :attr:`_RAW_OBJECT_LIMIT` raises
+        :class:`ValueError`. The caller separately parses and
+        canonicalizes the returned bytes, so only one small object is
+        ever held."""
+        raw = bytearray()
+        raw.append(self.take())  # must be the opening brace
+        if raw[-1] != 0x7B:  # '{'
+            raise ValueError("expected a JSON object")
+        depth = 1
+        in_string = False
+        escaped = False
+        while depth:
+            byte = self.take()
+            raw.append(byte)
+            if len(raw) > self._RAW_OBJECT_LIMIT:
+                raise ValueError("JSON object is larger than the limit")
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif byte == 0x5C:  # '\\'
+                    escaped = True
+                elif byte == 0x22:  # '"'
+                    in_string = False
+                continue
+            if byte == 0x22:  # '"'
+                in_string = True
+            elif byte == 0x7B or byte == 0x5B:  # '{' or '['
+                depth += 1
+            elif byte == 0x7D or byte == 0x5D:  # '}' or ']'
+                depth -= 1
+        return bytes(raw)
+
+
+class _HashingTee:
+    """Forward :meth:`read`/:meth:`write` calls to a binary file while
+    folding every passing byte into a SHA-256 hasher, so a streamed
+    document can be digested without ever materializing its bytes."""
+
+    __slots__ = ("_file", "_hasher")
+
+    def __init__(self, fileobj: Any, hasher: Any) -> None:
+        self._file = fileobj
+        self._hasher = hasher
+
+    @property
+    def hexdigest(self) -> Any:
+        return self._hasher.hexdigest
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._file.read(size)
+        self._hasher.update(data)
+        return data
+
+    def write(self, data: bytes) -> int:
+        self._hasher.update(data)
+        return self._file.write(data)
+
+    def flush(self) -> None:
+        self._file.flush()
+
+    def fileno(self) -> int:
+        return self._file.fileno()
+
 
 class _ChainSegmenter:
     """Fold an authenticated recovery-chain frame stream into segments.
@@ -277,6 +351,11 @@ class _ChainSegmenter:
         "_last",
         "_last_digest",
         "_hasher",
+        "_prefix_hasher",
+        "_records_hasher",
+        "_completed",
+        "_completed_digest",
+        "_completed_prefix_digest",
     )
 
     def __init__(
@@ -291,21 +370,69 @@ class _ChainSegmenter:
         self._last = 0
         self._last_digest = ""
         self._hasher = hashlib.sha256()
+        # Running hash over every folded frame's canonical bytes; the
+        # snapshot at a complete-segment boundary pins the exact chain
+        # prefix a resuming build re-checks.
+        self._prefix_hasher = hashlib.sha256()
+        # Hash over the canonical bytes of every emitted segment record
+        # in order, i.e. the fingerprint a freshly published index must
+        # carry item for item.
+        self._records_hasher = hashlib.sha256()
+        # Sequence number and digest of the last full-size segment's
+        # final frame (zero and the empty-prefix digest until one full
+        # segment exists); a short trailing segment never advances the
+        # resumable boundary.
+        self._completed = 0
+        self._completed_digest = ""
+        self._completed_prefix_digest = hashlib.sha256(b"").hexdigest()
+
+    @property
+    def completed_boundary(self) -> int:
+        """Sequence number of the last full-size segment boundary."""
+        return self._completed
+
+    @property
+    def completed_boundary_digest(self) -> str:
+        """Digest of the frame at :attr:`completed_boundary`."""
+        return self._completed_digest
+
+    @property
+    def completed_prefix_digest(self) -> str:
+        """SHA-256 of the canonical frame bytes folded through
+        :attr:`completed_boundary` (the empty-input digest before the
+        first full-size segment exists)."""
+        return self._completed_prefix_digest
+
+    @property
+    def published_fingerprint(self) -> str:
+        """SHA-256 over every emitted segment record's canonical bytes
+        in emission order."""
+        return self._records_hasher.hexdigest()
 
     def _reset(self) -> None:
         self._count = 0
         self._hasher = hashlib.sha256()
 
     def _emit(self) -> None:
-        self._on_segment(
-            {
-                "first": self._first,
-                "last": self._last,
-                "first_digest": self._first_digest,
-                "last_digest": self._last_digest,
-                "digest": self._hasher.hexdigest(),
-            }
+        record = {
+            "first": self._first,
+            "last": self._last,
+            "first_digest": self._first_digest,
+            "last_digest": self._last_digest,
+            "digest": self._hasher.hexdigest(),
+        }
+        self._on_segment(record)
+        self._records_hasher.update(
+            self._canonical(record).encode("utf-8")
         )
+        # Only a full-size segment is a resumable boundary; a short
+        # trailing segment is rebuilt wholesale on the next append.
+        if self._count == self._size:
+            self._completed = self._last
+            self._completed_digest = self._last_digest
+            self._completed_prefix_digest = (
+                self._prefix_hasher.copy().hexdigest()
+            )
         self._reset()
 
     def on_frame(self, frame: dict[str, Any]) -> None:
@@ -317,17 +444,33 @@ class _ChainSegmenter:
             self._first_digest = frame["digest"]
         self._last = frame["seq"]
         self._last_digest = frame["digest"]
-        self._hasher.update(
-            self._canonical(
-                {
-                    "seq": frame["seq"],
-                    "prev": frame["prev"],
-                    "record": frame["record"],
-                    "digest": frame["digest"],
-                }
-            ).encode("utf-8")
-        )
+        frame_bytes = self._canonical(
+            {
+                "seq": frame["seq"],
+                "prev": frame["prev"],
+                "record": frame["record"],
+                "digest": frame["digest"],
+            }
+        ).encode("utf-8")
+        self._hasher.update(frame_bytes)
+        self._prefix_hasher.update(frame_bytes)
         self._count += 1
+
+    def open_segment_evidence(self) -> dict[str, Any] | None:
+        """The segment record the accumulator would emit right now
+        without emitting it, or ``None`` when the accumulator is empty.
+        A resuming build compares this against the previous index's
+        trailing (short) segment to prove the frames past the last
+        complete boundary are byte-for-byte unchanged."""
+        if not self._count:
+            return None
+        return {
+            "first": self._first,
+            "last": self._last,
+            "first_digest": self._first_digest,
+            "last_digest": self._last_digest,
+            "digest": self._hasher.hexdigest(),
+        }
 
     def finish(self) -> None:
         """Emit the trailing segment when one is partially filled."""
@@ -2637,6 +2780,31 @@ class BranchStore:
         "digest",
     )
 
+    #: Resumable build progress (see
+    #: :meth:`build_recovery_audit_segments`). The progress document
+    #: binds the segment size, the last complete-segment boundary, the
+    #: authenticated frame count and chain head, and digests of the chain
+    #: prefix through that boundary, the prefix's canonical frame bytes
+    #: and the matching segment index's canonical bytes. It is a
+    #: disposable cache like the segment index: it never stores audit
+    #: bodies and the canonical chain stays the sole trusted source.
+    _RECOVERY_CHAIN_PROGRESS_FORMAT = (
+        "branching-city-twin/recovery-audit-chain-progress"
+    )
+    _RECOVERY_CHAIN_PROGRESS_VERSION = 1
+    _RECOVERY_CHAIN_PROGRESS_SUPPORTED_VERSIONS = (1,)
+    _RECOVERY_CHAIN_PROGRESS_KEYS = (
+        "format",
+        "version",
+        "segment_size",
+        "boundary",
+        "boundary_digest",
+        "frames",
+        "head",
+        "prefix_digest",
+        "index_digest",
+    )
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -3853,6 +4021,39 @@ class BranchStore:
             )
 
     @classmethod
+    def _validate_progress_path(cls, progress_path: Any) -> None:
+        """Validate a ``progress_path`` argument: only ``None`` or a
+        non-empty :class:`str` is accepted. ``None`` opts out of
+        resumable builds; a non-``str`` raises :class:`TypeError` and an
+        empty string :class:`ValueError`."""
+        if progress_path is None:
+            return
+        if not isinstance(progress_path, str):
+            raise TypeError(
+                "progress_path must be None or a str, got "
+                f"{type(progress_path).__name__}"
+            )
+        if not progress_path:
+            raise ValueError("progress_path must be a non-empty str")
+
+    @classmethod
+    def _validate_progress_target(
+        cls, path: str, index_path: str, progress_path: str
+    ) -> None:
+        """The progress file must never name the chain or index file,
+        even through aliases, so publishing progress can never overwrite
+        either cache or the canonical chain."""
+        progress_real = os.path.realpath(progress_path)
+        if progress_real == os.path.realpath(path):
+            raise ValueError(
+                "progress_path must not name the recovery chain file"
+            )
+        if progress_real == os.path.realpath(index_path):
+            raise ValueError(
+                "progress_path must not name the segment index file"
+            )
+
+    @classmethod
     def _open_recovery_chain_locked(cls, path: str) -> Any:
         """Open the chain file for reading while the caller holds the
         chain lock, returning a binary file object positioned at the
@@ -3983,8 +4184,72 @@ class BranchStore:
         return body, digest
 
     @classmethod
+    def _validate_chain_frame_envelope(
+        cls, fields: dict[str, Any], position: int, previous_digest: str
+    ) -> str:
+        """Validate one already-parsed frame's envelope without
+        re-parsing its embedded audit record -- consecutive numbering
+        from one, the predecessor link, the digest field's shape and the
+        frame digest over the exact record bytes -- and return the
+        frame's digest.
+
+        This is the deliberately lighter check used for a prefix whose
+        exact bytes the caller pins with a digest: the frame digest
+        still covers the untouched record bytes, so any rewrite of an
+        old frame breaks either the digest comparison, the predecessor
+        chain or the caller's prefix digest. It is never used for frames
+        that have not been authenticated before.
+        """
+        seq = fields["seq"]
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise ValueError(
+                f"recovery chain frame {position}: 'seq' must be an int"
+            )
+        if seq != position:
+            raise ValueError(
+                f"recovery chain frame {position}: sequence numbers "
+                "must be consecutive starting at 1"
+            )
+        prev = fields["prev"]
+        if len(prev) != 64 or set(prev) - cls._HEX_DIGITS:
+            raise ValueError(
+                f"recovery chain frame {seq}: 'prev' must be a "
+                "64-character lowercase hex string"
+            )
+        if not hmac.compare_digest(prev, previous_digest):
+            raise ValueError(
+                f"recovery chain frame {seq}: predecessor digest "
+                "does not link to the previous frame"
+            )
+        record = fields["record"]
+        if not record:
+            raise ValueError(
+                f"recovery chain frame {seq}: 'record' must be a "
+                "non-empty str"
+            )
+        digest = fields["digest"]
+        if len(digest) != 64 or set(digest) - cls._HEX_DIGITS:
+            raise ValueError(
+                f"recovery chain frame {seq}: 'digest' must be a "
+                "64-character lowercase hex string"
+            )
+        expected_digest = cls._recovery_chain_frame_digest(
+            seq, prev, record
+        )
+        if not hmac.compare_digest(digest, expected_digest):
+            raise ValueError(
+                f"recovery chain frame {seq}: frame digest is invalid"
+            )
+        return digest
+
+    @classmethod
     def _scan_recovery_chain(
-        cls, fileobj: Any, on_frame: Any
+        cls,
+        fileobj: Any,
+        on_frame: Any,
+        *,
+        lightweight_through: int = 0,
+        parse_body_seqs: set[int] | None = None,
     ) -> tuple[int, int, str]:
         """Stream the open chain file and fully authenticate it --
         encoding, canonical form, duplicate keys, structure, consecutive
@@ -3999,6 +4264,18 @@ class BranchStore:
         schema version, frame count and head digest. Every content
         defect raises :class:`ValueError`; read failures propagate as
         :class:`OSError`.
+
+        ``lightweight_through`` names a previously authenticated
+        boundary: frames at or below that sequence number still have
+        their canonical encoding, consecutive numbering, predecessor
+        links and frame digests verified frame by frame, but their
+        embedded audit records are not parsed again (``body`` is
+        ``None``). A caller may use this only while independently
+        pinning those frames' exact bytes with a prefix digest, so the
+        lighter pass cannot mask a changed or reordered prefix -- any
+        altered byte breaks either a frame digest, the link chain or
+        the pinned prefix digest. Frames past the boundary are always
+        fully authenticated, embedded records included.
         """
         stream = _CanonicalJsonStream(fileobj)
         if stream.peek() is None:
@@ -4045,11 +4322,29 @@ class BranchStore:
                             fields = cls._parse_chain_frame_stream(stream)
                             frame_length = stream.offset - frame_offset
                             count += 1
-                            body, digest = (
-                                cls._validate_chain_frame_fields(
-                                    fields, count, previous_digest
+                            if (
+                                count <= lightweight_through
+                                and not (
+                                    parse_body_seqs
+                                    and count in parse_body_seqs
                                 )
-                            )
+                            ):
+                                # Verify the frame envelope and its
+                                # digest links without re-parsing the
+                                # embedded record; the caller pins the
+                                # prefix bytes separately.
+                                digest = (
+                                    cls._validate_chain_frame_envelope(
+                                        fields, count, previous_digest
+                                    )
+                                )
+                                body = None
+                            else:
+                                body, digest = (
+                                    cls._validate_chain_frame_fields(
+                                        fields, count, previous_digest
+                                    )
+                                )
                             previous_digest = digest
                             head = digest
                             on_frame(
@@ -4940,7 +5235,10 @@ class BranchStore:
 
     @classmethod
     def _scan_segment_entries(
-        cls, stream: _CanonicalJsonStream, fingerprint: Any
+        cls,
+        stream: _CanonicalJsonStream,
+        fingerprint: Any,
+        on_record: Any = None,
     ) -> tuple[int, int, str | None]:
         """Stream the segment index's ``segments`` array, validating
         each segment's shape, contiguous coverage from sequence number
@@ -4948,9 +5246,13 @@ class BranchStore:
         the last covered sequence number and the last segment's trailing
         boundary digest. ``fingerprint`` is a SHA-256 hasher updated
         with each segment's canonical bytes, so the caller can compare
-        the segments item for item against the authenticated chain. Any
-        defect raises :class:`ValueError`, which the caller treats as a
-        corrupt (rebuildable) segment index."""
+        the segments item for item against the authenticated chain.
+        When ``on_record`` is given it is invoked once per segment with
+        the exact canonical record mapping (re-serialization of which
+        reproduces the record's bytes); a resuming build uses it to copy
+        the prefix records verbatim. Any defect raises
+        :class:`ValueError`, which the caller treats as a corrupt
+        (rebuildable) segment index."""
         stream.expect(0x5B)  # '['
         count = 0
         expected_first = 1
@@ -5010,17 +5312,18 @@ class BranchStore:
                 if len(value) != 64 or set(value) - cls._HEX_DIGITS:
                     raise ValueError("bad segment digest")
                 digests[name] = value
+            record = {
+                "first": first,
+                "last": last,
+                "first_digest": digests["first_digest"],
+                "last_digest": digests["last_digest"],
+                "digest": digests["digest"],
+            }
             fingerprint.update(
-                cls._canonical_json(
-                    {
-                        "first": first,
-                        "last": last,
-                        "first_digest": digests["first_digest"],
-                        "last_digest": digests["last_digest"],
-                        "digest": digests["digest"],
-                    }
-                ).encode("utf-8")
+                cls._canonical_json(record).encode("utf-8")
             )
+            if on_record is not None:
+                on_record(record)
             count += 1
             expected_first = last + 1
             last_seq = last
@@ -5035,8 +5338,8 @@ class BranchStore:
 
     @classmethod
     def _read_recovery_chain_segments(
-        cls, index_path: str
-    ) -> tuple[int, int, int, str, str] | None:
+        cls, index_path: str, *, detail: bool = False
+    ) -> tuple[Any, ...] | None:
         """Read and fully validate the segment index, returning its
         binding -- ``(segment_size, chain_version, frames, head,
         segments_fingerprint)`` -- or ``None`` when the index is
@@ -5046,14 +5349,22 @@ class BranchStore:
         digests and frame-bytes digest match the authenticated chain
         item for item.
 
+        With ``detail`` set, the result additionally carries the
+        complete-segment boundary, the trailing short segment record
+        (``None`` when the frame count is an exact multiple of the
+        segment size) and the SHA-256 of the index file's exact bytes,
+        which a resuming build uses to splice only the appended tail.
+
         The segment index is a disposable cache, so no index problem
-        ever raises here: it only marks the index for a rebuild from the
-        canonical chain. Only a fixed amount of memory is used
+        ever raises here: it only marks the index for a rebuild from
+        the canonical chain. Only a fixed amount of memory is used
         regardless of the segment count.
         """
+        file_hasher = hashlib.sha256()
         try:
-            with open(index_path, "rb") as fileobj:
-                stream = _CanonicalJsonStream(fileobj)
+            with open(index_path, "rb") as raw:
+                tee = _HashingTee(raw, file_hasher)
+                stream = _CanonicalJsonStream(tee)
                 if stream.peek() is None or stream.peek() == 0xEF:
                     return None
                 stream.expect(0x7B)  # '{'
@@ -5068,6 +5379,29 @@ class BranchStore:
                 last_seq = 0
                 last_digest: str | None = None
                 fingerprint = hashlib.sha256()
+                prefix_fingerprint = hashlib.sha256()
+                boundary_digest: str | None = None
+                tail_record: dict[str, Any] | None = None
+
+                def on_record(record: dict[str, Any]) -> None:
+                    nonlocal tail_record, boundary_digest
+                    # Keys are ordered, so segment_size_value is known
+                    # before the segments array streams past. Records at
+                    # a complete-segment boundary anchor the prefix a
+                    # resume re-checks; the final record is the only
+                    # possibly short trailing segment.
+                    if (
+                        isinstance(segment_size_value, int)
+                        and not isinstance(segment_size_value, bool)
+                        and record["last"] % segment_size_value == 0
+                    ):
+                        prefix_fingerprint.update(
+                            cls._canonical_json(record).encode("utf-8")
+                        )
+                        boundary_digest = record["last_digest"]
+                        tail_record = None
+                    else:
+                        tail_record = record
                 if stream.peek() == 0x7D:  # '}'
                     stream.take()
                 else:
@@ -5084,7 +5418,9 @@ class BranchStore:
                         if key == "segments":
                             count, last_seq, last_digest = (
                                 cls._scan_segment_entries(
-                                    stream, fingerprint
+                                    stream,
+                                    fingerprint,
+                                    on_record if detail else None,
                                 )
                             )
                         elif key in ("format", "head"):
@@ -5158,15 +5494,929 @@ class BranchStore:
                     or head != last_digest
                 ):
                     return None
-                return (
+                binding: tuple[Any, ...] = (
                     segment_size_value,
                     chain_version,
                     declared_frames,
                     head,
                     fingerprint.hexdigest(),
                 )
+                if not detail:
+                    return binding
+                remainder = declared_frames % segment_size_value
+                complete = declared_frames - remainder
+                if remainder == 0:
+                    tail: dict[str, Any] | None = None
+                    if count < 1 or boundary_digest is None:
+                        return None
+                else:
+                    if (
+                        tail_record is None
+                        or tail_record["first"] != complete + 1
+                        or tail_record["last"] != declared_frames
+                    ):
+                        return None
+                    tail = tail_record
+                return (
+                    *binding,
+                    complete,
+                    boundary_digest,
+                    prefix_fingerprint.hexdigest(),
+                    tail,
+                    file_hasher.hexdigest(),
+                )
         except (OSError, ValueError, RecursionError):
             return None
+
+    @classmethod
+    def _read_recovery_progress(
+        cls, progress_path: str
+    ) -> tuple[int, int, str, int, str, str, str] | None:
+        """Read and strictly validate a resumable-build progress
+        document, returning its binding -- ``(segment_size, boundary,
+        boundary_digest, frames, head, prefix_digest, index_digest)``
+        -- or ``None`` when the file is missing, truncated or defective
+        in any way, which the caller treats as a one-shot rebuild from
+        the canonical chain.
+
+        A genuinely missing file is the normal first-build case and
+        yields ``None``; every other open or read failure propagates as
+        :class:`OSError`. The document binds the segment size, the last
+        full-size segment boundary and its frame digest, the
+        authenticated frame count and head, the SHA-256 of the prefix's
+        canonical frame bytes through that boundary and the SHA-256 of
+        the matching segment index's exact bytes; it never carries
+        audit bodies.
+        """
+        try:
+            with open(progress_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            return None
+        if raw.startswith(b"\xef\xbb\xbf"):
+            return None
+        try:
+            text = raw.decode("utf-8")
+            document = json.loads(
+                text, object_pairs_hook=cls._reject_duplicate_json_keys
+            )
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return None
+        if not isinstance(document, dict):
+            return None
+        if set(document.keys()) != set(cls._RECOVERY_CHAIN_PROGRESS_KEYS):
+            return None
+        if document["format"] != cls._RECOVERY_CHAIN_PROGRESS_FORMAT:
+            return None
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in cls._RECOVERY_CHAIN_PROGRESS_SUPPORTED_VERSIONS
+        ):
+            return None
+        segment_size = document["segment_size"]
+        boundary = document["boundary"]
+        frames = document["frames"]
+        for value in (segment_size, boundary, frames):
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+        if segment_size < 1 or boundary < 0 or frames < 1:
+            return None
+        if boundary % segment_size or boundary > frames:
+            return None
+        if frames - boundary >= segment_size:
+            return None
+        for name in (
+            "boundary_digest",
+            "head",
+            "prefix_digest",
+            "index_digest",
+        ):
+            value = document[name]
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or set(value) - cls._HEX_DIGITS
+            ):
+                return None
+        if boundary == 0 and (
+            document["boundary_digest"]
+            != cls._RECOVERY_CHAIN_GENESIS_PREV
+        ):
+            return None
+        return (
+            segment_size,
+            boundary,
+            document["boundary_digest"],
+            frames,
+            document["head"],
+            document["prefix_digest"],
+            document["index_digest"],
+        )
+
+    @classmethod
+    def _progress_bytes(
+        cls,
+        segment_size: int,
+        boundary: int,
+        boundary_digest: str,
+        frames: int,
+        head: str,
+        prefix_digest: str,
+        index_digest: str,
+    ) -> bytes:
+        """Deterministic compact JSON for a progress binding: UTF-8
+        without a BOM, no whitespace and no trailing newline, identical
+        byte for byte for identical bindings."""
+        document = {
+            "format": cls._RECOVERY_CHAIN_PROGRESS_FORMAT,
+            "version": cls._RECOVERY_CHAIN_PROGRESS_VERSION,
+            "segment_size": segment_size,
+            "boundary": boundary,
+            "boundary_digest": boundary_digest,
+            "frames": frames,
+            "head": head,
+            "prefix_digest": prefix_digest,
+            "index_digest": index_digest,
+        }
+        return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def _publish_files_rollback(
+        cls,
+        publications: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Durably publish ordered ``(temporary, target)`` pairs under a
+        rollback protocol; each temporary already sits in its target's
+        directory and is flushed and fsync-ed.
+
+        Every pre-existing target is first moved aside to a unique
+        same-directory backup; the temps are then replaced onto the
+        targets one by one, with the containing directory synced after
+        each move. If any replace or directory sync fails, every target
+        is restored byte for byte from its backup (removed entirely
+        when it did not exist before), the backups and unpublished
+        temps are cleaned up, the directories are synced and the
+        :class:`OSError` propagates -- so a failed publication leaves
+        every previous target exactly as it was, never a partial set.
+        On success the backups are removed and every directory synced.
+        """
+        backups: dict[str, str] = {}
+        installed: list[str] = []
+
+        def directory_of(target: str) -> str:
+            return os.path.dirname(os.path.abspath(target))
+
+        try:
+            for tmp, target in publications:
+                if os.path.exists(target):
+                    backup = (
+                        target
+                        + f".recovery-backup-{uuid.uuid4().hex}.bak"
+                    )
+                    os.replace(target, backup)
+                    backups[target] = backup
+                os.replace(tmp, target)
+                installed.append(target)
+                cls._fsync_directory(directory_of(target))
+        except OSError:
+            for target in reversed(installed):
+                with contextlib.suppress(OSError):
+                    os.remove(target)
+                backup = backups.get(target)
+                if backup is not None:
+                    with contextlib.suppress(OSError):
+                        os.replace(backup, target)
+            for target, backup in backups.items():
+                if target not in installed and os.path.exists(backup):
+                    with contextlib.suppress(OSError):
+                        os.replace(backup, target)
+            for tmp, target in publications:
+                if target not in installed:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+            for backup in backups.values():
+                with contextlib.suppress(OSError):
+                    os.remove(backup)
+            synced: set[str] = set()
+            for _tmp, target in publications:
+                directory = directory_of(target)
+                if directory not in synced:
+                    synced.add(directory)
+                    with contextlib.suppress(OSError):
+                        cls._fsync_directory(directory)
+            raise
+        for backup in backups.values():
+            with contextlib.suppress(OSError):
+                os.remove(backup)
+        synced = set()
+        for _tmp, target in publications:
+            directory = directory_of(target)
+            if directory not in synced:
+                synced.add(directory)
+                cls._fsync_directory(directory)
+
+    @classmethod
+    def _verify_published_segments(
+        cls,
+        index_path: str,
+        progress_path: str | None,
+        segment_size: int,
+        boundary: int,
+        boundary_digest: str,
+        count: int,
+        head: str,
+        prefix_digest: str,
+        segment_records_fingerprint: str,
+        chain_version: int,
+    ) -> None:
+        """Re-read the just-published caches and prove they bind the
+        authenticated chain: the index's segment fingerprint must
+        equal the fingerprint of the records the authenticated scan
+        emitted, and the progress (when present) must bind the same
+        head, boundary, prefix and exact index bytes. Any mismatch
+        raises :class:`ValueError`."""
+        detail = cls._read_recovery_chain_segments(index_path, detail=True)
+        if detail is None:
+            raise ValueError(
+                "recovery chain segment index is unusable after "
+                "publication"
+            )
+        (
+            idx_size,
+            idx_version,
+            idx_frames,
+            idx_head,
+            idx_fingerprint,
+            idx_boundary,
+            idx_boundary_digest,
+            _idx_prefix_fingerprint,
+            _idx_tail,
+            idx_file_digest,
+        ) = detail
+        if (
+            idx_size != segment_size
+            or idx_version != chain_version
+            or idx_frames != count
+            or not hmac.compare_digest(idx_head, head)
+            or idx_fingerprint != segment_records_fingerprint
+            or idx_boundary != boundary
+            or (
+                boundary
+                and not hmac.compare_digest(
+                    idx_boundary_digest, boundary_digest
+                )
+            )
+        ):
+            raise ValueError(
+                "recovery chain segment index does not match the "
+                "authenticated chain after publication"
+            )
+        if progress_path is None:
+            return
+        progress = cls._read_recovery_progress(progress_path)
+        if progress is None:
+            raise ValueError(
+                "recovery chain progress is unusable after publication"
+            )
+        if progress != (
+            segment_size,
+            boundary,
+            boundary_digest,
+            count,
+            head,
+            prefix_digest,
+            idx_file_digest,
+        ):
+            raise ValueError(
+                "recovery chain progress does not match the "
+                "authenticated chain after publication"
+            )
+
+    @classmethod
+    def _full_segment_build_locked(
+        cls,
+        path: str,
+        index_path: str,
+        segment_size: int,
+        wanted: set[int],
+        progress_path: str | None,
+        extension_pin: tuple[int, int, str, int, str, str] | None = None,
+    ) -> tuple[int, str, dict[int, dict[str, Any]]]:
+        """Fully authenticate the chain from frame one, fold every
+        frame into segments, durably publish the segment index (and,
+        when given, the progress file) and return the frame count, head
+        and wanted bodies; the caller holds the chain lock.
+
+        This is the trusted path used for the first build and exactly
+        once per call after an unusable progress/index pair. It
+        streams the whole chain to the full authentication standard
+        with bounded memory. Both caches are written as same-directory
+        temps and published under the rollback protocol, so no
+        open, write, flush, replace or sync failure can leave a
+        previously valid cache byte-different; a post-publish re-read
+        verifies the published index item for item against the
+        authenticated chain.
+
+        ``extension_pin`` carries ``(segment_size, boundary,
+        boundary_digest, old_frames, old_head, prefix_digest)`` from a
+        structurally valid progress whose index could not drive an
+        incremental continuation: even on the fallback rebuild the
+        chain must still be an append-only extension of that
+        authenticated prefix (the boundary frame, the old head frame
+        and the prefix-frame-bytes digest must all match and the chain
+        may not be shorter), so a lost index can never legitimize a
+        truncated or rewritten chain; a violation raises
+        :class:`ValueError` rather than rebuilding over it.
+        """
+        directory = os.path.dirname(os.path.abspath(index_path))
+        captured: dict[int, dict[str, Any]] = {}
+        index_fd, index_tmp = tempfile.mkstemp(
+            prefix=".recovery-chain-segments-",
+            suffix=".tmp",
+            dir=directory,
+        )
+        progress_tmp: str | None = None
+        publications: list[tuple[str, str]] = [(index_tmp, index_path)]
+        published = False
+        pin_prefix: Any = None
+        pin_boundary_frame = False
+        pin_old_head_frame = False
+        index_handle: Any = None
+        if extension_pin is not None:
+            (
+                _pin_size,
+                pin_boundary,
+                pin_boundary_digest,
+                pin_old_frames,
+                pin_old_head,
+                pin_prefix_digest,
+            ) = extension_pin
+            pin_prefix = hashlib.sha256()
+        try:
+            handle = os.fdopen(index_fd, "wb")
+            index_handle = handle
+            index_hasher = hashlib.sha256()
+            tee = _HashingTee(handle, index_hasher)
+            tee.write(
+                b'{"format":"'
+                + cls._RECOVERY_CHAIN_SEGMENTS_FORMAT.encode("ascii")
+                + b'","version":'
+                + str(cls._RECOVERY_CHAIN_SEGMENTS_VERSION).encode("ascii")
+                + b',"segment_size":'
+                + str(segment_size).encode("ascii")
+                + b',"segments":['
+            )
+            first = True
+
+            def on_segment(segment: dict[str, Any]) -> None:
+                nonlocal first
+                if not first:
+                    tee.write(b",")
+                tee.write(cls._canonical_json(segment).encode("utf-8"))
+                first = False
+
+            segmenter = _ChainSegmenter(
+                segment_size, cls._canonical_json, on_segment
+            )
+
+            def on_frame(frame: dict[str, Any]) -> None:
+                nonlocal pin_boundary_frame, pin_old_head_frame
+                if frame["seq"] in wanted:
+                    captured[frame["seq"]] = frame["body"]
+                if extension_pin is not None:
+                    if frame["seq"] <= pin_boundary:
+                        pin_prefix.update(
+                            cls._canonical_json(
+                                {
+                                    "seq": frame["seq"],
+                                    "prev": frame["prev"],
+                                    "record": frame["record"],
+                                    "digest": frame["digest"],
+                                }
+                            ).encode("utf-8")
+                        )
+                    if pin_boundary and frame["seq"] == pin_boundary:
+                        pin_boundary_frame = hmac.compare_digest(
+                            frame["digest"], pin_boundary_digest
+                        )
+                    if frame["seq"] == pin_old_frames:
+                        pin_old_head_frame = hmac.compare_digest(
+                            frame["digest"], pin_old_head
+                        )
+                segmenter.on_frame(frame)
+
+            chain_file = cls._open_recovery_chain_locked(path)
+            try:
+                # A fallback rebuild always fully authenticates every
+                # frame -- embedded records included -- exactly like a
+                # clean first build; the extension pin is an additional
+                # append-only constraint on top of that standard, never
+                # a lighter authentication.
+                version, count, head = cls._scan_recovery_chain(
+                    chain_file, on_frame
+                )
+            finally:
+                chain_file.close()
+            if extension_pin is not None:
+                if count < pin_old_frames:
+                    raise ValueError(
+                        "recovery chain was truncated behind the "
+                        "authenticated progress frame count"
+                    )
+                if pin_boundary and not pin_boundary_frame:
+                    raise ValueError(
+                        "recovery chain progress boundary frame is "
+                        "missing or rewritten"
+                    )
+                if not pin_old_head_frame:
+                    raise ValueError(
+                        "recovery chain progress head frame is missing "
+                        "or rewritten"
+                    )
+                if not hmac.compare_digest(
+                    pin_prefix.hexdigest(), pin_prefix_digest
+                ):
+                    raise ValueError(
+                        "recovery chain prefix does not match the "
+                        "authenticated progress prefix digest"
+                    )
+            segmenter.finish()
+            tee.write(
+                (
+                    '],"chain_version":%d,"frames":%d,"head":"%s"}'
+                    % (version, count, head)
+                ).encode("ascii")
+            )
+            tee.flush()
+            os.fsync(tee.fileno())
+            handle.close()
+            index_digest = index_hasher.hexdigest()
+            boundary = segmenter.completed_boundary
+            boundary_digest = (
+                segmenter.completed_boundary_digest
+                if boundary
+                else cls._RECOVERY_CHAIN_GENESIS_PREV
+            )
+            prefix_digest = segmenter.completed_prefix_digest
+            if progress_path is not None:
+                progress_directory = os.path.dirname(
+                    os.path.abspath(progress_path)
+                )
+                progress_fd, progress_tmp = tempfile.mkstemp(
+                    prefix=".recovery-chain-progress-",
+                    suffix=".tmp",
+                    dir=progress_directory,
+                )
+                with os.fdopen(progress_fd, "wb") as progress_handle:
+                    progress_handle.write(
+                        cls._progress_bytes(
+                            segment_size,
+                            boundary,
+                            boundary_digest,
+                            count,
+                            head,
+                            prefix_digest,
+                            index_digest,
+                        )
+                    )
+                    progress_handle.flush()
+                    os.fsync(progress_handle.fileno())
+                publications.append((progress_tmp, progress_path))
+            cls._publish_files_rollback(tuple(publications))
+            published = True
+            cls._verify_published_segments(
+                index_path,
+                progress_path,
+                segment_size,
+                boundary,
+                boundary_digest,
+                count,
+                head,
+                prefix_digest,
+                segmenter.published_fingerprint,
+                version,
+            )
+            return count, head, captured
+        finally:
+            # A chain defect raised while the index temp is still open
+            # must not leak the descriptor; closing twice is harmless.
+            if index_handle is not None and not index_handle.closed:
+                with contextlib.suppress(OSError):
+                    index_handle.close()
+            if not published:
+                for tmp, _target in publications:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+
+    @classmethod
+    def _locate_segments_splice(
+        cls, index_path: str, boundary: int, segment_size: int
+    ) -> int | None:
+        """Stream the segment index only far enough to locate the byte
+        offset immediately after the complete-segment record covering
+        sequence ``boundary`` (or immediately after the opening ``[``
+        when ``boundary`` is zero), using fixed buffers. Returns
+        ``None`` when the records through the boundary are not a
+        canonical, continuous run of full-size segment records. The
+        index has already been validated by the caller in the same
+        lock hold, so a genuine open/read failure propagates as
+        :class:`OSError` rather than masquerading as a corrupt cache.
+        """
+        try:
+            with open(index_path, "rb") as fileobj:
+                stream = _CanonicalJsonStream(fileobj)
+                if stream.peek() is None:
+                    return None
+                stream.expect(0x7B)  # '{'
+                if stream.peek() == 0x7D:  # '}'
+                    return None
+                while True:
+                    if stream.peek() != 0x22:  # '"'
+                        return None
+                    key = stream.parse_string()
+                    stream.expect(0x3A)  # ':'
+                    if key == "segments":
+                        stream.expect(0x5B)  # '['
+                        break
+                    stream.skip_value()
+                    byte = stream.take()
+                    if byte != 0x2C:  # ','
+                        return None
+                if boundary == 0:
+                    return stream.offset
+                expected_first = 1
+                while True:
+                    raw = stream.read_raw_object()
+                    try:
+                        record = json.loads(
+                            raw.decode("utf-8"),
+                            object_pairs_hook=(
+                                cls._reject_duplicate_json_keys
+                            ),
+                        )
+                    except ValueError:
+                        return None
+                    if not isinstance(record, dict) or set(
+                        record.keys()
+                    ) != set(cls._RECOVERY_CHAIN_SEGMENT_KEYS):
+                        return None
+                    if cls._canonical_json(record).encode("utf-8") != raw:
+                        return None
+                    first = record["first"]
+                    last = record["last"]
+                    for value in (first, last):
+                        if (
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                        ):
+                            return None
+                    if (
+                        first != expected_first
+                        or last - first + 1 != segment_size
+                    ):
+                        return None
+                    point = stream.offset
+                    byte = stream.take()
+                    if last == boundary:
+                        if byte not in (0x2C, 0x5D):  # ',' or ']'
+                            return None
+                        return point
+                    expected_first = last + 1
+                    if byte != 0x2C:  # ','
+                        return None
+        except OSError:
+            raise
+        except (ValueError, RecursionError):
+            return None
+
+    @classmethod
+    def _resume_segment_build_locked(
+        cls,
+        path: str,
+        index_path: str,
+        progress_path: str,
+        segment_size: int,
+        wanted: set[int],
+    ) -> tuple[int, str, dict[int, dict[str, Any]]]:
+        """Continue a build from a mutually consistent progress/index
+        pair, scanning the chain exactly once, and return the frame
+        count, head and wanted bodies; the caller holds the chain lock.
+
+        The progress and index are read and cross-checked before the
+        chain is opened, so a missing or unusable cache pair falls
+        through to one full rebuild without scanning the chain. Once
+        the pair claims an authenticated prefix, a disagreement with
+        the chain is a canonical-chain defect and raises
+        :class:`ValueError`: a chain truncated behind the authenticated
+        frame count, a rewritten, reordered or duplicated prefix
+        frame, a broken boundary or head link, or a frame that will not
+        canonically parse.
+
+        Old frames through the previous frame count are checked with
+        fixed buffers only (envelope shape, predecessor links, frame
+        digests, the pinned prefix-frame-bytes digest, the boundary
+        frame and the index's complete-segment and trailing-segment
+        evidence); queried old endpoint records and every appended
+        frame are fully parsed, so neither cache can ever answer over
+        an unauthenticated record. The replacement tail segments are
+        spliced onto the exact old prefix-index bytes and both caches
+        are published under the rollback protocol and re-verified.
+        """
+        progress = cls._read_recovery_progress(progress_path)
+        if progress is None:
+            # No trustworthy prior binding: this is the one free full
+            # rebuild (a missing or unparseable progress file).
+            return cls._full_segment_build_locked(
+                path, index_path, segment_size, wanted, progress_path
+            )
+        (
+            prog_size,
+            boundary,
+            boundary_digest,
+            old_frames,
+            old_head,
+            prefix_digest,
+            index_digest,
+        ) = progress
+        extension_pin = (
+            prog_size,
+            boundary,
+            boundary_digest,
+            old_frames,
+            old_head,
+            prefix_digest,
+        )
+        detail: tuple[Any, ...] | None = None
+        if prog_size == segment_size:
+            detail = cls._read_recovery_chain_segments(
+                index_path, detail=True
+            )
+        if detail is not None:
+            (
+                idx_size,
+                idx_version,
+                idx_frames,
+                idx_head,
+                _idx_fingerprint,
+                idx_boundary,
+                idx_boundary_digest,
+                idx_prefix_fingerprint,
+                idx_tail,
+                idx_file_digest,
+            ) = detail
+            pair_consistent = (
+                idx_size == segment_size
+                and idx_frames == old_frames
+                and hmac.compare_digest(idx_head, old_head)
+                and idx_boundary == boundary
+                and hmac.compare_digest(idx_file_digest, index_digest)
+                and (
+                    boundary == 0
+                    or hmac.compare_digest(
+                        idx_boundary_digest, boundary_digest
+                    )
+                )
+            )
+        else:
+            pair_consistent = False
+        if not pair_consistent:
+            # The progress still binds a once-authenticated chain
+            # prefix, so even the fallback rebuild must prove the chain
+            # merely extends it; a lost or stale index can never
+            # legitimise a truncated or rewritten chain.
+            return cls._full_segment_build_locked(
+                path,
+                index_path,
+                segment_size,
+                wanted,
+                progress_path,
+                extension_pin=extension_pin,
+            )
+
+        captured: dict[int, dict[str, Any]] = {}
+        prefix_frame_hasher = hashlib.sha256()
+        prefix_index_hasher = hashlib.sha256()
+        index_prefix_ok = boundary == 0
+        tail_ok = idx_tail is None
+        old_head_seen = False
+        new_records: list[dict[str, Any]] = []
+
+        def on_segment(segment: dict[str, Any]) -> None:
+            nonlocal index_prefix_ok
+            if segment["last"] <= boundary:
+                prefix_index_hasher.update(
+                    cls._canonical_json(segment).encode("utf-8")
+                )
+                if segment["last"] == boundary:
+                    index_prefix_ok = True
+            else:
+                new_records.append(segment)
+
+        segmenter = _ChainSegmenter(
+            segment_size, cls._canonical_json, on_segment
+        )
+
+        def on_frame(frame: dict[str, Any]) -> None:
+            nonlocal tail_ok, old_head_seen
+            seq = frame["seq"]
+            if seq in wanted:
+                captured[seq] = frame["body"]
+            if seq <= boundary:
+                prefix_frame_hasher.update(
+                    cls._canonical_json(
+                        {
+                            "seq": frame["seq"],
+                            "prev": frame["prev"],
+                            "record": frame["record"],
+                            "digest": frame["digest"],
+                        }
+                    ).encode("utf-8")
+                )
+            segmenter.on_frame(frame)
+            if boundary and seq == boundary and not hmac.compare_digest(
+                frame["digest"], boundary_digest
+            ):
+                raise ValueError(
+                    "recovery chain progress boundary digest does not "
+                    "match the authenticated chain"
+                )
+            if seq == old_frames:
+                if not hmac.compare_digest(frame["digest"], old_head):
+                    raise ValueError(
+                        "recovery chain progress head does not match "
+                        "the frame at the authenticated frame count"
+                    )
+                old_head_seen = True
+                if idx_tail is not None:
+                    tail_ok = (
+                        segmenter.open_segment_evidence() == idx_tail
+                    )
+
+        chain_file = cls._open_recovery_chain_locked(path)
+        try:
+            version, count, head = cls._scan_recovery_chain(
+                chain_file,
+                on_frame,
+                lightweight_through=old_frames,
+                parse_body_seqs=wanted,
+            )
+        finally:
+            chain_file.close()
+        if count < old_frames:
+            raise ValueError(
+                "recovery chain was truncated behind the authenticated "
+                "progress frame count"
+            )
+        if not old_head_seen:
+            raise ValueError(
+                "recovery chain does not contain the authenticated "
+                "progress head frame"
+            )
+        segmenter.finish()
+        if not index_prefix_ok or (idx_tail is not None and not tail_ok):
+            raise ValueError(
+                "recovery chain prefix does not match the authenticated "
+                "segment-index evidence"
+            )
+        if not hmac.compare_digest(
+            prefix_frame_hasher.hexdigest(), prefix_digest
+        ):
+            raise ValueError(
+                "recovery chain prefix does not match the authenticated "
+                "progress prefix digest"
+            )
+        if not hmac.compare_digest(
+            prefix_index_hasher.hexdigest(), idx_prefix_fingerprint
+        ):
+            raise ValueError(
+                "recovery chain segment index prefix does not match "
+                "its authenticated evidence"
+            )
+        if count == old_frames:
+            if not hmac.compare_digest(head, old_head):
+                raise ValueError(
+                    "recovery chain head does not match the "
+                    "authenticated progress head"
+                )
+            # Nothing was appended: the existing caches already bind
+            # this exact chain, so nothing is published.
+            return count, head, captured
+        tail_records = [
+            record for record in new_records if record["first"] > boundary
+        ]
+        if not tail_records:
+            raise ValueError(
+                "recovery chain continuation produced no replacement "
+                "tail segment"
+            )
+        new_boundary = segmenter.completed_boundary
+        new_boundary_digest = (
+            segmenter.completed_boundary_digest
+            if new_boundary
+            else cls._RECOVERY_CHAIN_GENESIS_PREV
+        )
+        new_prefix_digest = segmenter.completed_prefix_digest
+        splice_point = cls._locate_segments_splice(
+            index_path, boundary, segment_size
+        )
+        if splice_point is None:
+            raise ValueError(
+                "recovery chain segment index cannot be spliced at the "
+                "authenticated boundary"
+            )
+        directory = os.path.dirname(os.path.abspath(index_path))
+        index_fd, index_tmp = tempfile.mkstemp(
+            prefix=".recovery-chain-segments-",
+            suffix=".tmp",
+            dir=directory,
+        )
+        progress_tmp: str | None = None
+        publications: list[tuple[str, str]] = [(index_tmp, index_path)]
+        published = False
+        try:
+            with open(index_path, "rb") as old_index, os.fdopen(
+                index_fd, "wb"
+            ) as handle:
+                index_hasher = hashlib.sha256()
+                tee = _HashingTee(handle, index_hasher)
+                remaining = splice_point
+                while remaining:
+                    chunk = old_index.read(min(remaining, 65536))
+                    if not chunk:
+                        raise ValueError(
+                            "recovery chain segment index ended before "
+                            "the authenticated splice point"
+                        )
+                    tee.write(chunk)
+                    remaining -= len(chunk)
+                if boundary:
+                    tee.write(b",")
+                tee.write(
+                    b",".join(
+                        cls._canonical_json(record).encode("utf-8")
+                        for record in tail_records
+                    )
+                )
+                if version != idx_version:
+                    raise ValueError(
+                        "recovery chain schema version changed without "
+                        "a rebuilt segment index"
+                    )
+                tee.write(
+                    (
+                        '],"chain_version":%d,"frames":%d,"head":"%s"}'
+                        % (idx_version, count, head)
+                    ).encode("ascii")
+                )
+                tee.flush()
+                os.fsync(tee.fileno())
+                index_digest_new = index_hasher.hexdigest()
+            progress_directory = os.path.dirname(
+                os.path.abspath(progress_path)
+            )
+            progress_fd, progress_tmp = tempfile.mkstemp(
+                prefix=".recovery-chain-progress-",
+                suffix=".tmp",
+                dir=progress_directory,
+            )
+            with os.fdopen(progress_fd, "wb") as progress_handle:
+                progress_handle.write(
+                    cls._progress_bytes(
+                        segment_size,
+                        new_boundary,
+                        new_boundary_digest,
+                        count,
+                        head,
+                        new_prefix_digest,
+                        index_digest_new,
+                    )
+                )
+                progress_handle.flush()
+                os.fsync(progress_handle.fileno())
+            publications.append((progress_tmp, progress_path))
+            cls._publish_files_rollback(tuple(publications))
+            published = True
+            cls._verify_published_segments(
+                index_path,
+                progress_path,
+                segment_size,
+                new_boundary,
+                new_boundary_digest,
+                count,
+                head,
+                new_prefix_digest,
+                segmenter.published_fingerprint,
+                version,
+            )
+            return count, head, captured
+        finally:
+            if not published:
+                for tmp, _target in publications:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
 
     @classmethod
     def _segmented_chain_scan(
@@ -5175,34 +6425,44 @@ class BranchStore:
         index_path: str,
         segment_size: int,
         wanted: set[int],
+        progress_path: str | None = None,
     ) -> tuple[int, str, dict[int, dict[str, Any]]]:
         """Authenticate the chain with bounded memory under the chain
-        lock, keep the segment index fresh and return the frame count,
-        the head digest and the detached audit bodies of the ``wanted``
-        sequence numbers.
+        lock, keep the segment index (and, when given, the progress
+        file) fresh and return the frame count, the head digest and the
+        detached audit bodies of the ``wanted`` sequence numbers.
 
-        The whole batch runs as one locked chain scan plus one segment
-        check: the chain is streamed and fully authenticated to the same
-        standard as :meth:`_load_recovery_chain`, frames are folded into
-        segments as they pass and only the ``wanted`` audit bodies are
-        materialized, so memory grows only with the largest single frame
-        and fixed buffers -- never with the total frame count or a
-        queried range span. The segment index is then re-read and every
-        segment's bounds, boundary digests and frame-bytes digest is
-        checked against the authenticated chain (via a rolling SHA-256
-        fingerprint, so no segment list is materialized); any mismatch
-        marks the segment index corrupt. A missing, stale or corrupt
-        segment index is rebuilt once from the just-authenticated
-        canonical chain and re-checked; if it still does not match,
-        :class:`ValueError` is raised. The chain remains the only
-        trusted source and the segment index never answers a query by
-        itself, so no index content can mask a chain defect.
+        Without ``progress_path`` the behaviour is exactly the original
+        one: one locked full chain scan, one segment-index check and at
+        most one rebuild of a missing, stale or corrupt index. With a
+        progress path the progress, the segment index and the chain are
+        read inside the same lock hold and the chain is scanned at most
+        once: when the progress binds a prefix the chain only appends
+        to, the old prefix is checked with fixed buffers (envelope
+        links, frame digests, the pinned prefix digest, the boundary
+        frame and the index's complete-segment and trailing-segment
+        evidence) and only appended frames are fully parsed and folded
+        into a replacement tail; a missing, truncated or mismatching
+        progress/index pair triggers exactly one full rebuild from the
+        canonical chain. Either way a post-publish re-read proves the
+        index item for item against the authenticated chain, and
+        :class:`ValueError` is raised if it cannot match; the chain
+        stays the only trusted source, so neither cache can mask a
+        chain defect.
         """
         lock_path = cls._recovery_chain_lock_path(path)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             cls._acquire_chain_lock(fd, None)
             try:
+                if progress_path is not None:
+                    return cls._resume_segment_build_locked(
+                        path,
+                        index_path,
+                        progress_path,
+                        segment_size,
+                        wanted,
+                    )
                 captured: dict[int, dict[str, Any]] = {}
                 fingerprint = hashlib.sha256()
 
@@ -5254,7 +6514,11 @@ class BranchStore:
 
     @classmethod
     def build_recovery_audit_segments(
-        cls, path: Any, index_path: Any, segment_size: Any
+        cls,
+        path: Any,
+        index_path: Any,
+        segment_size: Any,
+        progress_path: Any = None,
     ) -> str:
         """Build the disposable bounded-memory segmented index over a
         persistent recovery-audit chain and return the authenticated
@@ -5300,19 +6564,59 @@ class BranchStore:
         Whether the build succeeds or fails, nothing under the
         generation directory -- business state, audits, idempotency
         records or the journal attachment -- is modified.
+
+        ``progress_path`` is optional and defaults to ``None``, which
+        keeps the call, its result and its authentication semantics
+        exactly as above. When given, it must be a non-empty
+        :class:`str` (a non-``str``/``None`` raises :class:`TypeError`,
+        an empty string :class:`ValueError`) and must not name the
+        chain or index file, even through an alias
+        (:class:`ValueError`); it is validated after the existing
+        arguments, whose order is unchanged. The build then reads the
+        progress, the segment index and the chain inside one chain-lock
+        hold and scans the chain at most once: a progress binding a
+        prefix the chain only appends to is continued from the last
+        full-size segment boundary (the old prefix is checked with
+        fixed buffers against the boundary frame and the pinned
+        prefix/index digests, and only appended frames are fully
+        parsed), while a missing, truncated or mismatching
+        progress/index pair triggers exactly one full rebuild --
+        though a structurally valid progress still forces the chain to
+        be an append-only extension of its authenticated prefix, so a
+        lost index can never legitimize a truncated or rewritten
+        chain. The progress is deterministic compact JSON binding the
+        segment size, boundary, frame count, chain head, prefix digest
+        and index digest; it stores no audit bodies. The index and
+        progress are written as same-directory temps and published
+        together under a rollback protocol, so a failed open, read,
+        write, flush, replace or directory sync raises
+        :class:`OSError` (content mismatches raise
+        :class:`ValueError`), returns no partial result and restores
+        both previous caches byte for byte; only this call's temps and
+        backups are cleaned up. After a successful continuation the new
+        index and progress are jointly bound to the current chain
+        head, so a restart resumes from the latest complete boundary.
         """
         cls._validate_chain_path(path)
         cls._validate_index_path(index_path)
         cls._validate_index_target(path, index_path)
         cls._validate_segment_size(segment_size)
+        cls._validate_progress_path(progress_path)
+        if progress_path is not None:
+            cls._validate_progress_target(path, index_path, progress_path)
         lock_path = cls._recovery_chain_lock_path(path)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             cls._acquire_chain_lock(fd, None)
             try:
-                return cls._build_recovery_audit_segments_locked(
-                    path, index_path, segment_size
+                if progress_path is None:
+                    return cls._build_recovery_audit_segments_locked(
+                        path, index_path, segment_size
+                    )
+                _count, head, _captured = cls._resume_segment_build_locked(
+                    path, index_path, progress_path, segment_size, set()
                 )
+                return head
             finally:
                 cls._release_chain_lock(fd)
         finally:
@@ -5326,6 +6630,7 @@ class BranchStore:
         ranges: Any,
         index_path: Any,
         segment_size: Any,
+        progress_path: Any = None,
     ) -> tuple[dict[str, Any], ...]:
         """Compare the audit records sealed at the endpoints of many
         chain ranges in one batch, strictly read-only.
@@ -5360,6 +6665,30 @@ class BranchStore:
         count or a range span. An empty ``ranges`` still completes the
         path, head, segment-size, chain and segment-index
         authentication and then returns an empty tuple.
+
+        ``progress_path`` is optional and trails the existing
+        arguments; ``None`` (the default) leaves the call, results and
+        authentication semantics exactly as above. When given it is
+        validated like the ``progress_path`` of
+        :meth:`build_recovery_audit_segments` (non-empty :class:`str`,
+        never aliasing the chain or index; :class:`TypeError`,
+        :class:`ValueError` and :class:`OSError` follow the same rules),
+        and the progress, segment index and chain are read together
+        under the chain lock so the chain is scanned at most once per
+        batch: a matching progress drives an incremental continuation
+        from the latest complete segment boundary (the old prefix is
+        checked with fixed buffers and only appended frames are parsed
+        fully, while queried old endpoint records are always
+        re-authenticated), and a missing, truncated or mismatching
+        progress/index pair triggers exactly one full rebuild, with a
+        structurally valid progress still requiring the chain to be an
+        append-only extension of its authenticated prefix. The index
+        and progress are published together under the rollback
+        protocol, so any filesystem failure raises :class:`OSError`,
+        returns no partial results and restores both previous caches
+        byte for byte. Concurrent appends, builds and queries compete
+        for the same chain lock and observe only the complete chain
+        from before or after an append.
 
         The result is a tuple of fresh dictionaries, one per input range
         in input order, each carrying ``start``, ``end`` and ``changes``
@@ -5407,12 +6736,15 @@ class BranchStore:
         cls._validate_index_path(index_path)
         cls._validate_index_target(path, index_path)
         cls._validate_segment_size(segment_size)
+        cls._validate_progress_path(progress_path)
+        if progress_path is not None:
+            cls._validate_progress_target(path, index_path, progress_path)
         wanted: set[int] = set()
         for start, end in normalized:
             wanted.add(start)
             wanted.add(end)
         last, head, captured = cls._segmented_chain_scan(
-            path, index_path, segment_size, wanted
+            path, index_path, segment_size, wanted, progress_path
         )
         if not hmac.compare_digest(head, expected_head):
             raise ValueError(
