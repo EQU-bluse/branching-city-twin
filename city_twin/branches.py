@@ -2724,6 +2724,49 @@ class BranchStore:
         "digest",
     )
 
+    #: Cross-process journal for one durable two-cache publication (see
+    #: :meth:`build_recovery_audit_segments`). When a segmented build or
+    #: batch diff publishes with a ``recovery_path``, this record is made
+    #: durable in the caches' directory *before* either target is replaced
+    #: and updated (and synced) after each replacement, so a process
+    #: dying mid-publication lets the next entry-point call finish the
+    #: new version or roll both targets back to their old bytes. The
+    #: record is UTF-8 without a BOM, compact JSON without a trailing
+    #: newline; it binds its own version, the publication phase, each
+    #: target's old/new existence and SHA-256 digest and the backup file
+    #: names, and carries a checksum over every other field.
+    _RECOVERY_CACHE_RECORD_FORMAT = (
+        "branching-city-twin/recovery-cache-publication"
+    )
+    _RECOVERY_CACHE_RECORD_VERSION = 1
+    _RECOVERY_CACHE_RECORD_SUPPORTED_VERSIONS = (1,)
+    _RECOVERY_CACHE_RECORD_KEYS = (
+        "format",
+        "version",
+        "phase",
+        "index",
+        "progress",
+        "checksum",
+    )
+    _RECOVERY_CACHE_TARGET_KEYS = (
+        "old_exists",
+        "old_digest",
+        "new_exists",
+        "new_digest",
+        "backup",
+    )
+    #: Phase recorded before either target is replaced.
+    _RECOVERY_CACHE_PHASE_PREPARED = "prepared"
+    #: Phase recorded after the index target was replaced.
+    _RECOVERY_CACHE_PHASE_INDEX = "index"
+    #: Phase recorded after the progress target was replaced.
+    _RECOVERY_CACHE_PHASE_PROGRESS = "progress"
+    _RECOVERY_CACHE_PHASES = (
+        _RECOVERY_CACHE_PHASE_PREPARED,
+        _RECOVERY_CACHE_PHASE_INDEX,
+        _RECOVERY_CACHE_PHASE_PROGRESS,
+    )
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -3973,6 +4016,62 @@ class BranchStore:
             )
 
     @classmethod
+    def _validate_recovery_path(cls, recovery_path: Any) -> None:
+        """Validate a ``recovery_path`` argument: ``None`` is accepted
+        (cross-process publication recovery disabled); otherwise it must
+        be a non-empty :class:`str` -- a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`."""
+        if recovery_path is None:
+            return
+        if not isinstance(recovery_path, str):
+            raise TypeError(
+                "recovery_path must be None or a str, got "
+                f"{type(recovery_path).__name__}"
+            )
+        if not recovery_path:
+            raise ValueError("recovery_path must be a non-empty str")
+
+    @classmethod
+    def _validate_recovery_target(
+        cls,
+        path: str,
+        index_path: str,
+        progress_path: str | None,
+        recovery_path: str,
+    ) -> None:
+        """The recovery record only coordinates a publication of both
+        caches, so a progress cursor is required, and the record must
+        never name the chain, index or progress file (even through an
+        alias); the index, progress and record must all live in one
+        directory so every backup and atomic replace shares a single
+        synced directory. Any violation raises :class:`ValueError`."""
+        if progress_path is None:
+            raise ValueError(
+                "recovery_path requires a progress_path so both caches "
+                "are published together"
+            )
+        recovery_real = os.path.realpath(recovery_path)
+        for other, label in (
+            (path, "recovery chain file"),
+            (index_path, "recovery chain index file"),
+            (progress_path, "recovery chain progress file"),
+        ):
+            if recovery_real == os.path.realpath(other):
+                raise ValueError(
+                    f"recovery_path must not name the {label}"
+                )
+        directories = {
+            os.path.dirname(os.path.realpath(index_path)),
+            os.path.dirname(os.path.realpath(progress_path)),
+            os.path.dirname(os.path.realpath(recovery_path)),
+        }
+        if len(directories) != 1:
+            raise ValueError(
+                "the index, progress and recovery files must all live in "
+                "the same directory"
+            )
+
+    @classmethod
     def _open_recovery_chain_locked(cls, path: str) -> Any:
         """Open the chain file for reading while the caller holds the
         chain lock, returning a binary file object positioned at the
@@ -5147,6 +5246,506 @@ class BranchStore:
                     cls._fsync_directory(entry["directory"])
 
     @classmethod
+    def _sha256_file(cls, path: str) -> str:
+        """Hex SHA-256 of a file's bytes, streamed in fixed chunks."""
+        hasher = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(cls._RECOVERY_CACHE_BACKUP_CHUNK)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @classmethod
+    def _cache_recovery_record_bytes(
+        cls,
+        phase: str,
+        index_target: dict[str, Any],
+        progress_target: dict[str, Any],
+    ) -> bytes:
+        """Deterministic compact JSON bytes for a cache-publication
+        recovery record: the checksum is the SHA-256 over the canonical
+        bytes of every other field and is serialized last."""
+        body = {
+            "format": cls._RECOVERY_CACHE_RECORD_FORMAT,
+            "version": cls._RECOVERY_CACHE_RECORD_VERSION,
+            "phase": phase,
+            "index": index_target,
+            "progress": progress_target,
+        }
+        document = dict(body)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def _parse_cache_recovery_record(cls, raw: bytes) -> dict[str, Any]:
+        """Strictly parse and authenticate a cache-publication recovery
+        record, returning its normalized mapping. Any encoding, JSON,
+        canonical-form, field, type, version, phase or checksum defect
+        raises :class:`ValueError`; the caller preserves all evidence."""
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raise ValueError("recovery record must be UTF-8 without a BOM")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"recovery record is not valid UTF-8: {exc}")
+        if not text:
+            raise ValueError("recovery record is empty")
+        try:
+            document = json.loads(
+                text, object_pairs_hook=cls._reject_duplicate_json_keys
+            )
+        except ValueError as exc:
+            raise ValueError(f"recovery record is not valid JSON: {exc}")
+        if cls._canonical_json(document) != text:
+            raise ValueError(
+                "recovery record is not canonical compact JSON"
+            )
+        if not isinstance(document, dict) or set(document) != set(
+            cls._RECOVERY_CACHE_RECORD_KEYS
+        ):
+            raise ValueError("recovery record has bad top-level keys")
+        if document["format"] != cls._RECOVERY_CACHE_RECORD_FORMAT:
+            raise ValueError("recovery record has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in cls._RECOVERY_CACHE_RECORD_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("recovery record has an unsupported version")
+        phase = document["phase"]
+        if not isinstance(phase, str) or phase not in (
+            cls._RECOVERY_CACHE_PHASES
+        ):
+            raise ValueError("recovery record has an unknown phase")
+        checksum = document["checksum"]
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or set(checksum) - cls._HEX_DIGITS
+        ):
+            raise ValueError("recovery record checksum is malformed")
+        body = {
+            "format": document["format"],
+            "version": version,
+            "phase": phase,
+            "index": document["index"],
+            "progress": document["progress"],
+        }
+        expected = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(expected, checksum):
+            raise ValueError("recovery record checksum does not match")
+
+        def parse_target(value: Any, label: str) -> dict[str, Any]:
+            if not isinstance(value, dict) or set(value) != set(
+                cls._RECOVERY_CACHE_TARGET_KEYS
+            ):
+                raise ValueError(f"recovery record {label} has bad keys")
+            old_exists = value["old_exists"]
+            new_exists = value["new_exists"]
+            if not isinstance(old_exists, bool) or not isinstance(
+                new_exists, bool
+            ):
+                raise ValueError(
+                    f"recovery record {label} existence flags must be bools"
+                )
+            if not new_exists:
+                raise ValueError(
+                    f"recovery record {label} must describe the published "
+                    "new version"
+                )
+            old_digest = value["old_digest"]
+            new_digest = value["new_digest"]
+            for name, digest in (
+                ("old_digest", old_digest),
+                ("new_digest", new_digest),
+            ):
+                if not isinstance(digest, str):
+                    raise ValueError(
+                        f"recovery record {label} {name} must be a str"
+                    )
+                if digest and (
+                    len(digest) != 64 or set(digest) - cls._HEX_DIGITS
+                ):
+                    raise ValueError(
+                        f"recovery record {label} {name} is malformed"
+                    )
+            if old_exists != bool(old_digest):
+                raise ValueError(
+                    f"recovery record {label} old existence and digest "
+                    "disagree"
+                )
+            backup = value["backup"]
+            if not isinstance(backup, str):
+                raise ValueError(
+                    f"recovery record {label} backup must be a str"
+                )
+            if old_exists:
+                if not backup or backup in (".", "..") or (
+                    "/" in backup or "\\" in backup or "\x00" in backup
+                ):
+                    raise ValueError(
+                        f"recovery record {label} backup name is malformed"
+                    )
+            elif backup:
+                raise ValueError(
+                    f"recovery record {label} must not name a backup for a "
+                    "target that did not previously exist"
+                )
+            return {
+                "old_exists": old_exists,
+                "old_digest": old_digest,
+                "new_exists": True,
+                "new_digest": new_digest,
+                "backup": backup,
+            }
+
+        return {
+            "format": document["format"],
+            "version": version,
+            "phase": phase,
+            "index": parse_target(document["index"], "index"),
+            "progress": parse_target(document["progress"], "progress"),
+            "checksum": checksum,
+        }
+
+    @classmethod
+    def _write_cache_recovery_record(
+        cls, recovery_path: str, data: bytes
+    ) -> None:
+        """Durably publish recovery-record bytes: temp file in the
+        record's directory, flush, fsync, atomic replace, directory
+        syncs. Any failure removes the temp and propagates
+        :class:`OSError`; a previous record file is only displaced by
+        the atomic replace itself."""
+        directory = os.path.dirname(os.path.abspath(recovery_path))
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".recovery-cache-record-", suffix=".tmp", dir=directory
+        )
+        replaced = False
+        try:
+            try:
+                handle = os.fdopen(fd, "wb")
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+                raise
+            with handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            cls._fsync_directory(directory)
+            os.replace(tmp_path, recovery_path)
+            replaced = True
+            cls._fsync_directory(directory)
+        finally:
+            if not replaced:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+
+    @classmethod
+    def _cache_target_state(
+        cls, target: str, described: dict[str, Any]
+    ) -> str:
+        """Classify a target's on-disk bytes against a recovery record:
+        ``"new"`` when it holds the published bytes, ``"old"`` when it
+        holds the recorded previous bytes (or is absent as recorded),
+        anything else -- missing-while-recorded or unknown third bytes
+        -- raises :class:`ValueError`, because such a state cannot be
+        completed or rolled back safely."""
+        exists = os.path.lexists(target)
+        if exists:
+            digest = cls._sha256_file(target)
+            if hmac.compare_digest(digest, described["new_digest"]):
+                return "new"
+            if described["old_exists"] and hmac.compare_digest(
+                digest, described["old_digest"]
+            ):
+                return "old"
+            raise ValueError(
+                "recovery target content matches neither the recorded old "
+                "nor new digest"
+            )
+        if not described["old_exists"]:
+            return "old"
+        raise ValueError(
+            "recovery target is missing but the record says it previously "
+            "existed"
+        )
+
+    @classmethod
+    def _recover_cache_publication_locked(
+        cls,
+        index_path: str,
+        progress_path: str,
+        recovery_path: str,
+    ) -> None:
+        """Finish an interrupted two-cache publication from a previous
+        process. The caller holds the chain lock and invokes this before
+        any cache, index or progress is used.
+
+        With no recovery record there is nothing to do. Otherwise the
+        record is parsed and checksummed strictly; when both targets
+        hold the recorded new bytes the new version is completed and the
+        old-version backups are removed. Every other recoverable state
+        rolls both targets back: a target still holding the new bytes is
+        either restored byte-for-byte from its named backup or, when it
+        did not exist before, removed; a target already holding the old
+        bytes is left alone (an earlier recovery attempt may have
+        crashed after restoring it). Backups and the directory are synced
+        as each restoration lands, and the record is removed only after
+        every restoration, cleanup and directory sync has succeeded.
+
+        An unparseable record, bad fields/checksum, target bytes from an
+        unknown version or corrupt backup content raises
+        :class:`ValueError` and leaves every target, backup and the
+        record untouched as evidence; a missing parent directory or any
+        open, read, write, flush, replace, delete or sync failure raises
+        :class:`OSError`, also with all recovery material retained.
+        """
+        if not os.path.lexists(recovery_path):
+            return
+        directory = os.path.dirname(os.path.abspath(recovery_path))
+        with open(recovery_path, "rb") as handle:
+            raw = handle.read()
+        record = cls._parse_cache_recovery_record(raw)
+
+        targets = (
+            ("index", index_path, record["index"]),
+            ("progress", progress_path, record["progress"]),
+        )
+        states = {
+            label: cls._cache_target_state(target, described)
+            for label, target, described in targets
+        }
+        if states["index"] == "new" and states["progress"] == "new":
+            # Both replacements (and their directory entries) survived:
+            # complete the new version by discarding the old bytes. An
+            # earlier attempt may already have removed some backups
+            # before dying short of the record unlink, so their absence
+            # here is expected.
+            for _label, _target, described in targets:
+                if described["old_exists"]:
+                    backup_path = os.path.join(
+                        directory, described["backup"]
+                    )
+                    if os.path.lexists(backup_path):
+                        os.remove(backup_path)
+            cls._fsync_directory(directory)
+            os.remove(recovery_path)
+            cls._fsync_directory(directory)
+            return
+
+        # Rollback path: verify every backup before any target is
+        # restored or any backup unlinked. A target still carrying the
+        # new bytes requires its backup to be present and byte-for-byte
+        # the recorded old bytes; a target already on the old bytes has
+        # no need for its backup, but a surviving backup that is corrupt
+        # can never be cleaned up quietly either.
+        for label, _target, described in targets:
+            if not described["old_exists"]:
+                continue
+            backup_path = os.path.join(directory, described["backup"])
+            if states[label] == "new":
+                backup_digest = cls._sha256_file(backup_path)
+                if not hmac.compare_digest(
+                    backup_digest, described["old_digest"]
+                ):
+                    raise ValueError(
+                        "recovery backup content does not match the "
+                        "recorded old digest"
+                    )
+            elif os.path.lexists(backup_path):
+                backup_digest = cls._sha256_file(backup_path)
+                if not hmac.compare_digest(
+                    backup_digest, described["old_digest"]
+                ):
+                    raise ValueError(
+                        "recovery backup content does not match the "
+                        "recorded old digest"
+                    )
+
+        # Every target still holding the new bytes is restored to its
+        # recorded old bytes; the backups were all verified above.
+        for _label, target, described in targets:
+            if states[_label] != "new":
+                continue
+            if described["old_exists"]:
+                os.replace(
+                    os.path.join(directory, described["backup"]), target
+                )
+            else:
+                os.remove(target)
+            cls._fsync_directory(directory)
+        # Every target is back on the old version now; discard the
+        # backups that are still present and, only last, the record.
+        for _label, _target, described in targets:
+            if described["old_exists"]:
+                backup_path = os.path.join(directory, described["backup"])
+                if os.path.lexists(backup_path):
+                    os.remove(backup_path)
+        cls._fsync_directory(directory)
+        os.remove(recovery_path)
+        cls._fsync_directory(directory)
+
+    @classmethod
+    def _publish_caches_recovery_locked(
+        cls,
+        index_path: str,
+        index_tmp: str,
+        progress_path: str,
+        progress_tmp: str,
+        recovery_path: str,
+    ) -> None:
+        """Publish the new index and progress caches under the
+        cross-process recovery protocol. The caller holds the chain
+        lock and has already flushed and fsync-ed both temp files; this
+        routine owns the durable publication sequence and cleanup.
+
+        Both pre-existing targets are streamed byte-for-byte into
+        durable backups in the shared directory first. The recovery
+        record -- version, phase, both targets' old/new existence and
+        SHA-256 digests and the backup names, covered by a checksum over
+        every other field -- is then durably published *before* the
+        first target is replaced. After each atomic replacement (and its
+        directory syncs) the record is rewritten and synced with the
+        advanced phase. Only once both targets carry the new bytes are
+        the old backups and, last, the record removed, so a process
+        dying at any point leaves the next entry-point call enough
+        durable evidence to commit the complete new version or restore
+        the complete old one.
+
+        Any in-process failure first converges the on-disk publication
+        with the same recovery routine the next process would run, so
+        the raising call never strands a mixed version; failures of that
+        convergence propagate as :class:`OSError` with all evidence
+        retained. The canonical chain and all generation state are
+        untouched either way.
+        """
+        directory = os.path.dirname(os.path.abspath(index_path))
+        prepared: list[dict[str, Any]] = []
+        try:
+            for target, tmp_path in (
+                (index_path, index_tmp),
+                (progress_path, progress_tmp),
+            ):
+                new_digest = cls._sha256_file(tmp_path)
+                if os.path.lexists(target):
+                    old_digest = cls._sha256_file(target)
+                    backup_path = cls._backup_cache_file(target)
+                    backup_name = os.path.basename(backup_path)
+                    if not hmac.compare_digest(
+                        cls._sha256_file(backup_path), old_digest
+                    ):
+                        raise ValueError(
+                            "recovery backup does not match the target's "
+                            "current bytes"
+                        )
+                else:
+                    old_digest = ""
+                    backup_path = None
+                    backup_name = ""
+                prepared.append(
+                    {
+                        "target": target,
+                        "tmp": tmp_path,
+                        "old_exists": backup_path is not None,
+                        "old_digest": old_digest,
+                        "new_digest": new_digest,
+                        "backup_path": backup_path,
+                        "backup_name": backup_name,
+                    }
+                )
+
+            def described() -> tuple[dict[str, Any], dict[str, Any]]:
+                return (
+                    {
+                        "old_exists": prepared[0]["old_exists"],
+                        "old_digest": prepared[0]["old_digest"],
+                        "new_exists": True,
+                        "new_digest": prepared[0]["new_digest"],
+                        "backup": prepared[0]["backup_name"],
+                    },
+                    {
+                        "old_exists": prepared[1]["old_exists"],
+                        "old_digest": prepared[1]["old_digest"],
+                        "new_exists": True,
+                        "new_digest": prepared[1]["new_digest"],
+                        "backup": prepared[1]["backup_name"],
+                    },
+                )
+
+            index_desc, progress_desc = described()
+            cls._write_cache_recovery_record(
+                recovery_path,
+                cls._cache_recovery_record_bytes(
+                    cls._RECOVERY_CACHE_PHASE_PREPARED,
+                    index_desc,
+                    progress_desc,
+                ),
+            )
+            phases = (
+                (index_path, index_tmp, cls._RECOVERY_CACHE_PHASE_INDEX),
+                (
+                    progress_path,
+                    progress_tmp,
+                    cls._RECOVERY_CACHE_PHASE_PROGRESS,
+                ),
+            )
+            for target, tmp_path, phase in phases:
+                cls._fsync_directory(directory)
+                os.replace(tmp_path, target)
+                cls._fsync_directory(directory)
+                index_desc, progress_desc = described()
+                cls._write_cache_recovery_record(
+                    recovery_path,
+                    cls._cache_recovery_record_bytes(
+                        phase, index_desc, progress_desc
+                    ),
+                )
+            for entry in prepared:
+                if entry["backup_path"] is not None:
+                    os.remove(entry["backup_path"])
+            cls._fsync_directory(directory)
+            os.remove(recovery_path)
+            cls._fsync_directory(directory)
+        except BaseException:
+            if os.path.lexists(recovery_path):
+                # A durable record exists, so one or both replacements
+                # may have landed: converge exactly as a fresh process
+                # would. If convergence itself fails its exception
+                # (ValueError with all evidence retained for corrupt
+                # material, OSError for a failed restore/cleanup/sync)
+                # propagates instead of the original.
+                cls._recover_cache_publication_locked(
+                    index_path, progress_path, recovery_path
+                )
+            else:
+                # The record was never durable, so no replacement could
+                # have become visible: discard this call's backups and
+                # temps without touching the targets.
+                for entry in prepared:
+                    backup_path = entry["backup_path"]
+                    if backup_path is not None and os.path.lexists(
+                        backup_path
+                    ):
+                        with contextlib.suppress(OSError):
+                            os.remove(backup_path)
+            for entry in prepared:
+                if os.path.lexists(entry["tmp"]):
+                    with contextlib.suppress(OSError):
+                        os.remove(entry["tmp"])
+            raise
+
+    @classmethod
     def _new_segment_index_temp(cls, index_path: str) -> tuple[Any, str]:
         """Create the temp file a fresh segment index is built into."""
         directory = os.path.dirname(os.path.abspath(index_path))
@@ -5936,6 +6535,7 @@ class BranchStore:
         wanted: set[int],
         progress_path: str | None = None,
         force_publish: bool = True,
+        recovery_path: str | None = None,
     ) -> tuple[int, str, dict[int, dict[str, Any]]]:
         """Authenticate the chain with bounded memory under the chain
         lock, keep the segment index (and, with a progress path, the
@@ -5958,12 +6558,21 @@ class BranchStore:
         reordered or duplicated chain -- raises :class:`ValueError`;
         caches never answer by themselves and cannot mask a chain
         defect.
+
+        With a ``recovery_path`` an interrupted two-cache publication
+        left by a previous process is finished or rolled back inside
+        this lock hold before any cache is read, so the scan only ever
+        starts from a complete old or complete new version.
         """
         lock_path = cls._recovery_chain_lock_path(path)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             cls._acquire_chain_lock(fd, None)
             try:
+                if recovery_path is not None:
+                    cls._recover_cache_publication_locked(
+                        index_path, progress_path, recovery_path
+                    )
                 if progress_path is None and not force_publish:
                     return cls._query_segment_scan_locked(
                         path, index_path, segment_size, wanted
@@ -5995,6 +6604,7 @@ class BranchStore:
                             segment_size,
                             wanted,
                             force_publish=force_publish,
+                            recovery_path=recovery_path,
                         )
                     except ValueError:
                         # A sound chain that forks from the recorded
@@ -6011,6 +6621,7 @@ class BranchStore:
                     wanted,
                     anchor=anchor if can_continue else None,
                     force_publish=force_publish,
+                    recovery_path=recovery_path,
                 )
             finally:
                 cls._release_chain_lock(fd)
@@ -6085,6 +6696,7 @@ class BranchStore:
         wanted: set[int],
         anchor: dict[str, Any] | None,
         force_publish: bool = True,
+        recovery_path: str | None = None,
     ) -> tuple[int, str, dict[int, dict[str, Any]]]:
         """One full authenticated chain scan that builds and publishes
         the caches rollback-safely; when ``anchor`` is given it enforces
@@ -6180,7 +6792,23 @@ class BranchStore:
                             "authenticated chain"
                         )
                     publications.append((progress_path, progress_tmp))
-            cls._publish_cache_files(publications)
+            if recovery_path is not None and progress_tmp is not None:
+                # Both caches are being replaced: publish them under the
+                # cross-process recovery protocol. An index-only update
+                # (no complete segment exists yet, so no progress temp
+                # was built) has no second version to protect and uses
+                # the single-cache rollback path instead; any earlier
+                # two-cache publication was already resolved before the
+                # caches were read.
+                cls._publish_caches_recovery_locked(
+                    index_path,
+                    index_tmp,
+                    progress_path,
+                    progress_tmp,
+                    recovery_path,
+                )
+            else:
+                cls._publish_cache_files(publications)
         except BaseException:
             # Remove the temps this call built that never reached a
             # publication slot (a binding or anchor failure raises
@@ -6206,6 +6834,7 @@ class BranchStore:
         segment_size: int,
         wanted: set[int],
         force_publish: bool = True,
+        recovery_path: str | None = None,
     ) -> tuple[int, str, dict[int, dict[str, Any]]]:
         """Build and publish both caches by appending past the progress
         boundary; raise :class:`ValueError` (typically
@@ -6414,7 +7043,16 @@ class BranchStore:
                         with contextlib.suppress(OSError):
                             os.remove(progress_tmp)
                     return count, head, captured
-            cls._publish_cache_files(publications)
+            if recovery_path is not None and progress_tmp is not None:
+                cls._publish_caches_recovery_locked(
+                    index_path,
+                    index_tmp,
+                    progress_path,
+                    progress_tmp,
+                    recovery_path,
+                )
+            else:
+                cls._publish_cache_files(publications)
         except BaseException:
             with contextlib.suppress(OSError):
                 os.remove(index_tmp)
@@ -6431,6 +7069,7 @@ class BranchStore:
         index_path: Any,
         segment_size: Any,
         progress_path: Any = None,
+        recovery_path: Any = None,
     ) -> str:
         """Build the disposable bounded-memory segmented index over a
         persistent recovery-audit chain and return the authenticated
@@ -6451,6 +7090,29 @@ class BranchStore:
         unreadable chain file, a missing index/progress directory or any
         failed open, flush, replace or sync raises :class:`OSError` and
         publishes nothing.
+
+        ``recovery_path`` is optional and validated after all the
+        arguments above: ``None`` (the default) keeps every prior
+        behavior; otherwise it must be a non-empty :class:`str` (a
+        non-``str`` raises :class:`TypeError`, an empty string
+        :class:`ValueError`) used together with a ``progress_path`` --
+        omitting progress raises :class:`ValueError` -- and must name
+        neither the chain, index nor progress file (even through an
+        alias), while the three cache files must share one directory
+        (otherwise :class:`ValueError`). Given a recovery path, every
+        call first finishes an earlier process's interrupted
+        publication: when the index and progress both carry the
+        recorded new version the new version is completed and the old
+        backups are removed, and every other recoverable state is
+        rolled back to the old version byte-for-byte (restoring absence
+        when the old target did not exist); only then does
+        authentication, a resuming build or a query begin. An
+        unparseable, malformed or checksum-bad recovery record, a
+        target matching neither recorded digest or a corrupt backup
+        raises :class:`ValueError` with all targets, backups and the
+        record preserved as evidence; a missing parent directory or a
+        failed open, read, write, flush, replace, delete or directory
+        sync raises :class:`OSError`.
 
         The build competes with appends for the same chain lock and
         re-checks the chain file's identity inside the lock, so it only
@@ -6489,11 +7151,20 @@ class BranchStore:
         directories, flushed and fsync-ed, then published under a
         rollback-safe protocol that restores any replaced target
         byte-for-byte if a later step fails; concurrent readers see
-        only a complete old or new cache. A crashed or failed build
-        never rewrites the chain file and removes its temp and backup
-        files. Whether the build succeeds or fails, nothing under the
-        generation directory -- business state, audits, idempotency
-        records or the journal attachment -- is modified.
+        only a complete old or new cache. With a ``recovery_path`` the
+        two targets are published under the chain lock with durable
+        backups of both old targets made first, a checksummed recovery
+        record (version, phase, each target's old/new existence and
+        SHA-256 digest and the backup names) made durable before the
+        first replacement and updated and directory-synced after each
+        replacement, and the backups and record removed only after the
+        complete new version is on disk; a process dying at any point
+        therefore resumes across processes as described above. A
+        crashed or failed build never rewrites the chain file and
+        removes its temp and backup files. Whether the build succeeds
+        or fails, nothing under the generation directory -- business
+        state, audits, idempotency records or the journal attachment --
+        is modified.
         """
         cls._validate_chain_path(path)
         cls._validate_index_path(index_path)
@@ -6502,8 +7173,18 @@ class BranchStore:
         cls._validate_progress_path(progress_path)
         if progress_path is not None:
             cls._validate_progress_target(path, index_path, progress_path)
+        cls._validate_recovery_path(recovery_path)
+        if recovery_path is not None:
+            cls._validate_recovery_target(
+                path, index_path, progress_path, recovery_path
+            )
         _count, head, _captured = cls._segmented_chain_scan(
-            path, index_path, segment_size, set(), progress_path
+            path,
+            index_path,
+            segment_size,
+            set(),
+            progress_path,
+            recovery_path=recovery_path,
         )
         return head
 
@@ -6516,6 +7197,7 @@ class BranchStore:
         index_path: Any,
         segment_size: Any,
         progress_path: Any = None,
+        recovery_path: Any = None,
     ) -> tuple[dict[str, Any], ...]:
         """Compare the audit records sealed at the endpoints of many
         chain ranges in one batch, strictly read-only.
@@ -6541,7 +7223,17 @@ class BranchStore:
         semantics exactly as before; a non-``str`` raises
         :class:`TypeError`, an empty string :class:`ValueError`, and a
         path naming the chain or index (even through an alias) raises
-        :class:`ValueError`.
+        :class:`ValueError`. ``recovery_path`` is optional and validated
+        last, exactly as for :meth:`build_recovery_audit_segments`:
+        ``None`` keeps every prior behavior, a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`, and the
+        path may only be used together with a ``progress_path`` and only
+        when it aliases none of the chain, index or progress files and
+        the three cache files share one directory (otherwise
+        :class:`ValueError`). Given a recovery path the batch first
+        finishes or rolls back an earlier process's interrupted
+        publication under the chain lock; success still returns exactly
+        the per-range dictionaries described below.
 
         The whole batch performs at most one locked canonical-chain
         scan and one segment check: the chain is authenticated under
@@ -6561,8 +7253,9 @@ class BranchStore:
         answer never comes from a cache. Memory grows only with the
         largest single frame and fixed buffers -- never with the total
         frame count or a range span. An empty ``ranges`` still
-        completes the path, head, segment-size, progress, chain and
-        segment-index authentication and then returns an empty tuple.
+        completes the path, head, segment-size, progress, recovery,
+        chain and segment-index authentication and then returns an
+        empty tuple.
 
         The result is a tuple of fresh dictionaries, one per input range
         in input order, each carrying ``start``, ``end`` and ``changes``
@@ -6613,6 +7306,11 @@ class BranchStore:
         cls._validate_progress_path(progress_path)
         if progress_path is not None:
             cls._validate_progress_target(path, index_path, progress_path)
+        cls._validate_recovery_path(recovery_path)
+        if recovery_path is not None:
+            cls._validate_recovery_target(
+                path, index_path, progress_path, recovery_path
+            )
         wanted: set[int] = set()
         for start, end in normalized:
             wanted.add(start)
@@ -6624,6 +7322,7 @@ class BranchStore:
             wanted,
             progress_path,
             force_publish=False,
+            recovery_path=recovery_path,
         )
         if not hmac.compare_digest(head, expected_head):
             raise ValueError(
