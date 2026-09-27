@@ -10117,6 +10117,845 @@ class BranchStore:
         return dict(snapshot), items, rotated, absent
 
     @classmethod
+    def compare_diagnostic_ledger_proofs(
+        cls, before: Any, after: Any
+    ) -> dict[str, Any]:
+        """Compare two offline diagnostic ledger proofs for continuous
+        history, with no access to the original ledgers.
+
+        ``before`` and ``after`` are validated in that order: each must
+        be the canonical :class:`str` returned by
+        :meth:`export_diagnostic_ledger_proof`, in transaction identity
+        mode, and both proofs must request exactly the same ordered
+        identity set. A non-:class:`str` raises :class:`TypeError`; an
+        empty string, a non-canonical or unauthenticatable proof, a
+        non-transaction filter mode or a differing identity set (in
+        content or order) raises :class:`ValueError`.
+
+        Each proof is independently fully re-authenticated exactly as
+        :meth:`verify_diagnostic_ledger_proof` does. Its manifest gives
+        a contiguous retained window of immutable, hash-chained
+        segments anchored either on genesis or on the authenticated
+        rotated-prefix evidence's prefix-end segment digest. The two
+        windows are aligned by segment index and digest and classified:
+
+        * ``"same"`` -- the authenticated snapshots are equivalent (the
+          same manifest content digest): ``common`` is the whole
+          history and the exclusive lists are empty tuples;
+        * ``"continued"`` -- ``after`` extends ``before`` along the same
+          chain, either by appending segments directly to ``before``'s
+          tail or by a rotation in which ``before``'s tail becomes part
+          of ``after``'s authenticated prefix. Rotation continuity must
+          be shown by a concrete *transition* segment -- a segment
+          ``before`` proves whose digest is exactly ``after``'s
+          prefix-end anchor (or one both sides retain); an aggregate
+          prefix digest alone can never bridge the two ends.
+          ``after``'s prefix evidence must precisely inherit
+          ``before``'s history: the same identities in chain order as
+          a prefix, plus the identities of the concrete segments that
+          newly rotate. ``after_only`` carries only the genuinely new
+          segments and ``rotated`` lists, in proof request order, the
+          requested identities that newly enter ``after``'s prefix
+          evidence;
+        * ``"forked"`` -- the chains authenticate one shared segment
+          (concrete on both sides, or concrete on one and exactly equal
+          to the other's prefix-end anchor) and then extend it with two
+          different valid successors; ``before_only`` and
+          ``after_only`` carry each side's exclusive chain from the
+          divergence point onward.
+
+        ``common`` is the last segment the two sides prove identically,
+        digest for digest: a fresh mapping with the segment ``index``,
+        ``digest`` and the cumulative ``entries`` through it, or
+        ``None`` for the empty-ledger genesis. An empty ``before`` (no
+        prefix, no retained segments) starts any ``after`` as
+        ``"continued"`` with ``common`` ``None``. Apart from that
+        start, two non-empty histories with no authenticable shared or
+        transition segment are a cross-ledger splice and raise
+        :class:`ValueError`, as do: ``after`` being a strict prefix of
+        ``before`` (a rollback); a rotation that passes ``before``'s
+        tail without a connecting transition segment; and any
+        contradiction at a shared position -- digest, entry count, time
+        bounds or entry body -- i.e. a history rewrite.
+
+        Returns a fresh mapping with ``relation``, ``common``,
+        ``before_only``, ``after_only`` and ``rotated`` in that order.
+        Each exclusive item is a fresh mapping with the segment
+        ``index``, ``digest`` and an ``entries`` tuple of isolated
+        ``at``/``summary``/``records`` copies in that segment's chain
+        order; ``same`` yields empty tuples and ``continued`` only
+        fills ``after_only``. The result shares no mutable level with
+        either proof string, and a succeeding or failing call never
+        modifies any proof, ledger, event graph, business audit or
+        idempotency state.
+        """
+        if not isinstance(before, str):
+            raise TypeError(
+                "before proof must be a str, got "
+                f"{type(before).__name__}"
+            )
+        if not before:
+            raise ValueError("before proof must be a non-empty str")
+        before_state = cls._load_comparison_proof(before)
+        if not isinstance(after, str):
+            raise TypeError(
+                "after proof must be a str, got "
+                f"{type(after).__name__}"
+            )
+        if not after:
+            raise ValueError("after proof must be a non-empty str")
+        after_state = cls._load_comparison_proof(after)
+        transaction_mode = (
+            cls._DIAGNOSTIC_LEDGER_PROOF_FILTER_MODE_TRANSACTIONS
+        )
+        if before_state["mode"]["mode"] != transaction_mode:
+            raise ValueError(
+                "before proof must use the transaction identity mode"
+            )
+        if after_state["mode"]["mode"] != transaction_mode:
+            raise ValueError(
+                "after proof must use the transaction identity mode"
+            )
+        requested = before_state["mode"]["transactions"]
+        if requested != after_state["mode"]["transactions"]:
+            raise ValueError(
+                "the two proofs must request the same ordered "
+                "transaction identity set"
+            )
+        return cls._classify_diagnostic_ledger_proofs(
+            before_state, after_state, requested
+        )
+
+    @classmethod
+    def _classify_diagnostic_ledger_proofs(
+        cls,
+        before_state: dict[str, Any],
+        after_state: dict[str, Any],
+        requested: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Align two authenticated comparison views and build the
+        result mapping; see :meth:`compare_diagnostic_ledger_proofs`."""
+        before_nodes = before_state["nodes"]
+        after_nodes = after_state["nodes"]
+        # An empty ledger has no retained segment and no rotated prefix
+        # (its chain is anchored on genesis at position zero).
+        before_empty = (
+            not before_nodes and before_state["anchor"]["index"] == 0
+        )
+        after_empty = (
+            not after_nodes and after_state["anchor"]["index"] == 0
+        )
+
+        def isolated_segment(node: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "index": node["index"],
+                "digest": node["digest"],
+                "entries": tuple(
+                    {
+                        "at": at,
+                        "summary": dict(summary),
+                        "records": tuple(chain),
+                    }
+                    for at, summary, chain in node["items"]
+                ),
+            }
+
+        def result(relation, common, before_only, after_only, rotated):
+            return {
+                "relation": relation,
+                "common": common,
+                "before_only": tuple(before_only),
+                "after_only": tuple(after_only),
+                "rotated": tuple(rotated),
+            }
+
+        # Equal manifest content is snapshot equivalence: export is
+        # deterministic for one snapshot and filter.
+        if hmac.compare_digest(
+            before_state["manifest_digest"],
+            after_state["manifest_digest"],
+        ):
+            if [node["index"] for node in before_nodes] != [
+                node["index"] for node in after_nodes
+            ] or any(
+                not hmac.compare_digest(left["digest"], right["digest"])
+                for left, right in zip(before_nodes, after_nodes)
+            ):
+                raise ValueError(
+                    "equal proof snapshots disagree in their "
+                    "authenticated histories"
+                )
+            common = (
+                None
+                if not before_nodes
+                else cls._comparison_boundary_at(
+                    before_nodes[-1]["index"],
+                    before_state,
+                    after_state,
+                )
+            )
+            return result("same", common, (), (), ())
+
+        if before_empty and after_empty:
+            raise ValueError(
+                "two different empty snapshots cannot be compared as "
+                "one continuous ledger"
+            )
+        if before_empty:
+            # The empty ledger starts every history.
+            return result(
+                "continued",
+                None,
+                (),
+                (isolated_segment(node) for node in after_nodes),
+                (),
+            )
+        if after_empty:
+            raise ValueError(
+                "the after proof is a strict historical prefix of the "
+                "before proof"
+            )
+
+        before_anchor = before_state["anchor"]
+        after_anchor = after_state["anchor"]
+        before_lo = before_nodes[0]["index"]
+        before_hi = before_nodes[-1]["index"]
+        after_lo = after_nodes[0]["index"]
+        after_hi = after_nodes[-1]["index"]
+        before_pos = before_anchor["index"]
+        after_pos = after_anchor["index"]
+
+        # Concrete overlap of the two retained windows.
+        if before_lo <= after_hi and after_lo <= before_hi:
+            first = max(before_lo, after_lo)
+            last = min(before_hi, after_hi)
+            mismatch: int | None = None
+            for index in range(first, last + 1):
+                left = before_nodes[index - before_lo]
+                right = after_nodes[index - after_lo]
+                if not hmac.compare_digest(left["digest"], right["digest"]):
+                    mismatch = index
+                    break
+            if mismatch is not None:
+                # A fork needs both sides to authenticate the same
+                # predecessor segment: concretely retained, or exactly
+                # equal to the other side's prefix-end anchor. Genesis
+                # alone is not a shared segment, so a first-segment
+                # disagreement is a cross-ledger splice.
+                predecessor = mismatch - 1
+                if predecessor < 1:
+                    raise ValueError(
+                        "the two proofs share no authenticable history "
+                        "segment; they cannot be compared as one "
+                        "continuous ledger"
+                    )
+                boundary = cls._comparison_fork_boundary(
+                    predecessor, before_state, after_state
+                )
+                cls._comparison_reconcile_fork_prefix(
+                    predecessor, before_state, after_state
+                )
+                return result(
+                    "forked",
+                    boundary,
+                    (
+                        isolated_segment(node)
+                        for node in before_nodes
+                        if node["index"] >= mismatch
+                    ),
+                    (
+                        isolated_segment(node)
+                        for node in after_nodes
+                        if node["index"] >= mismatch
+                    ),
+                    (),
+                )
+            # Every shared concrete segment is byte-for-byte identical.
+            # The prefix anchors must precisely inherit the same history
+            # wherever one side rotated past the other's window start.
+            cls._comparison_check_anchors(before_state, after_state)
+            boundary = cls._comparison_boundary_at(
+                last, before_state, after_state
+            )
+            if before_hi < after_hi:
+                return result(
+                    "continued",
+                    boundary,
+                    (),
+                    (
+                        isolated_segment(node)
+                        for node in after_nodes
+                        if node["index"] > before_hi
+                    ),
+                    cls._comparison_newly_rotated(
+                        before_state, after_state, requested
+                    ),
+                )
+            if before_hi > after_hi:
+                raise ValueError(
+                    "the after proof is a strict historical prefix of "
+                    "the before proof"
+                )
+            # Same chain end, different retention shape: a continuous
+            # history with no new segment (after_only empty); any newly
+            # remembered prefix identities are still reported.
+            return result(
+                "continued",
+                boundary,
+                (),
+                (),
+                cls._comparison_newly_rotated(
+                    before_state, after_state, requested
+                ),
+            )
+
+        # The retained windows do not overlap concretely.
+        transition_index = after_pos
+        if (
+            before_lo <= transition_index <= before_hi
+            and transition_index == before_hi
+            and after_lo == transition_index + 1
+        ):
+            # after's prefix ends exactly on before's concrete tail and
+            # after continues with strictly newer segments.
+            tail = before_nodes[transition_index - before_lo]
+            cls._comparison_check_transition(
+                tail, before_state, after_state
+            )
+            boundary = cls._comparison_boundary_at(
+                transition_index, before_state, after_state
+            )
+            return result(
+                "continued",
+                boundary,
+                (),
+                (isolated_segment(node) for node in after_nodes),
+                cls._comparison_newly_rotated(
+                    before_state, after_state, requested
+                ),
+            )
+        if after_pos > before_hi:
+            raise ValueError(
+                "rotation advances past the before proof's tail without "
+                "a transition segment connecting the two ends; "
+                "continuity cannot be inferred from an aggregate "
+                "prefix digest"
+            )
+        if before_pos >= after_hi:
+            raise ValueError(
+                "the after proof is a strict historical prefix of the "
+                "before proof"
+            )
+        raise ValueError(
+            "the two proofs share no authenticable history segment and "
+            "no transition segment connects them; they cannot be "
+            "compared as one continuous ledger"
+        )
+
+    @classmethod
+    def _comparison_position_digest(
+        cls, state: dict[str, Any], index: int
+    ) -> dict[str, Any] | None:
+        """What one authenticated view proves about chain position
+        ``index``: a concrete retained node or, when ``index`` is its
+        prefix-end position, the anchor summary. Returns ``None`` when
+        the view proves nothing about that position."""
+        for node in state["nodes"]:
+            if node["index"] == index:
+                return node
+        anchor = state["anchor"]
+        if anchor["index"] == index:
+            return anchor
+        return None
+
+    @classmethod
+    def _comparison_fork_boundary(
+        cls,
+        predecessor: int,
+        before_state: dict[str, Any],
+        after_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the common boundary for a divergence at
+        ``predecessor + 1``, requiring both sides to authenticate the
+        predecessor segment with the same digest. At least one side must
+        prove that segment *concretely* (a retained body): a digest that
+        both sides know only as an aggregate prefix anchor can never
+        establish a shared fork point. Otherwise a :class:`ValueError`
+        is raised."""
+        left_is_node = any(
+            node["index"] == predecessor for node in before_state["nodes"]
+        )
+        right_is_node = any(
+            node["index"] == predecessor for node in after_state["nodes"]
+        )
+        if not left_is_node and not right_is_node:
+            raise ValueError(
+                "the supposed fork point is proved only by aggregate "
+                "prefix digests, never by a concrete shared segment; "
+                "continuity cannot be inferred from them"
+            )
+        left = cls._comparison_position_digest(before_state, predecessor)
+        right = cls._comparison_position_digest(after_state, predecessor)
+        if left is None or right is None:
+            raise ValueError(
+                "the two proofs share no authenticable history segment "
+                "at the divergence point"
+            )
+        if not hmac.compare_digest(left["digest"], right["digest"]):
+            raise ValueError(
+                "the two proofs disagree at the supposed fork "
+                "predecessor; no shared history is provable"
+            )
+        return cls._comparison_boundary_at(
+            predecessor, before_state, after_state
+        )
+
+    @classmethod
+    def _comparison_reconcile_fork_prefix(
+        cls,
+        predecessor: int,
+        before_state: dict[str, Any],
+        after_state: dict[str, Any],
+    ) -> None:
+        """At a fork, when one side only knows the shared predecessor
+        through its prefix-end anchor, verify its evidence precisely
+        reproduces the prefix history the other side proves concretely
+        (identities in chain order, counts and time bounds). A genesis
+        anchor (index 0) carries no evidence to reconcile."""
+        before_anchor = before_state["anchor"]
+        after_anchor = after_state["anchor"]
+        if (
+            after_anchor["index"] == predecessor
+            and before_anchor["index"] < predecessor
+        ):
+            cls._comparison_require_anchor_matches_node(
+                after_anchor,
+                before_state,
+                predecessor,
+            )
+            cls._comparison_require_evidence_inherits(
+                before_state, after_state, predecessor
+            )
+        if (
+            before_anchor["index"] == predecessor
+            and after_anchor["index"] < predecessor
+        ):
+            cls._comparison_require_anchor_matches_node(
+                before_anchor,
+                after_state,
+                predecessor,
+            )
+            cls._comparison_require_evidence_inherits(
+                after_state, before_state, predecessor
+            )
+
+    @classmethod
+    def _comparison_check_anchors(
+        cls, before_state: dict[str, Any], after_state: dict[str, Any]
+    ) -> None:
+        """With a fully matching concrete overlap, verify the rotated
+        prefixes inherit each other precisely: the side that rotated
+        further ends its prefix exactly on a segment the other side
+        retains (digest, cumulative entries, time bounds), and its
+        evidence identities begin with the shorter prefix's identities
+        and continue with the concrete segment identities in chain
+        order. Any contradiction raises :class:`ValueError`."""
+        before_anchor = before_state["anchor"]
+        after_anchor = after_state["anchor"]
+        before_pos = before_anchor["index"]
+        after_pos = after_anchor["index"]
+        if before_pos == after_pos:
+            if not hmac.compare_digest(
+                before_anchor["digest"], after_anchor["digest"]
+            ):
+                raise ValueError(
+                    "the two proofs anchor their chains on different "
+                    "prefix digests at the same position"
+                )
+            if (
+                before_state["evidence_transactions"]
+                != after_state["evidence_transactions"]
+            ):
+                raise ValueError(
+                    "the two prefix evidence records disagree at the "
+                    "same position"
+                )
+            return
+        if before_pos < after_pos:
+            cls._comparison_require_anchor_matches_node(
+                after_anchor, before_state, after_pos
+            )
+            cls._comparison_require_evidence_inherits(
+                before_state, after_state, after_pos
+            )
+        else:
+            cls._comparison_require_anchor_matches_node(
+                before_anchor, after_state, before_pos
+            )
+            cls._comparison_require_evidence_inherits(
+                after_state, before_state, before_pos
+            )
+
+    @classmethod
+    def _comparison_require_anchor_matches_node(
+        cls,
+        anchor: dict[str, Any],
+        other_state: dict[str, Any],
+        position: int,
+    ) -> None:
+        """Require a prefix-end anchor ending at ``position`` to equal
+        the concrete segment the other view retains there, in digest,
+        cumulative entry count and time bounds."""
+        node = None
+        for candidate in other_state["nodes"]:
+            if candidate["index"] == position:
+                node = candidate
+                break
+        if node is None:
+            raise ValueError(
+                "rotation advances past the other proof's retained "
+                "history without a concrete transition segment"
+            )
+        if not hmac.compare_digest(anchor["digest"], node["digest"]):
+            raise ValueError(
+                "a rotated-prefix anchor does not match the concrete "
+                "segment the other proof retains at that position"
+            )
+        if anchor["last_at"] != node["last_at"]:
+            raise ValueError(
+                "the rotated-prefix last time bound does not match the "
+                "concrete history at that position"
+            )
+        cumulative = cls._comparison_cumulative_entries(
+            other_state, position
+        )
+        if anchor["entries"] != cumulative:
+            raise ValueError(
+                "the rotated-prefix entry count does not match the "
+                "concrete history at that position"
+            )
+        other_anchor = other_state["anchor"]
+        if other_anchor["index"] > 0:
+            if anchor["first_at"] != other_anchor["first_at"]:
+                raise ValueError(
+                    "the rotated prefixes disagree on their first time "
+                    "bound"
+                )
+        else:
+            # The other side never rotated: its first retained segment
+            # is the genesis segment and carries the prefix's start.
+            if anchor["first_at"] != other_state["nodes"][0]["first_at"]:
+                raise ValueError(
+                    "the rotated prefix's first time bound does not "
+                    "match the beginning of the concrete history"
+                )
+
+    @classmethod
+    def _comparison_require_evidence_inherits(
+        cls,
+        shorter_state: dict[str, Any],
+        longer_state: dict[str, Any],
+        position: int,
+    ) -> None:
+        """Require the longer prefix's evidence to reproduce the shorter
+        view's whole history through ``position`` exactly: the shorter
+        prefix's evidence identities as the chain-order prefix followed
+        by the transaction identities of the concrete segments the
+        shorter view retains up to ``position``."""
+        shorter_ids = shorter_state["evidence_transactions"]
+        longer_ids = tuple(longer_state["evidence_transactions"])
+        if longer_ids[: len(shorter_ids)] != tuple(shorter_ids):
+            raise ValueError(
+                "the longer rotated-prefix evidence does not inherit "
+                "the shorter prefix's identities in chain order"
+            )
+        concrete_identities: list[str] = []
+        for node in shorter_state["nodes"]:
+            if node["index"] > position:
+                break
+            for _at, summary, _chain in node["items"]:
+                concrete_identities.append(summary["transaction"])
+        if (
+            tuple(longer_ids[len(shorter_ids) :])
+            != tuple(concrete_identities)
+        ):
+            raise ValueError(
+                "the rotated-prefix evidence does not reproduce the "
+                "concrete segment identities it claims to inherit"
+            )
+        anchor = longer_state["anchor"]
+        if len(longer_ids) != anchor["entries"]:
+            raise ValueError(
+                "the rotated-prefix evidence entry count does not match "
+                "its prefix proof"
+            )
+
+    @classmethod
+    def _comparison_check_transition(
+        cls,
+        tail: dict[str, Any],
+        before_state: dict[str, Any],
+        after_state: dict[str, Any],
+    ) -> None:
+        """Verify the disjoint-window continuation: ``after``'s
+        prefix-end anchor equals ``before``'s concrete tail and its
+        evidence precisely reproduces all of ``before``'s history."""
+        anchor = after_state["anchor"]
+        if not hmac.compare_digest(anchor["digest"], tail["digest"]):
+            raise ValueError(
+                "the after proof's prefix end does not match the "
+                "before proof's tail segment"
+            )
+        if anchor["last_at"] != tail["last_at"]:
+            raise ValueError(
+                "the after prefix's last time bound does not match the "
+                "before tail segment"
+            )
+        cumulative = cls._comparison_cumulative_entries(
+            before_state, tail["index"]
+        )
+        if anchor["entries"] != cumulative:
+            raise ValueError(
+                "the after prefix's entry count does not match the "
+                "before history through its tail"
+            )
+        before_anchor = before_state["anchor"]
+        if before_anchor["index"] > 0:
+            if anchor["first_at"] != before_anchor["first_at"]:
+                raise ValueError(
+                    "the after prefix's first time bound does not "
+                    "inherit the before prefix"
+                )
+        else:
+            # before never rotated: its first retained segment is the
+            # genesis segment.
+            if anchor["first_at"] != before_state["nodes"][0]["first_at"]:
+                raise ValueError(
+                    "the after prefix's first time bound does not match "
+                    "the beginning of the before history"
+                )
+        cls._comparison_require_evidence_inherits(
+            before_state, after_state, tail["index"]
+        )
+
+    @classmethod
+    def _comparison_boundary_at(
+        cls,
+        index: int,
+        before_state: dict[str, Any],
+        after_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the fresh ``common`` boundary mapping at chain
+        position ``index`` (proved by at least one side, concretely or
+        through its prefix-end anchor), requiring both sides to agree on
+        the digest and the cumulative entry count there. A disagreement
+        is a history rewrite and raises :class:`ValueError`."""
+        left = cls._comparison_position_digest(before_state, index)
+        right = cls._comparison_position_digest(after_state, index)
+        if left is None or right is None:
+            raise ValueError(
+                "the common boundary segment is not proved by both "
+                "proofs"
+            )
+        if not hmac.compare_digest(left["digest"], right["digest"]):
+            raise ValueError(
+                "the two proofs disagree on the common boundary digest"
+            )
+        before_total = cls._comparison_cumulative_entries(
+            before_state, index
+        )
+        after_total = cls._comparison_cumulative_entries(
+            after_state, index
+        )
+        if before_total != after_total:
+            raise ValueError(
+                "the two proofs disagree on the cumulative entry count "
+                "at their common boundary"
+            )
+        return {
+            "index": index,
+            "digest": left["digest"],
+            "entries": before_total,
+        }
+
+    @staticmethod
+    def _comparison_cumulative_entries(
+        state: dict[str, Any], index: int
+    ) -> int:
+        """Total entry count from genesis through segment ``index`` as
+        proved by one authenticated view: its prefix-end total plus the
+        retained segments up to and including ``index``. The caller only
+        asks for the view's anchor position or a retained segment."""
+        total = 0
+        anchor = state["anchor"]
+        if anchor is not None and anchor["index"] <= index:
+            total += anchor["entries"]
+        for node in state["nodes"]:
+            if node["index"] <= index:
+                total += node["entries_count"]
+        return total
+
+    @staticmethod
+    def _comparison_newly_rotated(
+        before_state: dict[str, Any],
+        after_state: dict[str, Any],
+        requested: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Requested identities that enter ``after``'s authenticated
+        prefix evidence relative to ``before``'s, in proof request
+        order. Identities remembered by both prefixes are not newly
+        rotated."""
+        before_prefix = set(before_state["evidence_transactions"])
+        after_prefix = set(after_state["evidence_transactions"])
+        return tuple(
+            identity
+            for identity in requested
+            if identity in after_prefix and identity not in before_prefix
+        )
+
+    @classmethod
+    def _load_comparison_proof(cls, proof: str) -> dict[str, Any]:
+        """Fully authenticate one comparison argument proof exactly as
+        :meth:`verify_diagnostic_ledger_proof` and reconstruct the
+        comparison view: its validated filter, manifest content digest,
+        retained segment nodes in chain order (each with isolated
+        authenticated entries), the genesis/rotated-prefix chain anchor
+        and the authenticated prefix-evidence identities. Any defect
+        raises :class:`ValueError`; the view shares nothing with the
+        proof string."""
+        if proof.startswith("﻿"):
+            raise ValueError("proof must be UTF-8 without a BOM")
+        if proof.endswith("\n") or proof.endswith("\r"):
+            raise ValueError("proof must not have a trailing newline")
+        try:
+            document = json.loads(
+                proof,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
+            raise ValueError(f"proof is not valid JSON: {exc}") from exc
+        if cls._canonical_json(document) != proof:
+            raise ValueError("proof is not canonical compact JSON")
+        cls._parse_diagnostic_ledger_proof(document, proof)
+        mode = cls._parse_diagnostic_ledger_proof_filter(
+            document["filter"]
+        )
+        # Full single-proof authentication (snapshot, chain, evidence,
+        # coverage, checksum); the returned public view is not needed for
+        # alignment, only its success.
+        cls._authenticate_diagnostic_ledger_proof(document, mode)
+        checksum = document["checksum"]
+        body = {
+            key: value
+            for key, value in document.items()
+            if key != "checksum"
+        }
+        if not hmac.compare_digest(
+            checksum,
+            hashlib.sha256(
+                cls._canonical_json(body).encode("utf-8")
+            ).hexdigest(),
+        ):
+            raise ValueError("proof checksum does not verify")
+
+        manifest_object = document["manifest"]
+        manifest_raw = cls._canonical_json(manifest_object).encode(
+            "utf-8"
+        )
+        segments, dropped, _evidence_ref, manifest_digest = (
+            cls._parse_diagnostic_ledger_manifest(manifest_raw)
+        )
+        # Transaction-mode proofs carry every retained segment body
+        # (single-proof authentication above rejects any other set);
+        # rebuild each segment's authenticated entries from its embedded
+        # body for the exclusive lists.
+        embedded: dict[str, dict[str, Any]] = {}
+        for entry in document["segments"]:
+            name = entry["name"]
+            segment_raw = cls._canonical_json(entry["document"]).encode(
+                "utf-8"
+            )
+            index, _prev, pairs, digest = (
+                cls._parse_diagnostic_ledger_segment(segment_raw)
+            )
+            embedded[name] = {
+                "index": index,
+                "pairs": pairs,
+                "digest": digest,
+            }
+        chains = tuple(
+            chain
+            for meta in segments
+            for _at, chain in embedded[meta["name"]]["pairs"]
+        )
+        summaries = cls._authenticate_recovery_diagnostic_chains(chains)
+        nodes: list[dict[str, Any]] = []
+        offset = 0
+        for meta in segments:
+            pairs = embedded[meta["name"]]["pairs"]
+            segment_items = []
+            for at, chain_records in pairs:
+                segment_items.append(
+                    (
+                        at,
+                        dict(summaries[offset]),
+                        tuple(chain_records),
+                    )
+                )
+                offset += 1
+            nodes.append(
+                {
+                    "index": meta["index"],
+                    "digest": meta["digest"],
+                    "entries_count": meta["entries"],
+                    "first_at": meta["first_at"],
+                    "last_at": meta["last_at"],
+                    "items": segment_items,
+                }
+            )
+        evidence_transactions: tuple[str, ...] = ()
+        if dropped is not None:
+            if not segments:
+                raise ValueError(
+                    "a proof with a rotated prefix must still retain at "
+                    "least one segment"
+                )
+            evidence_object = document["evidence"]
+            if not isinstance(evidence_object, dict):
+                raise ValueError(
+                    "proof is missing its rotated-prefix evidence"
+                )
+            evidence_raw = cls._canonical_json(
+                evidence_object
+            ).encode("utf-8")
+            evidence = cls._parse_diagnostic_ledger_evidence(evidence_raw)
+            evidence_transactions = tuple(evidence["transactions"])
+            anchor = {
+                "index": segments[0]["index"] - 1,
+                "digest": dropped["digest"],
+                "entries": dropped["entries"],
+                "first_at": dropped["first_at"],
+                "last_at": dropped["last_at"],
+            }
+        else:
+            # An unrotated history chains directly off genesis: position
+            # zero carries no entries and no time bounds.
+            anchor = {
+                "index": 0,
+                "digest": cls._DIAGNOSTIC_LEDGER_GENESIS_PREV,
+                "entries": 0,
+                "first_at": None,
+                "last_at": None,
+            }
+        return {
+            "mode": mode,
+            "manifest_digest": manifest_digest,
+            "nodes": nodes,
+            "anchor": anchor,
+            "evidence_transactions": evidence_transactions,
+        }
+
+    @classmethod
     def _publish_caches_recovery_locked(
         cls,
         index_path: str,
