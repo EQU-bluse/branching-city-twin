@@ -7049,6 +7049,661 @@ class BranchStore:
                 return (dict(summary), chain)
         raise KeyError(transaction)
 
+    _DIAGNOSTIC_LEDGER_FORMAT = "branching-city-twin/diagnostic-ledger"
+    _DIAGNOSTIC_LEDGER_VERSION = 1
+    _DIAGNOSTIC_LEDGER_SUPPORTED_VERSIONS = (1,)
+    _DIAGNOSTIC_LEDGER_KEYS = ("format", "version", "entries", "checksum")
+    _DIAGNOSTIC_LEDGER_ENTRY_KEYS = ("at", "chain")
+    _DIAGNOSTIC_LEDGER_CURSOR_FORMAT = (
+        "branching-city-twin/diagnostic-ledger-cursor"
+    )
+    _DIAGNOSTIC_LEDGER_CURSOR_VERSION = 1
+    _DIAGNOSTIC_LEDGER_CURSOR_SUPPORTED_VERSIONS = (1,)
+    _DIAGNOSTIC_LEDGER_CURSOR_KEYS = (
+        "format",
+        "version",
+        "identity",
+        "digest",
+        "start",
+        "end",
+        "transactions",
+        "offset",
+        "checksum",
+    )
+    _DIAGNOSTIC_LEDGER_IDENTITY_KEYS = ("device", "inode", "size")
+
+    @classmethod
+    def _validate_diagnostic_ledger_path(cls, path: Any) -> None:
+        """Validate the ledger ``path`` argument shared by both ledger
+        entry points: a non-:class:`str` raises :class:`TypeError` and
+        an empty string raises :class:`ValueError`."""
+        if not isinstance(path, str):
+            raise TypeError(
+                f"path must be a str, got {type(path).__name__}"
+            )
+        if not path:
+            raise ValueError("path must be a non-empty str")
+
+    @classmethod
+    def _validate_diagnostic_ledger_entries(
+        cls, entries: Any
+    ) -> list[tuple[int, tuple[str, ...]]]:
+        """Validate the ``entries`` argument of
+        :meth:`save_diagnostic_ledger` and return it as a list of
+        ``(time, chain)`` pairs in input order.
+
+        ``entries`` must be a :class:`tuple` of ``(time, chain)``
+        tuples; any other container or entry shape raises
+        :class:`TypeError`, as does a non-:class:`int` (or
+        :class:`bool`) time or a non-:class:`tuple` chain. A negative
+        time or a time that steps backwards raises :class:`ValueError`.
+        Chain authentication is the caller's next step, not checked
+        here."""
+        if not isinstance(entries, tuple):
+            raise TypeError(
+                "entries must be a tuple, got "
+                f"{type(entries).__name__}"
+            )
+        pairs: list[tuple[int, tuple[str, ...]]] = []
+        for entry in entries:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError(
+                    "every ledger entry must be a (time, chain) tuple"
+                )
+            at, chain = entry
+            if isinstance(at, bool) or not isinstance(at, int):
+                raise TypeError(
+                    "ledger entry time must be an int, got "
+                    f"{type(at).__name__}"
+                )
+            if at < 0:
+                raise ValueError("ledger entry time must be non-negative")
+            if not isinstance(chain, tuple):
+                raise TypeError(
+                    "ledger entry chain must be a tuple, got "
+                    f"{type(chain).__name__}"
+                )
+            pairs.append((at, chain))
+        previous_at: int | None = None
+        for at, _chain in pairs:
+            if previous_at is not None and at < previous_at:
+                raise ValueError(
+                    "ledger entry times must be non-decreasing"
+                )
+            previous_at = at
+        return pairs
+
+    @classmethod
+    def _diagnostic_ledger_document(
+        cls, pairs: list[tuple[int, tuple[str, ...]]]
+    ) -> bytes:
+        """Serialize the ledger document for ``pairs`` to its canonical
+        bytes: compact UTF-8 JSON, no BOM, no trailing newline, with a
+        SHA-256 checksum over the canonical body. ``pairs`` must
+        already be authenticated and sorted."""
+        document: dict[str, Any] = {
+            "format": cls._DIAGNOSTIC_LEDGER_FORMAT,
+            "version": cls._DIAGNOSTIC_LEDGER_VERSION,
+            "entries": [
+                {"at": at, "chain": list(chain)} for at, chain in pairs
+            ],
+        }
+        body = dict(document)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def save_diagnostic_ledger(cls, path: Any, entries: Any) -> None:
+        """Seal a snapshot of time-stamped recovery diagnostic chains
+        into a persistent ledger at ``path``, replacing any previous
+        ledger wholesale.
+
+        ``path`` must be a non-empty :class:`str` (a non-:class:`str`
+        raises :class:`TypeError`, an empty string :class:`ValueError`).
+        ``entries`` must be a :class:`tuple` of ``(time, chain)``
+        tuples -- any other shape or element type raises
+        :class:`TypeError`. Each time must be a non-``bool``
+        non-negative :class:`int` and the times must be non-decreasing;
+        a negative or regressing time raises :class:`ValueError`. Each
+        chain is authenticated exactly as
+        :meth:`summarize_recovery_diagnostics` authenticates a ledger
+        of chains: an empty chain, a malformed record, a sequence that
+        does not authenticate, a chain that never names a transaction
+        or a transaction identity duplicated across entries raises
+        :class:`ValueError`. An empty ``entries`` tuple seals an empty
+        ledger.
+
+        The ledger is compact UTF-8 JSON with no BOM and no trailing
+        newline, covered by a SHA-256 checksum over its canonical body,
+        with entries stored sorted by time and then transaction
+        identity. The document is written to a temporary file in the
+        same directory, flushed, fsync-ed and atomically moved onto
+        ``path``; any open, write, flush or replace failure raises
+        :class:`OSError` and leaves a previous ledger byte-for-byte
+        untouched.
+        """
+        cls._validate_diagnostic_ledger_path(path)
+        pairs = cls._validate_diagnostic_ledger_entries(entries)
+        chains = tuple(chain for _at, chain in pairs)
+        summaries = cls._authenticate_recovery_diagnostic_chains(chains)
+        order = sorted(
+            range(len(pairs)),
+            key=lambda index: (
+                pairs[index][0],
+                summaries[index]["transaction"],
+            ),
+        )
+        sorted_pairs = [pairs[index] for index in order]
+        data = cls._diagnostic_ledger_document(sorted_pairs)
+        cls._replace_durable(path, data, ".diagnostic-ledger-")
+
+    @classmethod
+    def _read_diagnostic_ledger(cls, path: str) -> tuple[bytes, Any]:
+        """Read the ledger file's raw bytes together with the
+        :func:`os.fstat` result of the descriptor they were read from,
+        so a cursor can bind the exact file identity behind one open.
+        Missing, unreadable or otherwise failing files raise
+        :class:`OSError`."""
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            stat_result = os.fstat(fd)
+            handle = os.fdopen(fd, "rb")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        with handle:
+            raw = handle.read()
+        return raw, stat_result
+
+    @classmethod
+    def _parse_diagnostic_ledger(
+        cls, raw: bytes
+    ) -> tuple[
+        list[tuple[int, tuple[str, ...]]], list[dict[str, Any]], str
+    ]:
+        """Strictly parse and authenticate the ledger document bytes,
+        returning ``(entries, summaries, digest)``: the ``(time,
+        chain)`` pairs in canonical order, one fresh summary mapping
+        per entry as :meth:`summarize_recovery_diagnostics` reports it,
+        and the SHA-256 hex digest of the raw file bytes.
+
+        Any encoding, canonical-form, duplicate-key, structure,
+        version or checksum defect raises :class:`ValueError`, as does
+        any embedded chain that does not authenticate, an entry time
+        that is not a non-``bool`` non-negative :class:`int`, a
+        duplicated transaction identity or entries stored out of
+        canonical (time, transaction) order. No partial view of a
+        defective ledger is ever produced."""
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"ledger is not valid UTF-8: {exc}"
+            ) from exc
+        if text.startswith("\ufeff"):
+            raise ValueError("ledger must be UTF-8 without a BOM")
+        if text.endswith("\n") or text.endswith("\r"):
+            raise ValueError("ledger must not have a trailing newline")
+        try:
+            document = json.loads(
+                text,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
+            raise ValueError(f"ledger is not valid JSON: {exc}") from exc
+        if cls._canonical_json(document) != text:
+            raise ValueError("ledger is not canonical compact JSON")
+        if not isinstance(document, dict) or set(document) != set(
+            cls._DIAGNOSTIC_LEDGER_KEYS
+        ):
+            raise ValueError("ledger has bad top-level keys")
+        if document["format"] != cls._DIAGNOSTIC_LEDGER_FORMAT:
+            raise ValueError("ledger has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in cls._DIAGNOSTIC_LEDGER_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("ledger has an unsupported version")
+        checksum = document["checksum"]
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or set(checksum) - cls._HEX_DIGITS
+        ):
+            raise ValueError("ledger checksum is malformed")
+        body = {
+            key: value
+            for key, value in document.items()
+            if key != "checksum"
+        }
+        if not hmac.compare_digest(
+            checksum,
+            hashlib.sha256(
+                cls._canonical_json(body).encode("utf-8")
+            ).hexdigest(),
+        ):
+            raise ValueError("ledger checksum does not verify")
+        raw_entries = document["entries"]
+        if not isinstance(raw_entries, list):
+            raise ValueError("ledger entries must be a list")
+        pairs: list[tuple[int, tuple[str, ...]]] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict) or set(
+                raw_entry
+            ) != set(cls._DIAGNOSTIC_LEDGER_ENTRY_KEYS):
+                raise ValueError("ledger entry has bad keys")
+            at = raw_entry["at"]
+            if (
+                isinstance(at, bool)
+                or not isinstance(at, int)
+                or at < 0
+            ):
+                raise ValueError("ledger entry time is malformed")
+            chain = raw_entry["chain"]
+            if not isinstance(chain, list) or not chain:
+                raise ValueError(
+                    "ledger entry chain must be a non-empty list"
+                )
+            for record in chain:
+                if not isinstance(record, str):
+                    raise ValueError(
+                        "ledger entry records must be str"
+                    )
+            pairs.append((at, tuple(chain)))
+        chains = tuple(chain for _at, chain in pairs)
+        summaries = cls._authenticate_recovery_diagnostic_chains(chains)
+        order_keys = [
+            (at, summaries[index]["transaction"])
+            for index, (at, _chain) in enumerate(pairs)
+        ]
+        if order_keys != sorted(order_keys):
+            raise ValueError(
+                "ledger entries are not in canonical order"
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        return pairs, summaries, digest
+
+    @staticmethod
+    def _validate_diagnostic_ledger_bound(
+        value: Any, name: str
+    ) -> int | None:
+        """Validate one inclusive time bound: ``None`` (unbounded) or a
+        non-``bool`` non-negative :class:`int`; anything else raises
+        :class:`TypeError`."""
+        if value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise TypeError(
+                f"{name} must be None or a non-negative int, got "
+                f"{type(value).__name__}"
+            )
+        return value
+
+    @staticmethod
+    def _validate_diagnostic_ledger_transactions(
+        transactions: Any,
+    ) -> tuple[str, ...] | None:
+        """Validate the transaction filter: ``None`` (match every
+        transaction) or a :class:`tuple` of distinct non-empty
+        :class:`str` identities -- an empty tuple matches nothing. A
+        non-:class:`tuple` container or non-:class:`str` element raises
+        :class:`TypeError`; an empty or duplicated identity raises
+        :class:`ValueError`. Returns the identities sorted, so equal
+        filters compare equal regardless of spelling order."""
+        if transactions is None:
+            return None
+        if not isinstance(transactions, tuple):
+            raise TypeError(
+                "transactions must be None or a tuple, got "
+                f"{type(transactions).__name__}"
+            )
+        seen: set[str] = set()
+        for item in transactions:
+            if not isinstance(item, str):
+                raise TypeError(
+                    "every transaction must be a str, got "
+                    f"{type(item).__name__}"
+                )
+            if not item:
+                raise ValueError(
+                    "transactions must not contain an empty identity"
+                )
+            if item in seen:
+                raise ValueError(
+                    "transactions must not contain duplicates"
+                )
+            seen.add(item)
+        return tuple(sorted(seen))
+
+    @staticmethod
+    def _validate_diagnostic_ledger_limit(limit: Any) -> int:
+        """Validate the page size: a non-``bool`` :class:`int` of at
+        least one; any other type raises :class:`TypeError` and a
+        smaller value raises :class:`ValueError`."""
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError(
+                f"limit must be an int, got {type(limit).__name__}"
+            )
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        return limit
+
+    @classmethod
+    def _seal_diagnostic_ledger_cursor(
+        cls,
+        identity: dict[str, int],
+        digest: str,
+        start: int | None,
+        end: int | None,
+        transactions: tuple[str, ...] | None,
+        offset: int,
+    ) -> str:
+        """Serialize a resumption cursor binding the ledger file's
+        identity and content digest, the query's filter conditions and
+        the next offset, checksummed like a diagnostic record."""
+        document: dict[str, Any] = {
+            "format": cls._DIAGNOSTIC_LEDGER_CURSOR_FORMAT,
+            "version": cls._DIAGNOSTIC_LEDGER_CURSOR_VERSION,
+            "identity": identity,
+            "digest": digest,
+            "start": start,
+            "end": end,
+            "transactions": (
+                None if transactions is None else list(transactions)
+            ),
+            "offset": offset,
+        }
+        body = dict(document)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document)
+
+    @classmethod
+    def _parse_diagnostic_ledger_cursor(cls, cursor: str) -> dict[str, Any]:
+        """Strictly parse and authenticate a resumption cursor,
+        returning its bound file identity, digest, filter conditions
+        and offset. An empty string, non-canonical encoding, structural
+        defect or checksum mismatch raises :class:`ValueError`. The
+        caller validates that ``cursor`` is a :class:`str`."""
+        if not cursor:
+            raise ValueError("cursor must be a non-empty str")
+        if cursor.startswith("\ufeff"):
+            raise ValueError("cursor must be UTF-8 without a BOM")
+        try:
+            document = json.loads(
+                cursor,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
+            raise ValueError(f"cursor is not valid JSON: {exc}") from exc
+        if cls._canonical_json(document) != cursor:
+            raise ValueError("cursor is not canonical compact JSON")
+        if not isinstance(document, dict) or set(document) != set(
+            cls._DIAGNOSTIC_LEDGER_CURSOR_KEYS
+        ):
+            raise ValueError("cursor has bad top-level keys")
+        if document["format"] != cls._DIAGNOSTIC_LEDGER_CURSOR_FORMAT:
+            raise ValueError("cursor has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in cls._DIAGNOSTIC_LEDGER_CURSOR_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("cursor has an unsupported version")
+        identity = document["identity"]
+        if not isinstance(identity, dict) or set(identity) != set(
+            cls._DIAGNOSTIC_LEDGER_IDENTITY_KEYS
+        ):
+            raise ValueError("cursor identity has bad keys")
+        for key in cls._DIAGNOSTIC_LEDGER_IDENTITY_KEYS:
+            field = identity[key]
+            if (
+                isinstance(field, bool)
+                or not isinstance(field, int)
+                or field < 0
+            ):
+                raise ValueError("cursor identity is malformed")
+        digest = document["digest"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or set(digest) - cls._HEX_DIGITS
+        ):
+            raise ValueError("cursor digest is malformed")
+
+        def parse_bound(value: Any) -> int | None:
+            if value is None:
+                return None
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError("cursor time bound is malformed")
+            return value
+
+        start = parse_bound(document["start"])
+        end = parse_bound(document["end"])
+        if start is not None and end is not None and start > end:
+            raise ValueError("cursor time bounds are reversed")
+        raw_transactions = document["transactions"]
+        transactions: tuple[str, ...] | None
+        if raw_transactions is None:
+            transactions = None
+        else:
+            if not isinstance(raw_transactions, list):
+                raise ValueError("cursor transactions must be a list")
+            for item in raw_transactions:
+                if not isinstance(item, str) or not item:
+                    raise ValueError(
+                        "cursor transactions must be non-empty str"
+                    )
+            if len(set(raw_transactions)) != len(
+                raw_transactions
+            ) or raw_transactions != sorted(raw_transactions):
+                raise ValueError(
+                    "cursor transactions are not canonical"
+                )
+            transactions = tuple(raw_transactions)
+        offset = document["offset"]
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+        ):
+            raise ValueError("cursor offset is malformed")
+        checksum = document["checksum"]
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or set(checksum) - cls._HEX_DIGITS
+        ):
+            raise ValueError("cursor checksum is malformed")
+        body = {
+            key: value
+            for key, value in document.items()
+            if key != "checksum"
+        }
+        if not hmac.compare_digest(
+            checksum,
+            hashlib.sha256(
+                cls._canonical_json(body).encode("utf-8")
+            ).hexdigest(),
+        ):
+            raise ValueError("cursor checksum does not verify")
+        return {
+            "identity": dict(identity),
+            "digest": digest,
+            "start": start,
+            "end": end,
+            "transactions": transactions,
+            "offset": offset,
+        }
+
+    @classmethod
+    def page_diagnostic_ledger(
+        cls,
+        path: Any,
+        start: Any,
+        end: Any,
+        transactions: Any,
+        limit: Any,
+        cursor: Any,
+    ) -> dict[str, Any]:
+        """Read one snapshot-consistent page from a sealed diagnostic
+        ledger, strictly read-only.
+
+        ``path`` must be a non-empty :class:`str` (a non-:class:`str`
+        raises :class:`TypeError`, an empty string :class:`ValueError`);
+        a missing, unreadable or unwritable-location file raises
+        :class:`OSError`. ``start`` and ``end`` are inclusive time
+        bounds: each may be ``None`` (unbounded) or a non-``bool``
+        non-negative :class:`int`, anything else raises
+        :class:`TypeError`, and ``start`` after ``end`` raises
+        :class:`ValueError`. ``transactions`` may be ``None`` (match
+        every transaction) or a :class:`tuple` of distinct non-empty
+        :class:`str` identities -- an empty tuple matches nothing; a
+        bad container or element type raises :class:`TypeError`, an
+        empty or duplicated identity :class:`ValueError`. Identities no
+        entry names are simply never matched, never an error.
+        ``limit`` must be a non-``bool`` positive :class:`int`
+        (:class:`TypeError` otherwise, :class:`ValueError` when below
+        one). ``cursor`` must be ``None`` (first page) or a cursor
+        string from a previous page: any other type raises
+        :class:`TypeError`; an empty, non-canonical or
+        checksum-invalid string raises :class:`ValueError`, as does a
+        cursor whose bound filter conditions differ from this call's.
+
+        A cursor binds the ledger file's identity and content digest,
+        so paging can resume across restarts; if the ledger was
+        replaced, truncated, appended to or otherwise modified since
+        the cursor was issued, the resume raises :class:`RuntimeError`
+        rather than mixing versions. A ledger whose encoding, checksum,
+        structure or embedded chain authentication is illegal raises
+        :class:`ValueError` and no partial page is returned.
+
+        Returns a new mapping with ``snapshot``, ``items`` and
+        ``next_cursor`` in that order. ``snapshot`` identifies the
+        ledger snapshot read (its content digest, entry count and byte
+        size) and is returned even when nothing matches. ``items`` is a
+        tuple of entries ordered by time and then transaction identity,
+        each a fresh mapping with the entry's time (``at``), its
+        ``summary`` as :meth:`summarize_recovery_diagnostics` reports
+        it and its ``records`` -- the chain's canonical tuple of
+        diagnostic strings. ``next_cursor`` is the resumption cursor
+        for the following page, or ``None`` on the last page. The
+        returned levels share no mutable state with each other or
+        across calls, and the call modifies nothing.
+        """
+        cls._validate_diagnostic_ledger_path(path)
+        start_value = cls._validate_diagnostic_ledger_bound(
+            start, "start"
+        )
+        end_value = cls._validate_diagnostic_ledger_bound(end, "end")
+        if (
+            start_value is not None
+            and end_value is not None
+            and start_value > end_value
+        ):
+            raise ValueError("start must not be after end")
+        filter_transactions = (
+            cls._validate_diagnostic_ledger_transactions(transactions)
+        )
+        page_limit = cls._validate_diagnostic_ledger_limit(limit)
+        if cursor is not None and not isinstance(cursor, str):
+            raise TypeError(
+                "cursor must be None or a str, got "
+                f"{type(cursor).__name__}"
+            )
+        bookmark = (
+            None
+            if cursor is None
+            else cls._parse_diagnostic_ledger_cursor(cursor)
+        )
+        raw, stat_result = cls._read_diagnostic_ledger(path)
+        identity = {
+            "device": stat_result.st_dev,
+            "inode": stat_result.st_ino,
+            "size": stat_result.st_size,
+        }
+        digest = hashlib.sha256(raw).hexdigest()
+        if bookmark is not None:
+            if (
+                bookmark["identity"] != identity
+                or bookmark["digest"] != digest
+            ):
+                raise RuntimeError(
+                    "the ledger changed since the cursor was issued; "
+                    "restart the query instead of mixing versions"
+                )
+            if (
+                bookmark["start"] != start_value
+                or bookmark["end"] != end_value
+                or bookmark["transactions"] != filter_transactions
+            ):
+                raise ValueError(
+                    "cursor does not match the requested filters"
+                )
+        pairs, summaries, _file_digest = cls._parse_diagnostic_ledger(raw)
+        wanted = (
+            None
+            if filter_transactions is None
+            else set(filter_transactions)
+        )
+        matched = [
+            (at, chain, summaries[index])
+            for index, (at, chain) in enumerate(pairs)
+            if (start_value is None or at >= start_value)
+            and (end_value is None or at <= end_value)
+            and (
+                wanted is None
+                or summaries[index]["transaction"] in wanted
+            )
+        ]
+        offset = 0 if bookmark is None else bookmark["offset"]
+        page = matched[offset : offset + page_limit]
+        remaining = len(matched) - offset - len(page)
+        next_cursor = None
+        if remaining > 0:
+            next_cursor = cls._seal_diagnostic_ledger_cursor(
+                identity,
+                digest,
+                start_value,
+                end_value,
+                filter_transactions,
+                offset + len(page),
+            )
+        items = tuple(
+            {
+                "at": at,
+                "summary": dict(summary),
+                "records": chain,
+            }
+            for at, chain, summary in page
+        )
+        snapshot = {
+            "digest": digest,
+            "entries": len(pairs),
+            "size": stat_result.st_size,
+        }
+        return {
+            "snapshot": snapshot,
+            "items": items,
+            "next_cursor": next_cursor,
+        }
+
     @classmethod
     def _publish_caches_recovery_locked(
         cls,
