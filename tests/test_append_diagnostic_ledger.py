@@ -37,6 +37,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -415,6 +416,39 @@ class AppendPublishTests(AppendTestBase):
             [".diagnostic-ledger.lock", "manifest.json", "segment-000001.json"],
         )
 
+    def test_failed_multi_segment_publish_removes_staged_segments(
+        self,
+    ) -> None:
+        first = self.append()  # publishes segment 1
+        real_write = BranchStore._write_diagnostic_ledger_file
+        calls = {"count": 0}
+
+        def flaky_write(path, data, prefix):
+            calls["count"] += 1
+            if prefix == ".diagnostic-ledger-segment-" and calls[
+                "count"
+            ] == 2:
+                raise OSError("boom")
+            return real_write(path, data, prefix)
+
+        with mock.patch.object(
+            BranchStore,
+            "_write_diagnostic_ledger_file",
+            staticmethod(flaky_write),
+        ):
+            with self.assertRaises(OSError):
+                self.append(
+                    entries=self.entries[2:6],
+                    expected=first,
+                    segment_limit=2,
+                )  # segments 2 and 3 staged; segment 3 fails
+        # The staged segment 2 is gone; only the old snapshot remains.
+        self.assertEqual(first, self.current_digest())
+        self.assertEqual(self.segment_names(), ["segment-000001.json"])
+        self.assertEqual(
+            [item["at"] for item in self.page()["items"]], [1, 2]
+        )
+
 
 class AppendRotationTests(AppendTestBase):
     def publish(self, entries, keep=2):
@@ -756,6 +790,444 @@ class DirectoryCorruptionTests(AppendTestBase):
             BranchStore.append_diagnostic_ledger(
                 self.dir, self.entries[4:6], "0" * 64, 2, 10, None
             )
+
+
+class RotatedTransactionMemoryTests(AppendTestBase):
+    """After rotation removes old segments, the ledger must still
+    remember every transaction identity that appeared in them."""
+
+    def publish(self, entries, keep):
+        expected = getattr(self, "_expected", None)
+        digest = BranchStore.append_diagnostic_ledger(
+            self.dir, entries, expected, 2, keep, None
+        )
+        self._expected = digest
+        return digest
+
+    def rotate_everything_away(self, keep=1):
+        for start in range(0, 8, 2):
+            digest = self.publish(self.entries[start : start + 2], keep)
+        return digest
+
+    def test_dropped_proof_lists_every_removed_identity(self) -> None:
+        self.rotate_everything_away()
+        dropped = self.manifest()["dropped"]
+        identities = [
+            BranchStore.summarize_recovery_diagnostics((chain,))[0][
+                "transaction"
+            ]
+            for chain in self.chains[:6]
+        ]
+        self.assertEqual(dropped["entries"], 6)
+        self.assertEqual(dropped["transactions"], sorted(identities))
+        # The proof is covered by the manifest checksum: parsing it
+        # through the public reader must authenticate it.
+        result = self.page()
+        self.assertEqual(result["snapshot"]["entries"], 2)
+
+    def test_rotated_identity_is_still_rejected(self) -> None:
+        digest = self.rotate_everything_away()
+        # Every rotated-away transaction lives in no retained segment.
+        self.assertEqual(
+            self.segment_names(), ["segment-000004.json"]
+        )
+        for index in range(6):
+            with self.subTest(transaction=index):
+                with self.assertRaises(ValueError):
+                    BranchStore.append_diagnostic_ledger(
+                        self.dir,
+                        ((9, self.chains[index]),),
+                        digest,
+                        2,
+                        1,
+                        None,
+                    )
+        # Nothing was written by the rejected appends.
+        self.assertEqual(self.current_digest(), digest)
+        self.assertEqual(self.segment_names(), ["segment-000004.json"])
+
+    def test_memory_survives_a_restart(self) -> None:
+        digest = self.rotate_everything_away()
+        # A fresh pager authenticates only durable files; rejection is
+        # re-derived from the authenticated proof every time.
+        self.assertEqual(
+            self.page()["snapshot"]["digest"], digest
+        )
+        for index in range(6):
+            with self.assertRaises(ValueError):
+                BranchStore.append_diagnostic_ledger(
+                    self.dir,
+                    ((9, self.chains[index]),),
+                    digest,
+                    2,
+                    1,
+                    None,
+                )
+
+    def test_proof_accumulates_across_repeated_rotations(self) -> None:
+        self.publish(self.entries[0:2], keep=2)
+        self.publish(self.entries[2:4], keep=2)
+        self.publish(self.entries[4:6], keep=2)  # drops segment 1
+        digest = self.publish(self.entries[6:8], keep=2)  # drops seg 2
+        identities = [
+            BranchStore.summarize_recovery_diagnostics((chain,))[0][
+                "transaction"
+            ]
+            for chain in self.chains[:4]
+        ]
+        self.assertEqual(
+            self.manifest()["dropped"]["transactions"],
+            sorted(identities),
+        )
+        for index in range(4):
+            with self.assertRaises(ValueError):
+                BranchStore.append_diagnostic_ledger(
+                    self.dir,
+                    ((9, self.chains[index]),),
+                    digest,
+                    2,
+                    2,
+                    None,
+                )
+
+    def current_digest(self) -> str:
+        return hashlib.sha256(
+            read_bytes(self.manifest_path())
+        ).hexdigest()
+
+
+class DroppedProofCorruptionTests(AppendTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        digest = BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[0:2], None, 2, 2, None
+        )
+        BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[2:4], digest, 2, 2, None
+        )
+        BranchStore.append_diagnostic_ledger(
+            self.dir,
+            self.entries[4:6],
+            self.current_digest(),
+            2,
+            2,
+            None,
+        )  # rotates segment 1 into the dropped proof
+
+    def current_digest(self) -> str:
+        return hashlib.sha256(
+            read_bytes(self.manifest_path())
+        ).hexdigest()
+
+    def write_manifest(self, document: dict) -> None:
+        with open(self.manifest_path(), "w", encoding="utf-8") as handle:
+            handle.write(reseal(document))
+
+    def tamper_dropped(self, rebuild) -> None:
+        document = self.manifest()
+        document["dropped"] = rebuild(document["dropped"])
+        self.write_manifest(document)
+
+    def assert_ledger_unusable(self) -> None:
+        with self.assertRaises(ValueError):
+            self.page()
+        with self.assertRaises(ValueError):
+            BranchStore.append_diagnostic_ledger(
+                self.dir, self.entries[6:8], "0" * 64, 2, 2, None
+            )
+
+    def test_missing_proof_field(self) -> None:
+        def rebuild(dropped):
+            return {
+                key: value
+                for key, value in dropped.items()
+                if key != "transactions"
+            }
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_extra_proof_field(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            tampered["extra"] = 1
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_proof_entries_count_mismatch(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            tampered["entries"] = dropped["entries"] + 1
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_proof_identities_unsorted(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            identities = list(dropped["transactions"])
+            tampered["transactions"] = list(reversed(identities))
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_proof_identities_duplicated(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            identities = list(dropped["transactions"])
+            tampered["transactions"] = [
+                identities[0],
+                identities[0],
+                *identities[1:],
+            ]
+            # Keep the count internally consistent so only the
+            # duplicate is judged.
+            tampered["entries"] = len(tampered["transactions"])
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_proof_identity_count_mismatch(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            tampered["transactions"] = [
+                *dropped["transactions"],
+                hashlib.sha256(b"extra").hexdigest(),
+            ]
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_proof_identity_bad_type(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            tampered["transactions"] = [
+                1,
+                *dropped["transactions"][1:],
+            ]
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+    def test_proof_identity_reappearing_in_segments(self) -> None:
+        # A proof identity that also names a retained entry breaks the
+        # boundary between prefix and retained segments.
+        manifest = self.manifest()
+        retained = BranchStore.summarize_recovery_diagnostics(
+            (self.chains[2],)
+        )[0]["transaction"]
+        manifest["dropped"]["transactions"][0] = retained
+        manifest["dropped"]["transactions"].sort()
+        self.write_manifest(manifest)
+        self.assert_ledger_unusable()
+
+    def test_proof_digest_mismatch(self) -> None:
+        def rebuild(dropped):
+            tampered = dict(dropped)
+            tampered["digest"] = "f" * 64
+            return tampered
+
+        self.tamper_dropped(rebuild)
+        self.assert_ledger_unusable()
+
+
+class DirectoryReadCoordinationTests(AppendTestBase):
+    def lock_path(self) -> str:
+        return os.path.join(
+            os.path.realpath(self.dir),
+            BranchStore._DIAGNOSTIC_LEDGER_LOCK_NAME,
+        )
+
+    def test_active_reader_blocks_a_publish_until_released(self) -> None:
+        digest = BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[:4], None, 2, 10, None
+        )
+        fd = os.open(self.lock_path(), os.O_RDWR)
+        completed = threading.Event()
+        try:
+            BranchStore._acquire_chain_lock(fd, None, shared=True)
+
+            def publish():
+                BranchStore.append_diagnostic_ledger(
+                    self.dir, self.entries[4:6], digest, 2, 10, None
+                )
+                completed.set()
+
+            thread = threading.Thread(target=publish)
+            thread.start()
+            self.assertFalse(completed.wait(0.4))
+            BranchStore._release_chain_lock(fd)
+            self.assertTrue(completed.wait(5))
+            thread.join()
+        finally:
+            BranchStore._release_chain_lock(fd)
+            os.close(fd)
+
+    def test_publish_waits_out_a_slow_page(self) -> None:
+        digest = BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[:4], None, 2, 10, None
+        )
+        published = threading.Event()
+
+        def publish():
+            BranchStore.append_diagnostic_ledger(
+                self.dir, self.entries[4:6], digest, 2, 10, None
+            )
+            published.set()
+
+        original = BranchStore._load_diagnostic_ledger_directory
+        main_thread = threading.current_thread()
+
+        def slow_load(directory, raw):
+            state = original(directory, raw)
+            if threading.current_thread() is main_thread:
+                thread = threading.Thread(target=publish)
+                thread.start()
+                self.assertFalse(published.wait(0.3))
+                time.sleep(0.2)
+            return state
+
+        with mock.patch.object(
+            BranchStore,
+            "_load_diagnostic_ledger_directory",
+            staticmethod(slow_load),
+        ):
+            result = self.page()
+        # The page observed the complete pre-switch snapshot.
+        self.assertEqual(result["snapshot"]["digest"], digest)
+        self.assertTrue(published.wait(5))
+
+    def test_pages_never_mix_versions_under_rotation(self) -> None:
+        digest = BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[:4], None, 2, 2, None
+        )
+        state = {"digest": digest, "index": 4}
+        state_lock = threading.Lock()
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def publisher():
+            while not stop.is_set():
+                with state_lock:
+                    index = state["index"]
+                    if index + 2 > len(self.entries):
+                        stop.set()
+                        return
+                    chunk = self.entries[index : index + 2]
+                    expected = state["digest"]
+                try:
+                    new_digest = BranchStore.append_diagnostic_ledger(
+                        self.dir, chunk, expected, 2, 2, None
+                    )
+                except (RuntimeError, ValueError):
+                    stop.set()
+                    return
+                with state_lock:
+                    state["digest"] = new_digest
+                    state["index"] = index + 2
+
+        original = BranchStore._load_diagnostic_ledger_directory
+        publisher_threads: set[threading.Thread] = set()
+
+        def slow_load(directory, raw):
+            loaded = original(directory, raw)
+            # Only reader threads widen the read window; the publisher
+            # also calls this loader and must run at full speed.
+            if threading.current_thread() not in publisher_threads:
+                time.sleep(0.01)
+            return loaded
+
+        BranchStore._load_diagnostic_ledger_directory = staticmethod(
+            slow_load
+        )
+        try:
+            def reader():
+                while not stop.is_set():
+                    try:
+                        cursor = None
+                        seen: list[int] = []
+                        snapshot_digest = None
+                        while True:
+                            result = self.page(limit=2, cursor=cursor)
+                            snapshot_digest = result["snapshot"][
+                                "digest"
+                            ]
+                            seen.extend(
+                                item["at"] for item in result["items"]
+                            )
+                            cursor = result["next_cursor"]
+                            if cursor is None:
+                                total = result["snapshot"]["entries"]
+                                break
+                        if seen != sorted(seen):
+                            errors.append(f"page out of order: {seen}")
+                        if len(set(seen)) != len(seen):
+                            errors.append(
+                                f"page duplicated entries: {seen}"
+                            )
+                        if len(seen) != total:
+                            errors.append(
+                                f"walked {len(seen)} of {total} at "
+                                f"{snapshot_digest}"
+                            )
+                    except RuntimeError:
+                        # A rotation between page calls invalidates the
+                        # cursor, which is the documented behaviour.
+                        pass
+
+            publisher_thread = threading.Thread(target=publisher)
+            publisher_threads.add(publisher_thread)
+            readers = [threading.Thread(target=reader) for _ in range(4)]
+            publisher_thread.start()
+            for thread in readers:
+                thread.start()
+            publisher_thread.join(30)
+            stop.set()
+            for thread in readers:
+                thread.join(10)
+                self.assertFalse(thread.is_alive())
+            self.assertFalse(publisher_thread.is_alive())
+        finally:
+            BranchStore._load_diagnostic_ledger_directory = staticmethod(
+                original
+            )
+        self.assertEqual(errors, [])
+
+    def test_reader_crash_leaves_reclaimable_occupancy(self) -> None:
+        digest = BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[:4], None, 2, 2, None
+        )
+        # Simulate a reader process that took the shared lock and then
+        # died: on a real exit the OS releases its flock, so the lock
+        # file remains but is unheld.
+        fd = os.open(self.lock_path(), os.O_RDWR)
+        try:
+            self.assertTrue(
+                BranchStore._try_acquire_chain_lock(fd, shared=True)
+            )
+        finally:
+            BranchStore._release_chain_lock(fd)
+            os.close(fd)
+        new_digest = BranchStore.append_diagnostic_ledger(
+            self.dir, self.entries[4:6], digest, 2, 2, None
+        )
+        self.assertEqual(
+            self.page()["snapshot"]["digest"], new_digest
+        )
+
+    def test_reader_creates_no_coordination_file(self) -> None:
+        empty = os.path.join(self.tmp.name, "empty")
+        os.mkdir(empty)
+        with self.assertRaises(OSError):
+            self.page(path=empty)
+        self.assertEqual(os.listdir(empty), [])
 
 
 class AppendLockTests(AppendTestBase):
