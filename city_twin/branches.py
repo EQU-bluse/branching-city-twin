@@ -10226,6 +10226,14 @@ class BranchStore:
         ``"forked"`` when both proofs carry two different legal
         successors of the common boundary.
 
+        Every :class:`ValueError` this comparison raises for a
+        non-fork anomaly carries a stable machine-readable
+        ``classification`` attribute (``"rollback"``, ``"spliced"``,
+        ``"missing_transition"`` or ``"rewritten"``) and, when it can be
+        located, a detached ``boundary`` naming the last segment the two
+        sides jointly authenticated before the anomaly (``None`` marks
+        that no such boundary exists).
+
         On success returns a fresh mapping with ``relation``,
         ``common``, ``before_only``, ``after_only`` and ``rotated`` in
         that order. ``common`` names the last segment the two sides
@@ -10247,35 +10255,362 @@ class BranchStore:
         from every other call, and no level shares mutable state with
         another.
         """
-        before_mode, before_snapshot, _b_items, before_rotated, \
-            _b_absent, before_view = (
-                cls._authenticate_diagnostic_ledger_proof_string(before)
+        before_auth = cls._authenticate_diagnostic_ledger_proof_auth(
+            before, "before"
+        )
+        after_auth = cls._authenticate_diagnostic_ledger_proof_auth(
+            after, "after"
+        )
+        cls._require_matching_diagnostic_ledger_proof_identities(
+            before_auth["mode"], after_auth["mode"]
+        )
+        return cls._diagnostic_ledger_proof_relation(
+            before_auth, after_auth
+        )
+
+    @classmethod
+    def audit_diagnostic_ledger_proof_sequence(
+        cls, proofs: Any
+    ) -> dict[str, Any]:
+        """Audit an ordered sequence of exported diagnostic ledger
+        proofs entirely offline, with no access to any ledger.
+
+        ``proofs`` must be a :class:`tuple` of canonical proof strings
+        as returned by :meth:`export_diagnostic_ledger_proof`; any other
+        container raises :class:`TypeError`, and the empty tuple returns
+        a deterministic ``"empty"`` result. The proofs are authenticated
+        strictly in sequence order: a non-:class:`str` element raises
+        :class:`TypeError`, and an empty string, a non-canonical proof
+        or any authentication failure raises :class:`ValueError`. Every
+        proof must use the transaction-identity filter mode and request
+        the same ordered identity set, or :class:`ValueError` is raised.
+        Every proof is fully authenticated before any relation is
+        analysed, so a late invalid element never produces a partial
+        audit.
+
+        Each adjacent pair forms one hop analysed exactly as
+        :meth:`compare_diagnostic_ledger_proofs` analyses a pair, with
+        the same boundary, increment and rotation semantics. The hop
+        relation is ``"same"`` for equivalent snapshots and
+        ``"continued"`` for a legal append or a fully evidenced
+        rotation. A first ``"forked"`` hop keeps the common boundary and
+        both sides' unique histories and terminates the audit: no later
+        hop is inferred. A later proof that is a strict historical
+        prefix of the earlier one is ``"rollback"`` (never an ordinary
+        fork); a digest, count, time-bound or diagnostic-body
+        contradiction at a shared position is ``"rewritten"``; a
+        rotation whose connecting segments are missing (the aggregate
+        prefix digest never stands in for them) is
+        ``"missing_transition"``; and two non-empty proofs with no
+        authenticatable common segment are ``"spliced"`` -- except when
+        the first proof authenticates the empty ledger. These anomalies
+        follow from individually legal proofs, so they are reported in
+        the result rather than raised.
+
+        Returns a fresh mapping with ``status``, ``common``, ``hops``
+        and ``failure`` in that order. ``status`` is ``"empty"`` for
+        the empty tuple, ``"continuous"`` when every hop is ``"same"``
+        or ``"continued"``, and ``"failed"`` otherwise. ``hops`` is a
+        tuple with one fresh mapping per completed hop, in order, with
+        ``index`` (the right-hand proof's position), ``relation``,
+        ``common`` (the boundary the hop starts from), ``before_only``
+        and ``after_only`` (the sides' unique segments, shaped as
+        :meth:`compare_diagnostic_ledger_proofs` returns them),
+        ``rotated`` (the identities newly entering the rotated-away
+        prefix, in request order) and, on a failing hop, ``reason`` --
+        a stable machine-readable classification string. ``failure`` is
+        ``None`` for a continuous audit, otherwise a mapping with
+        ``index`` (the first failing hop's right-hand position) and
+        ``classification`` (``"forked"``, ``"rollback"``,
+        ``"rewritten"``, ``"missing_transition"`` or ``"spliced"``);
+        ``common`` is then the last boundary every proof up to that
+        point jointly authenticated (``None`` from the empty ledger).
+        Nested levels never share mutable state with each other or with
+        any other call, and the proofs, every ledger, the event graph,
+        the business audit and the idempotency state are never modified,
+        whether the audit succeeds or raises.
+        """
+        if not isinstance(proofs, tuple):
+            raise TypeError(
+                "proofs must be a tuple, got "
+                f"{type(proofs).__name__}"
             )
+        if not proofs:
+            return {
+                "status": "empty",
+                "common": None,
+                "hops": (),
+                "failure": None,
+            }
+        # Authenticate every proof and settle the shared ordered
+        # identity set before any relation analysis, so an invalid late
+        # element can never leak a partial audit.
+        authenticated: list[dict[str, Any]] = []
+        first_mode: dict[str, Any] | None = None
+        for position, proof in enumerate(proofs):
+            auth = cls._authenticate_diagnostic_ledger_proof_auth(
+                proof, f"proof at index {position}"
+            )
+            if first_mode is None:
+                first_mode = auth["mode"]
+            else:
+                cls._require_matching_diagnostic_ledger_proof_identities(
+                    first_mode, auth["mode"]
+                )
+            authenticated.append(auth)
+        hops: list[dict[str, Any]] = []
+        # The last boundary every proof jointly authenticates can never
+        # move past the first proof's tail: successful hops only extend
+        # history, so a continuous audit ends on that first boundary
+        # (None when the first proof authenticates the empty ledger).
+        first_common = cls._copy_diagnostic_ledger_proof_boundary(
+            cls._diagnostic_ledger_proof_chain_boundary(
+                authenticated[0]["view"]
+            )
+        )
+
+        def common_with_pair(
+            pair_boundary: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            """The last boundary every proof up to a failing hop jointly
+            authenticated: the failing pair's boundary when it lies
+            before the first proof's tail, otherwise that first
+            boundary. ``None`` when the first proof authenticates the
+            empty ledger (it authenticates no segments at all) or the
+            pair shares no boundary."""
+            if first_common is None or pair_boundary is None:
+                return None
+            if pair_boundary["index"] < first_common["index"]:
+                return cls._copy_diagnostic_ledger_proof_boundary(
+                    pair_boundary
+                )
+            return cls._copy_diagnostic_ledger_proof_boundary(first_common)
+
+        for right_index in range(1, len(authenticated)):
+            before_auth = authenticated[right_index - 1]
+            after_auth = authenticated[right_index]
+            try:
+                relation = cls._diagnostic_ledger_proof_relation(
+                    before_auth, after_auth
+                )
+            except ValueError as exc:
+                classification = getattr(
+                    exc, "classification", "rewritten"
+                )
+                pair_boundary = (
+                    cls._copy_diagnostic_ledger_proof_boundary(
+                        exc.boundary
+                    )
+                    if hasattr(exc, "boundary")
+                    else None
+                )
+                hops.append(
+                    {
+                        "index": right_index,
+                        "relation": classification,
+                        "common": pair_boundary,
+                        "before_only":
+                            cls._copy_diagnostic_ledger_proof_segment_items(
+                                cls._diagnostic_ledger_proof_unique_segments(
+                                    before_auth["view"], pair_boundary
+                                )
+                            ),
+                        "after_only":
+                            cls._copy_diagnostic_ledger_proof_segment_items(
+                                cls._diagnostic_ledger_proof_unique_segments(
+                                    after_auth["view"], pair_boundary
+                                )
+                            ),
+                        # The hop never authenticated, so no rotation
+                        # across it was ever evidenced.
+                        "rotated": (),
+                        "reason": classification,
+                    }
+                )
+                return {
+                    "status": "failed",
+                    "common": common_with_pair(pair_boundary),
+                    "hops": tuple(hops),
+                    "failure": {
+                        "index": right_index,
+                        "classification": classification,
+                    },
+                }
+            pair_common = cls._copy_diagnostic_ledger_proof_boundary(
+                relation["common"]
+            )
+            hop = {
+                "index": right_index,
+                "relation": relation["relation"],
+                "common": pair_common,
+                "before_only":
+                    cls._copy_diagnostic_ledger_proof_segment_items(
+                        relation["before_only"]
+                    ),
+                "after_only":
+                    cls._copy_diagnostic_ledger_proof_segment_items(
+                        relation["after_only"]
+                    ),
+                "rotated": tuple(relation["rotated"]),
+            }
+            if relation["relation"] == "forked":
+                hop["reason"] = "forked"
+            hops.append(hop)
+            if relation["relation"] == "forked":
+                return {
+                    "status": "failed",
+                    "common": common_with_pair(pair_common),
+                    "hops": tuple(hops),
+                    "failure": {
+                        "index": right_index,
+                        "classification": "forked",
+                    },
+                }
+        return {
+            "status": "continuous",
+            "common": cls._copy_diagnostic_ledger_proof_boundary(
+                first_common
+            ),
+            "hops": tuple(hops),
+            "failure": None,
+        }
+
+    @classmethod
+    def _diagnostic_ledger_proof_unique_segments(
+        cls,
+        view: dict[str, Any],
+        boundary: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any], ...]:
+        """The retained segments one side of a hop alone carries after
+        the pair's last jointly authenticated ``boundary`` (all of its
+        retained segments when the boundary is ``None``)."""
+        segments = view["segments"]
+        if not segments:
+            return ()
+        start = segments[0]["index"]
+        end = segments[-1]["index"]
+        first = start if boundary is None else max(start, boundary["index"] + 1)
+        return cls._diagnostic_ledger_proof_segment_items(view, first, end)
+
+    @staticmethod
+    def _copy_diagnostic_ledger_proof_boundary(
+        boundary: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Detached ``index``/``digest``/``entries`` copy of one common
+        boundary record, or ``None``."""
+        if boundary is None:
+            return None
+        return {
+            "index": boundary["index"],
+            "digest": boundary["digest"],
+            "entries": boundary["entries"],
+        }
+
+    @staticmethod
+    def _copy_diagnostic_ledger_proof_segment_items(
+        items: tuple[dict[str, Any], ...],
+    ) -> tuple[dict[str, Any], ...]:
+        """Deeply detached copies of the unique-segment records a hop
+        carries so nested results of one audit never share mutable
+        state with each other or with the authenticated views."""
+        detached: list[dict[str, Any]] = []
+        for item in items:
+            entries: list[dict[str, Any]] = []
+            for entry in item["entries"]:
+                entries.append(
+                    {
+                        "at": entry["at"],
+                        "summary": dict(entry["summary"]),
+                        "records": tuple(entry["records"]),
+                    }
+                )
+            detached.append(
+                {
+                    "index": item["index"],
+                    "digest": item["digest"],
+                    "entries": tuple(entries),
+                }
+            )
+        return tuple(detached)
+
+    @classmethod
+    def _authenticate_diagnostic_ledger_proof_auth(
+        cls, proof: Any, side: str = "proof"
+    ) -> dict[str, Any]:
+        """Fully authenticate one exported proof string exactly as
+        :meth:`verify_diagnostic_ledger_proof` requires and return a
+        fresh isolated authentication record bundling its transaction
+        filter mode, authenticated snapshot summary, matched items,
+        rotated and absent identities, and internal authenticated-history
+        view. ``side`` only labels boundary defects in error messages.
+        Every defect raises exactly as :meth:`verify_diagnostic_ledger_proof`
+        documents: :class:`TypeError` for a non-:class:`str`,
+        :class:`ValueError` for an empty, non-canonical or
+        non-authenticating proof."""
+        mode, snapshot, items, rotated, absent, view = (
+            cls._authenticate_diagnostic_ledger_proof_string(proof)
+        )
         if (
-            before_mode["mode"]
+            mode["mode"]
             != cls._DIAGNOSTIC_LEDGER_PROOF_FILTER_MODE_TRANSACTIONS
         ):
             raise ValueError(
-                "the before proof must use the transaction identity "
+                f"the {side} proof must use the transaction identity "
                 "filter mode"
             )
-        after_mode, after_snapshot, _a_items, after_rotated, \
-            _a_absent, after_view = (
-                cls._authenticate_diagnostic_ledger_proof_string(after)
-            )
-        if (
-            after_mode["mode"]
-            != cls._DIAGNOSTIC_LEDGER_PROOF_FILTER_MODE_TRANSACTIONS
-        ):
-            raise ValueError(
-                "the after proof must use the transaction identity "
-                "filter mode"
-            )
+        return {
+            "mode": mode,
+            "snapshot": snapshot,
+            "items": items,
+            "rotated": rotated,
+            "absent": absent,
+            "view": view,
+        }
+
+    @staticmethod
+    def _require_matching_diagnostic_ledger_proof_identities(
+        before_mode: dict[str, Any], after_mode: dict[str, Any]
+    ) -> None:
+        """Require two authenticated transaction-mode proofs to request
+        the same ordered transaction identity set; otherwise raise
+        :class:`ValueError`."""
         if before_mode["transactions"] != after_mode["transactions"]:
             raise ValueError(
                 "both proofs must request the same ordered transaction "
                 "identity set"
             )
+
+    @classmethod
+    def _diagnostic_ledger_proof_relation(
+        cls,
+        before_auth: dict[str, Any],
+        after_auth: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Align two already authenticated transaction-mode proofs and
+        report how the ``after`` history relates to the ``before``
+        history. This is the pure offline engine shared by
+        :meth:`compare_diagnostic_ledger_proofs` and
+        :meth:`audit_diagnostic_ledger_proof_sequence`; every fact comes
+        from the two authenticated proof packages and nothing is read
+        from or written to the filesystem.
+
+        Returns a fresh ``same``/``continued``/``forked`` relation record
+        exactly as :meth:`compare_diagnostic_ledger_proofs` documents.
+        Every non-fork divergence -- a strict historical prefix
+        (rollback), two non-empty histories with no authenticatable
+        common segment (splice), a rotation that ran past the before
+        tail without its connecting segments, or a digest, entry-count,
+        time-bound, evidence or retained-body contradiction at a shared
+        position (rewrite) -- raises :class:`ValueError` carrying a
+        stable machine-readable ``classification`` attribute naming the
+        relation class (``"rollback"``, ``"spliced"``,
+        ``"missing_transition"`` or ``"rewritten"``)."""
+        before_snapshot = before_auth["snapshot"]
+        after_snapshot = after_auth["snapshot"]
+        before_rotated = before_auth["rotated"]
+        after_rotated = after_auth["rotated"]
+        before_view = before_auth["view"]
+        after_view = after_auth["view"]
         b_segments = before_view["segments"]
         a_segments = after_view["segments"]
         b_dropped = before_view["dropped"]
@@ -10295,14 +10630,16 @@ class BranchStore:
             # here) no rotated prefix, so there is nothing to align:
             # any non-empty authenticated history continues it.
             if b_dropped is not None:
-                raise ValueError(
+                raise cls._diagnostic_ledger_proof_relation_error(
+                    "rewritten",
                     "the before proof's rotated-prefix boundary cannot "
-                    "be located without retained segments"
+                    "be located without retained segments",
                 )
             if not a_segments:
-                raise ValueError(
+                raise cls._diagnostic_ledger_proof_relation_error(
+                    "rewritten",
                     "the after proof's rotated-prefix boundary cannot "
-                    "be located without retained segments"
+                    "be located without retained segments",
                 )
             return {
                 "relation": "continued",
@@ -10321,11 +10658,16 @@ class BranchStore:
         a_boundary = cls._diagnostic_ledger_proof_chain_start(
             after_view, "after"
         )
+
         if a_dropped is None:
             if b_dropped is not None:
-                raise ValueError(
+                raise cls._diagnostic_ledger_proof_relation_error(
+                    "rewritten",
                     "the after proof does not carry the rotated-prefix "
-                    "continuity proof the before proof established"
+                    "continuity proof the before proof established",
+                    cls._diagnostic_ledger_proof_boundary_if_carried(
+                        before_view, b_boundary
+                    ),
                 )
         elif b_dropped is None:
             cls._diagnostic_ledger_proof_prefix_inheritance(
@@ -10333,18 +10675,26 @@ class BranchStore:
             )
         else:
             if a_boundary < b_boundary:
-                raise ValueError(
+                raise cls._diagnostic_ledger_proof_relation_error(
+                    "rewritten",
                     "the after proof rotates away less history than "
-                    "the before proof already rotated away"
+                    "the before proof already rotated away",
+                    cls._diagnostic_ledger_proof_boundary_if_carried(
+                        before_view, a_boundary
+                    ),
                 )
             if a_boundary == b_boundary:
                 if (
                     a_dropped != b_dropped
                     or before_view["evidence"] != after_view["evidence"]
                 ):
-                    raise ValueError(
+                    raise cls._diagnostic_ledger_proof_relation_error(
+                        "rewritten",
                         "the proofs disagree about the rotated-away "
-                        "prefix they share"
+                        "prefix they share",
+                        cls._diagnostic_ledger_proof_boundary_if_carried(
+                            before_view, b_boundary
+                        ),
                     )
             else:
                 cls._diagnostic_ledger_proof_prefix_inheritance(
@@ -10380,9 +10730,10 @@ class BranchStore:
                     "entries": a_dropped["entries"],
                 }
             else:
-                raise ValueError(
+                raise cls._diagnostic_ledger_proof_relation_error(
+                    "spliced",
                     "the two proofs share no authenticatable segment "
-                    "and come from different ledgers"
+                    "and come from different ledgers",
                 )
             return {
                 "relation": "forked",
@@ -10398,9 +10749,30 @@ class BranchStore:
                 "rotated": (),
             }
         if a_end < b_end:
-            raise ValueError(
+            # The after history ends inside the before history. Every
+            # segment through a_end agreed, so a_end (or the verified
+            # rotated-prefix boundary when a rotated after ends before
+            # the before retained chain begins) is the last jointly
+            # authenticated boundary.
+            if a_segments:
+                rollback_boundary = (
+                    cls._diagnostic_ledger_proof_boundary_if_carried(
+                        after_view, a_end
+                    )
+                )
+            elif a_dropped is not None:
+                rollback_boundary = {
+                    "index": a_boundary,
+                    "digest": a_dropped["digest"],
+                    "entries": a_dropped["entries"],
+                }
+            else:
+                rollback_boundary = None
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "rollback",
                 "the after proof is a strict historical prefix of the "
-                "before proof (a rollback)"
+                "before proof (a rollback)",
+                rollback_boundary,
             )
         if b_end >= a_start:
             common = cls._diagnostic_ledger_proof_boundary_at(
@@ -10428,6 +10800,25 @@ class BranchStore:
                 if identity not in before_rotated_set
             ),
         }
+
+    @staticmethod
+    def _diagnostic_ledger_proof_relation_error(
+        classification: str,
+        message: str,
+        boundary: dict[str, Any] | None = None,
+    ) -> ValueError:
+        """Build the :class:`ValueError` a non-fork relation anomaly
+        raises, tagged with a stable machine-readable
+        ``classification`` (``"rollback"``, ``"spliced"``,
+        ``"missing_transition"`` or ``"rewritten"``) and, when it can be
+        located, the detached ``boundary`` record (``index``,
+        ``digest`` and cumulative ``entries``) the two sides last
+        jointly authenticated before the anomaly; ``None`` marks that no
+        such boundary exists."""
+        error = ValueError(message)
+        error.classification = classification
+        error.boundary = boundary
+        return error
 
     @classmethod
     def _diagnostic_ledger_proof_chain_start(
@@ -10476,45 +10867,67 @@ class BranchStore:
         identity sequence must equal, position by position, what
         ``before_view`` retains (plus its own already-rotated prefix,
         if any). A rotation that ran past the ``before`` proof's tail
-        without the transition segments connecting the two ends, and
+        without the transition segments connecting the two ends raises
+        a classified :class:`ValueError` (``"missing_transition"``);
         any digest, count, time-bound or identity contradiction at a
-        shared position, raises :class:`ValueError`."""
+        shared position raises one classified ``"rewritten"``."""
         b_segments = before_view["segments"]
         b_entries = before_view["segment_entries"]
         b_dropped = before_view["dropped"]
         b_start = b_segments[0]["index"]
         b_end = b_segments[-1]["index"]
         first_covered = b_start if b_dropped is not None else 1
+
+        def inherited_boundary(index: int) -> dict[str, Any] | None:
+            """The detached boundary record for the segment right
+            before segment ``index`` on the before proof's
+            authenticated chain when that proof directly carries it;
+            ``None`` for the genesis boundary or a segment the proof
+            only remembers through its aggregate rotated-prefix
+            digest."""
+            return cls._diagnostic_ledger_proof_boundary_if_carried(
+                before_view, index
+            )
+
         if a_boundary > b_end:
-            raise ValueError(
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "missing_transition",
                 "the after proof rotated away history past the before "
                 "proof's tail and the transition segments connecting "
-                "the two ends are missing"
+                "the two ends are missing",
+                inherited_boundary(b_end),
             )
         covered: list[int] = []
         for position in range(first_covered, a_boundary + 1):
             if position < b_start:
-                raise ValueError(
+                raise cls._diagnostic_ledger_proof_relation_error(
+                    "missing_transition",
                     "the after proof rotated away segments the before "
                     "proof does not carry and the transition segments "
-                    "connecting the two ends are missing"
+                    "connecting the two ends are missing",
+                    inherited_boundary(b_start - 1),
                 )
             covered.append(position - b_start)
         boundary_meta = b_segments[covered[-1]]
+        prior_boundary = inherited_boundary(a_boundary - 1)
         if not hmac.compare_digest(
             boundary_meta["digest"], a_dropped["digest"]
         ):
-            raise ValueError(
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "rewritten",
                 "the after proof's rotated-prefix digest contradicts "
-                "the before proof's retained segment at the boundary"
+                "the before proof's retained segment at the boundary",
+                prior_boundary,
             )
         entries = sum(b_segments[offset]["entries"] for offset in covered)
         if b_dropped is not None:
             entries += b_dropped["entries"]
         if entries != a_dropped["entries"]:
-            raise ValueError(
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "rewritten",
                 "the after proof's rotated-prefix entry count "
-                "contradicts the before proof's retained segments"
+                "contradicts the before proof's retained segments",
+                prior_boundary,
             )
         first_at = (
             b_segments[covered[0]]["first_at"]
@@ -10522,14 +10935,18 @@ class BranchStore:
             else b_dropped["first_at"]
         )
         if first_at != a_dropped["first_at"]:
-            raise ValueError(
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "rewritten",
                 "the after proof's rotated-prefix time bounds "
-                "contradict the before proof's retained segments"
+                "contradict the before proof's retained segments",
+                prior_boundary,
             )
         if boundary_meta["last_at"] != a_dropped["last_at"]:
-            raise ValueError(
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "rewritten",
                 "the after proof's rotated-prefix time bounds "
-                "contradict the before proof's retained segments"
+                "contradict the before proof's retained segments",
+                prior_boundary,
             )
         new_identities: list[str] = []
         for offset in covered:
@@ -10539,9 +10956,11 @@ class BranchStore:
             tuple(before_view["evidence"]) + tuple(new_identities)
             != a_evidence
         ):
-            raise ValueError(
+            raise cls._diagnostic_ledger_proof_relation_error(
+                "rewritten",
                 "the after proof's prefix evidence does not exactly "
-                "inherit the before proof's history"
+                "inherit the before proof's history",
+                prior_boundary,
             )
 
     @classmethod
@@ -10566,6 +10985,36 @@ class BranchStore:
             "digest": meta["digest"],
             "entries": entries,
         }
+
+    @classmethod
+    def _diagnostic_ledger_proof_boundary_if_carried(
+        cls, view: dict[str, Any], index: int
+    ) -> dict[str, Any] | None:
+        """The boundary record at segment number ``index`` when the
+        proof directly authenticates that segment: a retained segment,
+        the segment ending its verified rotated-away prefix (its first
+        retained segment's predecessor), or the genesis boundary
+        (``None``) when ``index`` is 0. For any other segment the proof
+        only remembers through an aggregate prefix digest, the exact
+        boundary cannot be reconstructed, so ``None`` is returned rather
+        than guessing."""
+        if index <= 0:
+            return None
+        segments = view["segments"]
+        dropped = view["dropped"]
+        if not segments:
+            return None
+        start = segments[0]["index"]
+        end = segments[-1]["index"]
+        if start <= index <= end:
+            return cls._diagnostic_ledger_proof_boundary_at(view, index)
+        if dropped is not None and index == start - 1:
+            return {
+                "index": index,
+                "digest": dropped["digest"],
+                "entries": dropped["entries"],
+            }
+        return None
 
     @classmethod
     def _diagnostic_ledger_proof_chain_boundary(
