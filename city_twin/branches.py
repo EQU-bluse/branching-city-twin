@@ -7643,8 +7643,9 @@ class BranchStore:
 
         Returns a new mapping with ``snapshot``, ``items`` and
         ``next_cursor`` in that order. ``snapshot`` identifies the
-        ledger snapshot read (its content digest, entry count and byte
-        size) and is returned even when nothing matches. ``items`` is a
+        ledger snapshot read (its content digest, entry count and the
+        byte count of the authenticated manifest under ``bytes``) and is
+        returned even when nothing matches. ``items`` is a
         tuple of entries ordered by time and then transaction identity,
         each a fresh mapping with the entry's time (``at``), its
         ``summary`` as :meth:`summarize_recovery_diagnostics` reports
@@ -7805,7 +7806,7 @@ class BranchStore:
         snapshot = {
             "digest": digest,
             "entries": len(pairs),
-            "size": size,
+            "bytes": size,
         }
         return {
             "snapshot": snapshot,
@@ -8680,7 +8681,18 @@ class BranchStore:
         visible manifest is atomically replaced; a failure before that
         switch raises and leaves the old snapshot -- manifest, retained
         segments and evidence -- byte-for-byte readable with no partial
-        result visible. Rotated-away segment files (and a superseded
+        result visible. The manifest switch, the removal of the
+        rotated-away segment files, the reclamation of the superseded
+        evidence file and the final directory sync are one rollback-able
+        commit: the exact bytes of every doomed file are captured first,
+        and a failure of the replacement, a removal or any directory sync
+        restores the pre-publish state byte-for-byte -- the old
+        manifest and every segment and evidence it references stay readable
+        and re-authenticate -- leaves no newly staged segment,
+        evidence, temporary or backup file behind, and raises
+        :class:`OSError`; a failure encountered during that rollback
+        itself raises :class:`OSError`, never masked as success by the
+        original failure. Rotated-away segment files (and a superseded
         evidence file) are removed only after the new manifest is
         durable and only once the exclusive publish lock can be held,
         i.e. once every in-progress directory page's shared lock has
@@ -8913,49 +8925,176 @@ class BranchStore:
             manifest_data = cls._diagnostic_ledger_manifest_document(
                 retained, dropped, manifest_evidence_digest
             )
+        except BaseException as staging_error:
+            # The visible manifest still names only the old snapshot, so
+            # deleting the newly staged files (never the old ones, which
+            # remain in ``preexisting``) restores the directory to its
+            # pre-publish state. A cleanup failure is itself an OSError:
+            # it must never hide behind the original failure as success.
+            cleanup_errors: list[OSError] = []
+            for staged in created:
+                if os.path.basename(staged) not in preexisting:
+                    try:
+                        os.remove(staged)
+                    except OSError as exc:
+                        cleanup_errors.append(exc)
+            try:
+                cls._fsync_directory(directory)
+            except OSError as exc:
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                rollback_failure = OSError(
+                    "a diagnostic ledger publish failed and its staging "
+                    "cleanup failed as well"
+                )
+                raise rollback_failure from staging_error
+            raise
+        # The manifest switch, the rotated-segment reclamation, the
+        # superseded/orphan-evidence reclamation and the final directory
+        # sync are one rollback-able commit: any failure restores the
+        # pre-publish snapshot byte-for-byte.
+        keep_evidence_name = (
+            None
+            if manifest_evidence_digest is None
+            else cls._diagnostic_ledger_evidence_name(
+                manifest_evidence_digest
+            )
+        )
+        cls._commit_diagnostic_ledger_publish(
+            directory,
+            manifest_path,
+            manifest_data,
+            manifest_raw,
+            [meta["name"] for meta in removed],
+            keep_evidence_name,
+            created,
+            preexisting,
+        )
+        return hashlib.sha256(manifest_data).hexdigest()
+
+    @classmethod
+    def _commit_diagnostic_ledger_publish(
+        cls,
+        directory: str,
+        manifest_path: str,
+        manifest_data: bytes,
+        old_manifest_raw: bytes | None,
+        removed_names: list[str],
+        keep_evidence_name: str | None,
+        staged: list[str],
+        preexisting: set[str],
+    ) -> None:
+        """Switch the visible manifest and reclaim every segment and
+        evidence file it supersedes as a single rollback-able commit.
+
+        The doomed files are identified (a directory listing included),
+        their exact bytes captured, the new manifest durably published,
+        the old files removed and the directory synced, all inside one
+        guarded sequence. Any failure rolls back to the pre-publish state
+        (old manifest, segments and evidence byte-for-byte, every newly
+        staged file removed) before the original exception is re-raised; a
+        failure during that rollback itself raises :class:`OSError`. The
+        caller holds the exclusive publish lock."""
+        backups: dict[str, bytes] = {}
+        try:
+            victims = [
+                os.path.join(directory, name) for name in removed_names
+            ]
+            # Evidence reclamation follows the same gate as the manifest's
+            # rotation bookkeeping: only a publish that actually rotates
+            # reconciles the evidence directory. This removes the
+            # superseded evidence and any orphan left by a publish that
+            # crashed after writing its evidence but before the manifest
+            # switch. The caller's exclusive lock waits for every shared
+            # reader lock to drain, so no in-progress reader is still
+            # resolving these names; a reader that already opened a file
+            # keeps its unlinked inode readable by the kernel.
+            if removed_names:
+                for name in cls._diagnostic_ledger_evidence_files(directory):
+                    if name != keep_evidence_name:
+                        victims.append(os.path.join(directory, name))
+            for victim in victims:
+                raw, _stat = cls._read_diagnostic_ledger(victim)
+                backups[victim] = raw
             cls._write_diagnostic_ledger_file(
                 manifest_path,
                 manifest_data,
                 ".diagnostic-ledger-manifest-",
             )
-        except BaseException:
-            # The visible manifest still names only the old snapshot, so
-            # deleting the newly staged files (never the old ones, which
-            # remain in ``preexisting``) restores the directory to its
-            # pre-publish state. Cleanup errors are suppressed so the
-            # original failure surfaces.
-            for staged in created:
-                if os.path.basename(staged) not in preexisting:
-                    with contextlib.suppress(OSError):
-                        os.remove(staged)
-            with contextlib.suppress(OSError):
-                cls._fsync_directory(directory)
+            for victim in victims:
+                os.remove(victim)
+            cls._fsync_directory(directory)
+        except BaseException as original:
+            cls._rollback_diagnostic_ledger_publish(
+                directory,
+                manifest_path,
+                old_manifest_raw,
+                backups,
+                staged,
+                preexisting,
+                original,
+            )
             raise
-        # Rotated-away segments and superseded/orphan evidence are only
-        # garbage-collected once the manifest naming the new generation
-        # is durable and visible. The caller's exclusive publish lock
-        # waits for every shared reader lock to drain, so no in-progress
-        # reader is still resolving these names; a reader that already
-        # opened a file keeps its unlinked inode readable by the kernel.
-        for meta in removed:
-            os.remove(os.path.join(directory, meta["name"]))
-        if removed:
-            keep_evidence = (
-                None
-                if manifest_evidence_digest is None
-                else cls._diagnostic_ledger_evidence_name(
-                    manifest_evidence_digest
+
+    @classmethod
+    def _rollback_diagnostic_ledger_publish(
+        cls,
+        directory: str,
+        manifest_path: str,
+        old_manifest_raw: bytes | None,
+        backups: dict[str, bytes],
+        staged: list[str],
+        preexisting: set[str],
+        original: BaseException,
+    ) -> None:
+        """Restore the pre-publish snapshot after a failed publish
+        commit: the old manifest bytes, every backed-up segment or
+        evidence file and the removal of every newly staged file, with a
+        final directory sync. Each step is attempted even after an
+        earlier one fails. When anything here fails, an
+        :class:`OSError` chained to the original failure is raised
+        rather than letting the rollback fault stay hidden; when the
+        rollback succeeds, control returns and the caller re-raises the
+        original exception."""
+        errors: list[OSError] = []
+
+        def attempt(operation: Any) -> None:
+            try:
+                operation()
+            except OSError as exc:
+                errors.append(exc)
+
+        # Re-establish the old visible view first.
+        if old_manifest_raw is not None:
+            attempt(
+                lambda: cls._write_diagnostic_ledger_file(
+                    manifest_path,
+                    old_manifest_raw,
+                    ".diagnostic-ledger-manifest-rollback-",
                 )
             )
-            # Reconcile every evidence file on disk against the one the
-            # new manifest references: this removes the superseded
-            # evidence and any orphan left by a publish that crashed
-            # after writing its evidence but before the manifest switch.
-            for name in cls._diagnostic_ledger_evidence_files(directory):
-                if name != keep_evidence:
-                    os.remove(os.path.join(directory, name))
-            cls._fsync_directory(directory)
-        return hashlib.sha256(manifest_data).hexdigest()
+        elif os.path.exists(manifest_path):
+            attempt(lambda: os.remove(manifest_path))
+        for victim, raw in backups.items():
+            attempt(
+                lambda victim=victim, raw=raw: (
+                    cls._write_diagnostic_ledger_file(
+                        victim,
+                        raw,
+                        ".diagnostic-ledger-rollback-",
+                    )
+                )
+            )
+        for path in staged:
+            if os.path.basename(path) not in preexisting:
+                if os.path.exists(path):
+                    attempt(lambda path=path: os.remove(path))
+        attempt(lambda: cls._fsync_directory(directory))
+        if errors:
+            raise OSError(
+                "a diagnostic ledger publish failed and its rollback "
+                "failed as well; the ledger directory may need recovery"
+            ) from original
 
     @classmethod
     def _page_diagnostic_ledger_directory(

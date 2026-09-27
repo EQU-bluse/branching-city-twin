@@ -507,7 +507,7 @@ class DirectoryPageTests(AppendTestBase):
             result["snapshot"]["digest"], hashlib.sha256(raw).hexdigest()
         )
         self.assertEqual(result["snapshot"]["entries"], 5)
-        self.assertEqual(result["snapshot"]["size"], len(raw))
+        self.assertEqual(result["snapshot"]["bytes"], len(raw))
         self.assertIsNone(result["next_cursor"])
         self.assertEqual(
             [item["at"] for item in result["items"]], [1, 2, 3, 4, 5]
