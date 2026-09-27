@@ -7566,9 +7566,14 @@ class BranchStore:
         ledger, strictly read-only.
 
         ``path`` must be a non-empty :class:`str` (a non-:class:`str`
-        raises :class:`TypeError`, an empty string :class:`ValueError`);
-        a missing, unreadable or unwritable-location file raises
-        :class:`OSError`. ``start`` and ``end`` are inclusive time
+        raises :class:`TypeError`, an empty string :class:`ValueError`).
+        It names either a sealed single-file ledger written by
+        :meth:`save_diagnostic_ledger` or a ledger directory published
+        by :meth:`append_diagnostic_ledger`; a directory pages only the
+        segments its current manifest retains. A missing, unreadable or
+        unwritable-location file raises :class:`OSError`, as does a
+        ledger directory without a readable manifest. ``start`` and
+        ``end`` are inclusive time
         bounds: each may be ``None`` (unbounded) or a non-``bool``
         non-negative :class:`int`, anything else raises
         :class:`TypeError`, and ``start`` after ``end`` raises
@@ -7586,12 +7591,15 @@ class BranchStore:
         checksum-invalid string raises :class:`ValueError`, as does a
         cursor whose bound filter conditions differ from this call's.
 
-        A cursor binds the ledger file's identity and content digest,
-        so paging can resume across restarts; if the ledger was
-        replaced, truncated, appended to or otherwise modified since
-        the cursor was issued, the resume raises :class:`RuntimeError`
-        rather than mixing versions. A ledger whose encoding, checksum,
-        structure or embedded chain authentication is illegal raises
+        A cursor binds the ledger snapshot it was issued from -- the
+        ledger file's identity and content digest for a single-file
+        ledger, the manifest's identity and content digest for a ledger
+        directory -- so paging can resume across restarts; if the
+        ledger was replaced, appended to, rotated, truncated or
+        otherwise modified since the cursor was issued, the resume
+        raises :class:`RuntimeError` rather than mixing versions. A
+        ledger whose encoding, checksum, structure, segment digest
+        chain or embedded chain authentication is illegal raises
         :class:`ValueError` and no partial page is returned.
 
         Returns a new mapping with ``snapshot``, ``items`` and
@@ -7632,7 +7640,13 @@ class BranchStore:
             if cursor is None
             else cls._parse_diagnostic_ledger_cursor(cursor)
         )
-        raw, stat_result = cls._read_diagnostic_ledger(path)
+        is_directory = os.path.isdir(path)
+        ledger_path = (
+            os.path.join(path, cls._DIAGNOSTIC_LEDGER_MANIFEST_NAME)
+            if is_directory
+            else path
+        )
+        raw, stat_result = cls._read_diagnostic_ledger(ledger_path)
         identity = {
             "device": stat_result.st_dev,
             "inode": stat_result.st_ino,
@@ -7656,7 +7670,21 @@ class BranchStore:
                 raise ValueError(
                     "cursor does not match the requested filters"
                 )
-        pairs, summaries, _file_digest = cls._parse_diagnostic_ledger(raw)
+        if is_directory:
+            state = cls._parse_diagnostic_ledger_directory(path, raw)
+            order = sorted(
+                range(len(state["pairs"])),
+                key=lambda index: (
+                    state["pairs"][index][0],
+                    state["summaries"][index]["transaction"],
+                ),
+            )
+            pairs = [state["pairs"][index] for index in order]
+            summaries = [state["summaries"][index] for index in order]
+        else:
+            pairs, summaries, _file_digest = cls._parse_diagnostic_ledger(
+                raw
+            )
         wanted = (
             None
             if filter_transactions is None
@@ -7703,6 +7731,796 @@ class BranchStore:
             "items": items,
             "next_cursor": next_cursor,
         }
+
+    #: Segmented, append-only diagnostic ledger directory (see
+    #: :meth:`append_diagnostic_ledger`). The directory holds one
+    #: checksummed manifest -- the only mutable file, always switched
+    #: by an atomic replace -- plus one immutable, checksummed segment
+    #: file per publish batch. Segments chain through digests, and the
+    #: manifest keeps the rotated-away prefix's last digest, entry
+    #: count and time bounds so continuity stays provable after
+    #: rotation.
+    _DIAGNOSTIC_LEDGER_MANIFEST_NAME = "manifest.json"
+    _DIAGNOSTIC_LEDGER_MANIFEST_FORMAT = (
+        "branching-city-twin/diagnostic-ledger-manifest"
+    )
+    _DIAGNOSTIC_LEDGER_MANIFEST_VERSION = 1
+    _DIAGNOSTIC_LEDGER_MANIFEST_SUPPORTED_VERSIONS = (1,)
+    _DIAGNOSTIC_LEDGER_MANIFEST_KEYS = (
+        "format",
+        "version",
+        "generation",
+        "segments",
+        "rotated",
+        "checksum",
+    )
+    _DIAGNOSTIC_LEDGER_DESCRIPTOR_KEYS = (
+        "name",
+        "digest",
+        "entries",
+        "first",
+        "last",
+    )
+    _DIAGNOSTIC_LEDGER_ROTATED_KEYS = ("digest", "entries", "first", "last")
+    _DIAGNOSTIC_LEDGER_SEGMENT_FORMAT = (
+        "branching-city-twin/diagnostic-ledger-segment"
+    )
+    _DIAGNOSTIC_LEDGER_SEGMENT_VERSION = 1
+    _DIAGNOSTIC_LEDGER_SEGMENT_SUPPORTED_VERSIONS = (1,)
+    _DIAGNOSTIC_LEDGER_SEGMENT_KEYS = (
+        "format",
+        "version",
+        "index",
+        "prev",
+        "entries",
+        "checksum",
+    )
+    _DIAGNOSTIC_LEDGER_SEGMENT_PREFIX = "segment-"
+    _DIAGNOSTIC_LEDGER_SEGMENT_SUFFIX = ".json"
+
+    @classmethod
+    def _validate_diagnostic_ledger_directory(cls, directory: Any) -> None:
+        """Validate the ledger ``directory`` argument: a non-:class:`str`
+        raises :class:`TypeError`, an empty string :class:`ValueError`."""
+        if not isinstance(directory, str):
+            raise TypeError(
+                f"directory must be a str, got {type(directory).__name__}"
+            )
+        if not directory:
+            raise ValueError("directory must be a non-empty str")
+
+    @staticmethod
+    def _validate_diagnostic_ledger_positive_int(
+        value: Any, name: str
+    ) -> int:
+        """Validate a segment-limit or retain-count argument: a
+        non-``bool`` :class:`int` of at least one; any other type raises
+        :class:`TypeError` and a smaller value raises
+        :class:`ValueError`."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                f"{name} must be an int, got {type(value).__name__}"
+            )
+        if value < 1:
+            raise ValueError(f"{name} must be >= 1")
+        return value
+
+    @classmethod
+    def _validate_diagnostic_ledger_expected(cls, expected: Any) -> None:
+        """Validate the expected-snapshot argument: ``None`` (the empty
+        expectation, only legal for the first publish) or the
+        64-character lowercase hex digest of the current manifest. A
+        wrong type raises :class:`TypeError` and a malformed string
+        :class:`ValueError`; a well-formed digest that does not match
+        the current snapshot raises :class:`RuntimeError` later, under
+        the lock."""
+        if expected is None:
+            return
+        if not isinstance(expected, str):
+            raise TypeError(
+                "expected snapshot must be None or a str, got "
+                f"{type(expected).__name__}"
+            )
+        if len(expected) != 64 or set(expected) - cls._HEX_DIGITS:
+            raise ValueError(
+                "expected snapshot must be a 64-character lowercase hex "
+                "string"
+            )
+
+    @classmethod
+    def _diagnostic_ledger_segment_name(cls, index: int) -> str:
+        """Canonical file name of the segment with sequence ``index``;
+        the zero-padded width keeps lexicographic and numeric order
+        aligned and grows past six digits without ambiguity."""
+        return (
+            f"{cls._DIAGNOSTIC_LEDGER_SEGMENT_PREFIX}{index:06d}"
+            f"{cls._DIAGNOSTIC_LEDGER_SEGMENT_SUFFIX}"
+        )
+
+    @classmethod
+    def _diagnostic_ledger_segment_index(cls, name: Any) -> int:
+        """Validate a manifest segment file name and return its
+        sequence index; only the canonical zero-padded spelling is
+        legal, anything else raises :class:`ValueError`."""
+        prefix = cls._DIAGNOSTIC_LEDGER_SEGMENT_PREFIX
+        suffix = cls._DIAGNOSTIC_LEDGER_SEGMENT_SUFFIX
+        if (
+            not isinstance(name, str)
+            or not name.startswith(prefix)
+            or not name.endswith(suffix)
+        ):
+            raise ValueError("manifest segment name is malformed")
+        digits = name[len(prefix) : len(name) - len(suffix)]
+        if not digits.isdigit():
+            raise ValueError("manifest segment name is malformed")
+        index = int(digits)
+        if index < 1 or name != cls._diagnostic_ledger_segment_name(index):
+            raise ValueError("manifest segment name is not canonical")
+        return index
+
+    @classmethod
+    def _decode_diagnostic_ledger_document(cls, raw: bytes, kind: str) -> Any:
+        """Decode one ledger-directory document (manifest or segment)
+        from its raw bytes: UTF-8 without a BOM, no trailing newline,
+        valid JSON without duplicate keys and in canonical compact
+        form; every defect raises :class:`ValueError`."""
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{kind} is not valid UTF-8: {exc}") from exc
+        if text.startswith("\ufeff"):
+            raise ValueError(f"{kind} must be UTF-8 without a BOM")
+        if text.endswith("\n") or text.endswith("\r"):
+            raise ValueError(f"{kind} must not have a trailing newline")
+        try:
+            document = json.loads(
+                text,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{kind} is not valid JSON: {exc}") from exc
+        if cls._canonical_json(document) != text:
+            raise ValueError(f"{kind} is not canonical compact JSON")
+        return document
+
+    @classmethod
+    def _verify_diagnostic_ledger_checksum(
+        cls, document: Any, kind: str
+    ) -> None:
+        """Verify the ``checksum`` field of one decoded ledger-directory
+        document against a SHA-256 over its canonical body; a malformed
+        or mismatching checksum raises :class:`ValueError`. The caller
+        has already checked the document's top-level keys."""
+        checksum = document["checksum"]
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or set(checksum) - cls._HEX_DIGITS
+        ):
+            raise ValueError(f"{kind} checksum is malformed")
+        body = {
+            key: value for key, value in document.items() if key != "checksum"
+        }
+        if not hmac.compare_digest(
+            checksum,
+            hashlib.sha256(
+                cls._canonical_json(body).encode("utf-8")
+            ).hexdigest(),
+        ):
+            raise ValueError(f"{kind} checksum does not verify")
+
+    @classmethod
+    def _require_diagnostic_ledger_digest(cls, value: Any, what: str) -> str:
+        """Require one manifest or segment field to be a 64-character
+        lowercase hex digest, raising :class:`ValueError` otherwise."""
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or set(value) - cls._HEX_DIGITS
+        ):
+            raise ValueError(
+                f"{what} must be a 64-character lowercase hex string"
+            )
+        return value
+
+    @staticmethod
+    def _require_diagnostic_ledger_time(value: Any, what: str) -> int:
+        """Require one manifest or segment time field to be a
+        non-``bool`` non-negative :class:`int`, raising
+        :class:`ValueError` otherwise."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{what} must be a non-negative int")
+        return value
+
+    @classmethod
+    def _diagnostic_ledger_segment_document(
+        cls,
+        index: int,
+        prev: str,
+        pairs: list[tuple[int, tuple[str, ...]]],
+    ) -> bytes:
+        """Serialize one immutable segment to its canonical bytes:
+        compact UTF-8 JSON, no BOM, no trailing newline, with a SHA-256
+        checksum over the canonical body. ``pairs`` must already be
+        authenticated and sorted."""
+        document: dict[str, Any] = {
+            "format": cls._DIAGNOSTIC_LEDGER_SEGMENT_FORMAT,
+            "version": cls._DIAGNOSTIC_LEDGER_SEGMENT_VERSION,
+            "index": index,
+            "prev": prev,
+            "entries": [
+                {"at": at, "chain": list(chain)} for at, chain in pairs
+            ],
+        }
+        body = dict(document)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def _diagnostic_ledger_manifest_document(
+        cls,
+        generation: int,
+        descriptors: list[dict[str, Any]],
+        rotated: dict[str, Any] | None,
+    ) -> bytes:
+        """Serialize the manifest to its canonical bytes, checksummed
+        like a segment."""
+        document: dict[str, Any] = {
+            "format": cls._DIAGNOSTIC_LEDGER_MANIFEST_FORMAT,
+            "version": cls._DIAGNOSTIC_LEDGER_MANIFEST_VERSION,
+            "generation": generation,
+            "segments": [dict(descriptor) for descriptor in descriptors],
+            "rotated": None if rotated is None else dict(rotated),
+        }
+        body = dict(document)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def _parse_diagnostic_ledger_manifest(
+        cls, raw: bytes
+    ) -> tuple[int, list[dict[str, Any]], dict[str, Any] | None]:
+        """Strictly parse and authenticate the manifest document bytes,
+        returning ``(generation, descriptors, rotated)``: the publish
+        generation, one fresh descriptor mapping per retained segment
+        in chain order and the rotated-prefix evidence (``None`` when
+        no segment was ever rotated away). Any encoding, canonical-form,
+        structure, version, checksum or continuity defect raises
+        :class:`ValueError`."""
+        document = cls._decode_diagnostic_ledger_document(raw, "manifest")
+        if not isinstance(document, dict) or set(document) != set(
+            cls._DIAGNOSTIC_LEDGER_MANIFEST_KEYS
+        ):
+            raise ValueError("manifest has bad top-level keys")
+        if document["format"] != cls._DIAGNOSTIC_LEDGER_MANIFEST_FORMAT:
+            raise ValueError("manifest has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in cls._DIAGNOSTIC_LEDGER_MANIFEST_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("manifest has an unsupported version")
+        cls._verify_diagnostic_ledger_checksum(document, "manifest")
+        generation = document["generation"]
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("manifest generation is malformed")
+        raw_segments = document["segments"]
+        if not isinstance(raw_segments, list):
+            raise ValueError("manifest segments must be a list")
+        descriptors: list[dict[str, Any]] = []
+        previous_index: int | None = None
+        previous_last: int | None = None
+        for raw_descriptor in raw_segments:
+            if not isinstance(raw_descriptor, dict) or set(
+                raw_descriptor
+            ) != set(cls._DIAGNOSTIC_LEDGER_DESCRIPTOR_KEYS):
+                raise ValueError("manifest segment descriptor has bad keys")
+            index = cls._diagnostic_ledger_segment_index(
+                raw_descriptor["name"]
+            )
+            if previous_index is not None and index != previous_index + 1:
+                raise ValueError("manifest segments are not consecutive")
+            digest = cls._require_diagnostic_ledger_digest(
+                raw_descriptor["digest"], "manifest segment digest"
+            )
+            count = raw_descriptor["entries"]
+            if (
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 1
+            ):
+                raise ValueError(
+                    "manifest segment entry count is malformed"
+                )
+            first = cls._require_diagnostic_ledger_time(
+                raw_descriptor["first"], "manifest segment first time"
+            )
+            last = cls._require_diagnostic_ledger_time(
+                raw_descriptor["last"], "manifest segment last time"
+            )
+            if first > last:
+                raise ValueError(
+                    "manifest segment time bounds are reversed"
+                )
+            if previous_last is not None and first < previous_last:
+                raise ValueError("manifest segment times regress")
+            descriptors.append(
+                {
+                    "name": raw_descriptor["name"],
+                    "digest": digest,
+                    "entries": count,
+                    "first": first,
+                    "last": last,
+                }
+            )
+            previous_index = index
+            previous_last = last
+        raw_rotated = document["rotated"]
+        rotated: dict[str, Any] | None = None
+        if raw_rotated is not None:
+            if not isinstance(raw_rotated, dict) or set(
+                raw_rotated
+            ) != set(cls._DIAGNOSTIC_LEDGER_ROTATED_KEYS):
+                raise ValueError("manifest rotated prefix has bad keys")
+            rotated = {
+                "digest": cls._require_diagnostic_ledger_digest(
+                    raw_rotated["digest"], "manifest rotated digest"
+                ),
+                "entries": raw_rotated["entries"],
+                "first": cls._require_diagnostic_ledger_time(
+                    raw_rotated["first"], "manifest rotated first time"
+                ),
+                "last": cls._require_diagnostic_ledger_time(
+                    raw_rotated["last"], "manifest rotated last time"
+                ),
+            }
+            if (
+                isinstance(rotated["entries"], bool)
+                or not isinstance(rotated["entries"], int)
+                or rotated["entries"] < 1
+            ):
+                raise ValueError(
+                    "manifest rotated entry count is malformed"
+                )
+            if rotated["first"] > rotated["last"]:
+                raise ValueError(
+                    "manifest rotated time bounds are reversed"
+                )
+            if not descriptors:
+                raise ValueError(
+                    "manifest rotates segments without retaining any"
+                )
+            if rotated["last"] > descriptors[0]["first"]:
+                raise ValueError(
+                    "manifest rotated prefix overlaps the retained "
+                    "segments"
+                )
+        return generation, descriptors, rotated
+
+    @classmethod
+    def _parse_diagnostic_ledger_segment(
+        cls, raw: bytes
+    ) -> tuple[int, str, list[tuple[int, tuple[str, ...]]]]:
+        """Strictly parse one segment's bytes, returning ``(index,
+        prev, pairs)``: the segment's sequence index, its predecessor
+        digest link and its ``(time, chain)`` pairs in stored order.
+        Any encoding, canonical-form, structure, version or checksum
+        defect raises :class:`ValueError`; chain authentication and
+        cross-segment ordering are the directory-level parser's job."""
+        document = cls._decode_diagnostic_ledger_document(raw, "segment")
+        if not isinstance(document, dict) or set(document) != set(
+            cls._DIAGNOSTIC_LEDGER_SEGMENT_KEYS
+        ):
+            raise ValueError("segment has bad top-level keys")
+        if document["format"] != cls._DIAGNOSTIC_LEDGER_SEGMENT_FORMAT:
+            raise ValueError("segment has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in cls._DIAGNOSTIC_LEDGER_SEGMENT_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("segment has an unsupported version")
+        cls._verify_diagnostic_ledger_checksum(document, "segment")
+        index = document["index"]
+        if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+            raise ValueError("segment index is malformed")
+        prev = cls._require_diagnostic_ledger_digest(
+            document["prev"], "segment prev digest"
+        )
+        raw_entries = document["entries"]
+        if not isinstance(raw_entries, list) or not raw_entries:
+            raise ValueError("segment entries must be a non-empty list")
+        pairs: list[tuple[int, tuple[str, ...]]] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict) or set(
+                raw_entry
+            ) != set(cls._DIAGNOSTIC_LEDGER_ENTRY_KEYS):
+                raise ValueError("segment entry has bad keys")
+            at = raw_entry["at"]
+            if isinstance(at, bool) or not isinstance(at, int) or at < 0:
+                raise ValueError("segment entry time is malformed")
+            chain = raw_entry["chain"]
+            if not isinstance(chain, list) or not chain:
+                raise ValueError(
+                    "segment entry chain must be a non-empty list"
+                )
+            for record in chain:
+                if not isinstance(record, str):
+                    raise ValueError("segment entry records must be str")
+            pairs.append((at, tuple(chain)))
+        return index, prev, pairs
+
+    @classmethod
+    def _parse_diagnostic_ledger_directory(
+        cls, directory: str, manifest_raw: bytes
+    ) -> dict[str, Any]:
+        """Authenticate the manifest and every segment it retains,
+        returning the ledger's current state: the flattened ``(time,
+        chain)`` pairs in segment order with one summary per entry, the
+        manifest's generation, segment descriptors and rotated-prefix
+        evidence, and the derived next segment index, last segment
+        digest and last entry time.
+
+        Every retained segment is read and strictly parsed; a segment
+        file that cannot be read raises :class:`OSError`, while any
+        encoding, checksum, digest-chain, ordering or embedded-chain
+        defect raises :class:`ValueError` and no partial view of a
+        defective ledger is ever produced."""
+        generation, descriptors, rotated = (
+            cls._parse_diagnostic_ledger_manifest(manifest_raw)
+        )
+        pairs: list[tuple[int, tuple[str, ...]]] = []
+        previous_digest = (
+            rotated["digest"]
+            if rotated is not None
+            else cls._RECOVERY_CHAIN_GENESIS_PREV
+        )
+        next_index = 1
+        for descriptor in descriptors:
+            segment_path = os.path.join(directory, descriptor["name"])
+            with open(segment_path, "rb") as handle:
+                segment_raw = handle.read()
+            digest = hashlib.sha256(segment_raw).hexdigest()
+            if not hmac.compare_digest(digest, descriptor["digest"]):
+                raise ValueError(
+                    "segment bytes do not match the manifest"
+                )
+            index, prev, segment_pairs = cls._parse_diagnostic_ledger_segment(
+                segment_raw
+            )
+            if cls._diagnostic_ledger_segment_name(index) != descriptor[
+                "name"
+            ]:
+                raise ValueError(
+                    "segment index does not match its file name"
+                )
+            if not hmac.compare_digest(prev, previous_digest):
+                raise ValueError("segment digest chain is broken")
+            if len(segment_pairs) != descriptor["entries"]:
+                raise ValueError(
+                    "segment entry count does not match the manifest"
+                )
+            if (
+                segment_pairs[0][0] != descriptor["first"]
+                or segment_pairs[-1][0] != descriptor["last"]
+            ):
+                raise ValueError(
+                    "segment time bounds do not match the manifest"
+                )
+            previous_digest = digest
+            next_index = index + 1
+            pairs.extend(segment_pairs)
+        chains = tuple(chain for _at, chain in pairs)
+        summaries = cls._authenticate_recovery_diagnostic_chains(chains)
+        position = 0
+        previous_time: int | None = None
+        for descriptor in descriptors:
+            count = descriptor["entries"]
+            order_keys = [
+                (
+                    pairs[position + offset][0],
+                    summaries[position + offset]["transaction"],
+                )
+                for offset in range(count)
+            ]
+            if order_keys != sorted(order_keys):
+                raise ValueError(
+                    "segment entries are not in canonical order"
+                )
+            if previous_time is not None and order_keys[0][0] < previous_time:
+                raise ValueError(
+                    "segment entry times regress across segments"
+                )
+            previous_time = order_keys[-1][0]
+            position += count
+        return {
+            "pairs": pairs,
+            "summaries": summaries,
+            "generation": generation,
+            "segments": descriptors,
+            "rotated": rotated,
+            "next_index": next_index,
+            "last_digest": previous_digest,
+            "last_time": pairs[-1][0] if pairs else None,
+        }
+
+    @classmethod
+    def append_diagnostic_ledger(
+        cls,
+        directory: Any,
+        entries: Any,
+        expected: Any,
+        segment_limit: Any,
+        retain: Any,
+        timeout: Any,
+    ) -> str:
+        """Append time-stamped recovery diagnostic chains to a
+        segmented ledger directory, publishing a new manifest snapshot
+        atomically.
+
+        ``directory`` must be a non-empty :class:`str` naming an
+        existing directory (a non-:class:`str` raises
+        :class:`TypeError`, an empty string :class:`ValueError`, a
+        missing directory :class:`OSError`); the directory is never
+        created implicitly. ``entries`` follows exactly the rules of
+        :meth:`save_diagnostic_ledger`: a :class:`tuple` of ``(time,
+        chain)`` tuples with non-``bool`` non-negative non-decreasing
+        :class:`int` times, each chain authenticating and naming a
+        transaction no other entry -- new or already retained -- names;
+        shape and plain value type errors raise :class:`TypeError`,
+        regressing times, empty chains, duplicated transactions and
+        authentication failures raise :class:`ValueError`. The first
+        new time must also not be earlier than the ledger's last
+        retained entry.
+
+        ``expected`` is the compare-and-swap guard: ``None`` for the
+        first publish (legal only while no manifest exists), otherwise
+        the digest of the current manifest snapshot as
+        :meth:`page_diagnostic_ledger` reports it -- a wrong type
+        raises :class:`TypeError`, a malformed digest
+        :class:`ValueError`, and any mismatch with the snapshot
+        actually current under the lock :class:`RuntimeError`, so of
+        several callers racing with the same old snapshot at most one
+        publishes and the winner's data is never overwritten.
+        ``segment_limit`` and ``retain`` must be non-``bool`` positive
+        :class:`int` values (:class:`TypeError` otherwise,
+        :class:`ValueError` below one): each written segment holds at
+        most ``segment_limit`` entries, and once more than ``retain``
+        segments exist the oldest are rotated away. ``timeout`` is the
+        lock wait: ``None`` waits indefinitely, otherwise a
+        non-``bool`` finite non-negative number of seconds
+        (:class:`TypeError` for other types, :class:`ValueError` for
+        negative, NaN or infinite values, :class:`TimeoutError` when
+        the wait elapses).
+
+        Equivalent spellings of the same directory compete for one
+        cross-process lock derived from the canonical path; the
+        manifest, the retained segments and the expected snapshot are
+        (re-)authenticated only after the lock is held. New entries are
+        stored sorted by time and then transaction identity in
+        immutable segment files chained by digest, each segment
+        recording its predecessor's digest -- the very first roots at
+        the all-zero digest, and after rotation the first retained
+        segment still links to the rotated prefix's last digest, which
+        the manifest preserves together with the prefix's entry count
+        and time bounds.
+
+        The publish first durably writes (flush, fsync, atomic
+        replace, directory sync) every new segment and then the new
+        manifest, switching the visible snapshot with one atomic
+        manifest replace; rotated segment files are removed afterwards.
+        A locking, read, write, flush, replace or sync failure raises
+        :class:`OSError`; whatever fails, the previous snapshot stays
+        byte-for-byte readable and no partial result is ever returned,
+        so concurrent :meth:`page_diagnostic_ledger` readers only ever
+        observe the complete snapshot from before or after the switch.
+        A corrupt manifest, segment encoding or digest chain raises
+        :class:`ValueError`.
+
+        Returns the new snapshot: the SHA-256 hex digest of the
+        published manifest, to be passed as ``expected`` on the next
+        append.
+        """
+        cls._validate_diagnostic_ledger_directory(directory)
+        pairs = cls._validate_diagnostic_ledger_entries(entries)
+        new_chains = tuple(chain for _at, chain in pairs)
+        new_summaries = cls._authenticate_recovery_diagnostic_chains(
+            new_chains
+        )
+        segment_size = cls._validate_diagnostic_ledger_positive_int(
+            segment_limit, "segment_limit"
+        )
+        retain_count = cls._validate_diagnostic_ledger_positive_int(
+            retain, "retain"
+        )
+        cls._validate_diagnostic_ledger_expected(expected)
+        cls._validate_chain_timeout(timeout)
+        if not os.path.isdir(directory):
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "diagnostic ledger directory does not exist",
+                directory,
+            )
+        real = os.path.realpath(directory)
+        lock_path = cls._recovery_chain_lock_path(real)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            cls._acquire_chain_lock(fd, timeout)
+            try:
+                return cls._append_diagnostic_ledger_locked(
+                    real,
+                    pairs,
+                    new_summaries,
+                    expected,
+                    segment_size,
+                    retain_count,
+                )
+            finally:
+                cls._release_chain_lock(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _append_diagnostic_ledger_locked(
+        cls,
+        real: str,
+        pairs: list[tuple[int, tuple[str, ...]]],
+        new_summaries: list[dict[str, Any]],
+        expected: str | None,
+        segment_size: int,
+        retain_count: int,
+    ) -> str:
+        """Publish one append under the held directory lock: re-read
+        and re-authenticate the current snapshot, check the expected
+        digest against it, then durably write the new segments and
+        switch the manifest atomically. ``real`` is the ledger
+        directory's canonical path; the argument-level validation has
+        already happened in :meth:`append_diagnostic_ledger`."""
+        manifest_path = os.path.join(
+            real, cls._DIAGNOSTIC_LEDGER_MANIFEST_NAME
+        )
+        if os.path.lexists(manifest_path):
+            manifest_raw, _stat = cls._read_diagnostic_ledger(manifest_path)
+            state = cls._parse_diagnostic_ledger_directory(real, manifest_raw)
+            current = hashlib.sha256(manifest_raw).hexdigest()
+            if expected is None:
+                raise RuntimeError(
+                    "the diagnostic ledger already exists, so the "
+                    "expected snapshot must name the current manifest"
+                )
+            if not hmac.compare_digest(current, expected):
+                raise RuntimeError(
+                    "expected snapshot does not match the current "
+                    "diagnostic ledger manifest"
+                )
+        else:
+            if expected is not None:
+                raise RuntimeError(
+                    "no diagnostic ledger manifest exists yet, so the "
+                    "expected snapshot must be None"
+                )
+            state = None
+        if state is None:
+            generation = 1
+            descriptors: list[dict[str, Any]] = []
+            rotated: dict[str, Any] | None = None
+            next_index = 1
+            prev = cls._RECOVERY_CHAIN_GENESIS_PREV
+        else:
+            if (
+                pairs
+                and state["last_time"] is not None
+                and pairs[0][0] < state["last_time"]
+            ):
+                raise ValueError(
+                    "ledger entry times must be non-decreasing"
+                )
+            retained = {
+                summary["transaction"] for summary in state["summaries"]
+            }
+            for summary in new_summaries:
+                if summary["transaction"] in retained:
+                    raise ValueError(
+                        "transaction identity is duplicated across the "
+                        "ledger"
+                    )
+            generation = state["generation"] + 1
+            descriptors = [
+                dict(descriptor) for descriptor in state["segments"]
+            ]
+            rotated = (
+                None if state["rotated"] is None else dict(state["rotated"])
+            )
+            next_index = state["next_index"]
+            prev = state["last_digest"]
+        order = sorted(
+            range(len(pairs)),
+            key=lambda index: (
+                pairs[index][0],
+                new_summaries[index]["transaction"],
+            ),
+        )
+        sorted_pairs = [pairs[index] for index in order]
+        written: list[str] = []
+        removed: list[str] = []
+        published = False
+        try:
+            for start in range(0, len(sorted_pairs), segment_size):
+                chunk = sorted_pairs[start : start + segment_size]
+                name = cls._diagnostic_ledger_segment_name(next_index)
+                data = cls._diagnostic_ledger_segment_document(
+                    next_index, prev, chunk
+                )
+                cls._replace_durable(
+                    os.path.join(real, name), data, ".segment-"
+                )
+                cls._fsync_directory(real)
+                digest = hashlib.sha256(data).hexdigest()
+                descriptors.append(
+                    {
+                        "name": name,
+                        "digest": digest,
+                        "entries": len(chunk),
+                        "first": chunk[0][0],
+                        "last": chunk[-1][0],
+                    }
+                )
+                written.append(name)
+                prev = digest
+                next_index += 1
+            while len(descriptors) > retain_count:
+                oldest = descriptors.pop(0)
+                removed.append(oldest["name"])
+                if rotated is None:
+                    rotated = {
+                        "digest": oldest["digest"],
+                        "entries": oldest["entries"],
+                        "first": oldest["first"],
+                        "last": oldest["last"],
+                    }
+                else:
+                    rotated = {
+                        "digest": oldest["digest"],
+                        "entries": rotated["entries"] + oldest["entries"],
+                        "first": rotated["first"],
+                        "last": oldest["last"],
+                    }
+            manifest_data = cls._diagnostic_ledger_manifest_document(
+                generation, descriptors, rotated
+            )
+            cls._replace_durable(manifest_path, manifest_data, ".manifest-")
+            published = True
+            cls._fsync_directory(real)
+        except BaseException:
+            if not published:
+                # The old manifest is still the visible snapshot: drop
+                # the segments this failed publish leaked so no partial
+                # result lingers; the next publish would reuse their
+                # sequence indices anyway.
+                for name in written:
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(real, name))
+            raise
+        # The new snapshot is visible; evicting the rotated segments is
+        # garbage collection and must not fail the completed publish.
+        for name in removed:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(real, name))
+        if removed:
+            with contextlib.suppress(OSError):
+                cls._fsync_directory(real)
+        return hashlib.sha256(manifest_data).hexdigest()
 
     @classmethod
     def _publish_caches_recovery_locked(
