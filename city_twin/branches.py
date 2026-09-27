@@ -6131,11 +6131,14 @@ class BranchStore:
         business state is touched, and no recovery is performed. Each
         path must be a non-empty :class:`str` (a non-``str`` raises
         :class:`TypeError`, an empty string :class:`ValueError`); the
-        three paths must name distinct files (even through aliases) and
-        must all live in one directory, otherwise :class:`ValueError`.
-        A missing or unreadable index or progress, or any open/read
-        failure, raises :class:`OSError`; corrupt recovery material is
-        never raised but reported as a ``rejected`` diagnostic.
+        three paths must name distinct files -- even through aliases or
+        hard links, with existing objects identified by device and
+        inode and a failed identity probe raising :class:`OSError` --
+        and must all live in one directory, otherwise
+        :class:`ValueError`. A missing or unreadable index or progress,
+        or any open/read failure, raises :class:`OSError`; corrupt
+        recovery material is never raised but reported as a
+        ``rejected`` diagnostic.
 
         ``previous`` continues one transaction's diagnostic sequence
         after its recovery record was cleaned up: ``None`` (the
@@ -6210,6 +6213,27 @@ class BranchStore:
                 "index_path, progress_path and recovery_path must all "
                 "live in the same directory"
             )
+
+        # Distinct resolved path strings are not enough: two of the
+        # three objects may be hard links to one underlying file, which
+        # must not bypass the identity check. Existing objects are
+        # identified by device and inode; an absent object (the
+        # recovery record commonly is, which the idle semantics below
+        # report) is simply not probed, while any other stat failure
+        # propagates as OSError.
+        identities: set[tuple[int, int]] = set()
+        for probed in (index_path, progress_path, recovery_path):
+            try:
+                stat_result = os.stat(probed)
+            except FileNotFoundError:
+                continue
+            identity = (stat_result.st_dev, stat_result.st_ino)
+            if identity in identities:
+                raise ValueError(
+                    "index_path, progress_path and recovery_path must "
+                    "not name the same file"
+                )
+            identities.add(identity)
 
         prev_document: dict[str, Any] | None = None
         prev_digest = cls._RECOVERY_DIAGNOSTIC_GENESIS_PREV
@@ -6860,6 +6884,170 @@ class BranchStore:
                 return False
             previous = current
         return True
+
+    @classmethod
+    def _authenticate_recovery_diagnostic_chains(
+        cls, chains: Any
+    ) -> list[dict[str, Any]]:
+        """Validate a ledger of diagnostic chains and return one fresh
+        summary mapping per chain, in input order.
+
+        ``chains`` must be a :class:`tuple` of chains, each chain a
+        non-empty :class:`tuple` of diagnostic strings; any other
+        container or element type raises :class:`TypeError` and an
+        empty chain raises :class:`ValueError`. Every structural check
+        completes before any chain is authenticated. Each chain must
+        then authenticate through :meth:`verify_recovery_diagnostics`
+        -- a malformed record surfaces its own :class:`ValueError` and
+        a chain that does not authenticate raises :class:`ValueError`
+        -- and must name exactly one transaction identity: an all-idle
+        chain that never opens a transaction raises :class:`ValueError`,
+        as does a transaction identity shared by two chains. The
+        returned summaries are new mappings that share nothing with the
+        caller, and nothing is read from or written to the filesystem.
+        """
+        if not isinstance(chains, tuple):
+            raise TypeError(
+                "chains must be a tuple, got "
+                f"{type(chains).__name__}"
+            )
+        # Plain structural validation of every chain and record
+        # completes before any chain is authenticated.
+        for chain in chains:
+            if not isinstance(chain, tuple):
+                raise TypeError(
+                    "every diagnostic chain must be a tuple, got "
+                    f"{type(chain).__name__}"
+                )
+            if not chain:
+                raise ValueError("a diagnostic chain must not be empty")
+            for record in chain:
+                if not isinstance(record, str):
+                    raise TypeError(
+                        "every diagnostic record must be a str, got "
+                        f"{type(record).__name__}"
+                    )
+
+        terminal_dispositions = (
+            cls._RECOVERY_DIAGNOSTIC_DISPOSITION_COMMITTED,
+            cls._RECOVERY_DIAGNOSTIC_DISPOSITION_ROLLED_BACK,
+            cls._RECOVERY_DIAGNOSTIC_DISPOSITION_REJECTED,
+        )
+        summaries: list[dict[str, Any]] = []
+        transactions: set[str] = set()
+        for chain in chains:
+            if not cls.verify_recovery_diagnostics(chain):
+                raise ValueError(
+                    "diagnostic chain does not authenticate as one "
+                    "consecutive sequence"
+                )
+            documents = [
+                cls._parse_recovery_diagnostic(record) for record in chain
+            ]
+            # A verified chain names at most one transaction identity:
+            # the idle prefix is the only place it is empty.
+            transaction = ""
+            for document in documents:
+                if document["transaction"]:
+                    transaction = document["transaction"]
+                    break
+            if not transaction:
+                raise ValueError(
+                    "diagnostic chain never names a transaction"
+                )
+            if transaction in transactions:
+                raise ValueError(
+                    "transaction identity is duplicated across chains"
+                )
+            transactions.add(transaction)
+            last = documents[-1]
+            summaries.append(
+                {
+                    "transaction": transaction,
+                    "first": documents[0]["disposition"],
+                    "last": last["disposition"],
+                    "count": len(chain),
+                    "terminal": (
+                        last["disposition"] in terminal_dispositions
+                    ),
+                    "reason": last["reason"],
+                }
+            )
+        return summaries
+
+    @classmethod
+    def summarize_recovery_diagnostics(
+        cls, chains: Any
+    ) -> tuple[dict[str, Any], ...]:
+        """Summarize, strictly read-only, a ledger of recovery
+        diagnostic chains sampled over time.
+
+        ``chains`` must be a :class:`tuple` of chains in sampling
+        order, each chain a non-empty :class:`tuple` of diagnostic
+        strings produced by :meth:`recovery_diagnostic`; any other
+        container or a non-:class:`str` record raises
+        :class:`TypeError`, and an empty inner chain raises
+        :class:`ValueError`. An empty outer tuple returns an empty
+        tuple. All structural validation completes before any chain is
+        authenticated; a chain whose records are malformed, whose
+        sequence does not authenticate through
+        :meth:`verify_recovery_diagnostics`, that never names a
+        transaction, or whose transaction identity duplicates another
+        chain's raises :class:`ValueError` -- chains are never merged
+        and no evidence is overwritten.
+
+        Returns one new mapping per chain, in input order, with the
+        keys ``transaction`` (the chain's transaction identity),
+        ``first`` and ``last`` (the first and last records'
+        dispositions), ``count`` (the number of records), ``terminal``
+        (``True`` only when the last record is a committed, rolled-back
+        or rejected terminal observation -- a pending transaction is
+        never marked terminal early) and ``reason`` (the last record's
+        stable reason, which for a pending transaction stays
+        ``pending_commit`` or ``pending_rollback`` without speculating
+        an outcome). Every value comes from authenticated records. The
+        call modifies nothing: no diagnostic file, cache material,
+        event graph, audit or idempotency state is touched, whether it
+        succeeds or raises.
+        """
+        return tuple(
+            cls._authenticate_recovery_diagnostic_chains(chains)
+        )
+
+    @classmethod
+    def get_recovery_diagnostics(
+        cls, chains: Any, transaction: Any
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Look up one transaction in a ledger of recovery diagnostic
+        chains, strictly read-only.
+
+        The ledger is validated completely first, exactly as
+        :meth:`summarize_recovery_diagnostics` validates it: any
+        illegal chain raises and no other transaction is returned --
+        partial results are never produced. ``transaction`` must be a
+        non-empty :class:`str` (a non-``str`` raises :class:`TypeError`,
+        an empty string :class:`ValueError`); a transaction identity no
+        chain names raises :class:`KeyError`.
+
+        Returns ``(summary, records)``: a fresh copy of that chain's
+        summary mapping (as :meth:`summarize_recovery_diagnostics`
+        reports it) and the chain's own canonical tuple of diagnostic
+        record strings. The returned levels share no mutable state with
+        each other or across calls, and the call modifies nothing
+        whether it succeeds or raises.
+        """
+        summaries = cls._authenticate_recovery_diagnostic_chains(chains)
+        if not isinstance(transaction, str):
+            raise TypeError(
+                "transaction must be a str, got "
+                f"{type(transaction).__name__}"
+            )
+        if not transaction:
+            raise ValueError("transaction must be a non-empty str")
+        for summary, chain in zip(summaries, chains):
+            if summary["transaction"] == transaction:
+                return (dict(summary), chain)
+        raise KeyError(transaction)
 
     @classmethod
     def _publish_caches_recovery_locked(
