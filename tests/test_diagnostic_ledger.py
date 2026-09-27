@@ -509,7 +509,7 @@ class PageContentTests(LedgerTestBase):
             snapshot["digest"], hashlib.sha256(raw).hexdigest()
         )
         self.assertEqual(snapshot["entries"], 5)
-        self.assertEqual(snapshot["size"], len(raw))
+        self.assertEqual(snapshot["bytes"], len(raw))
         self.assertIsNone(result["next_cursor"])
         self.assertEqual(
             list(result["items"]),

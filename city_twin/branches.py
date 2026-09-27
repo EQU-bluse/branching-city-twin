@@ -7805,7 +7805,7 @@ class BranchStore:
         snapshot = {
             "digest": digest,
             "entries": len(pairs),
-            "size": size,
+            "bytes": size,
         }
         return {
             "snapshot": snapshot,
@@ -8918,44 +8918,98 @@ class BranchStore:
                 manifest_data,
                 ".diagnostic-ledger-manifest-",
             )
-        except BaseException:
+        except BaseException as exc:
             # The visible manifest still names only the old snapshot, so
             # deleting the newly staged files (never the old ones, which
             # remain in ``preexisting``) restores the directory to its
-            # pre-publish state. Cleanup errors are suppressed so the
-            # original failure surfaces.
-            for staged in created:
-                if os.path.basename(staged) not in preexisting:
-                    with contextlib.suppress(OSError):
+            # pre-publish state. A failure during this cleanup is itself
+            # an OSError and must surface, never be masked by the
+            # original failure.
+            try:
+                for staged in created:
+                    if os.path.basename(staged) not in preexisting:
                         os.remove(staged)
-            with contextlib.suppress(OSError):
                 cls._fsync_directory(directory)
+            except OSError as cleanup_exc:
+                raise cleanup_exc from exc
             raise
-        # Rotated-away segments and superseded/orphan evidence are only
-        # garbage-collected once the manifest naming the new generation
-        # is durable and visible. The caller's exclusive publish lock
-        # waits for every shared reader lock to drain, so no in-progress
-        # reader is still resolving these names; a reader that already
-        # opened a file keeps its unlinked inode readable by the kernel.
-        for meta in removed:
-            os.remove(os.path.join(directory, meta["name"]))
-        if removed:
-            keep_evidence = (
-                None
-                if manifest_evidence_digest is None
-                else cls._diagnostic_ledger_evidence_name(
-                    manifest_evidence_digest
-                )
+        new_digest = hashlib.sha256(manifest_data).hexdigest()
+        # The new manifest is now the durable, visible generation. The
+        # remaining commit -- deleting the rotated-away segments,
+        # reclaiming superseded/orphan evidence and syncing the directory
+        # -- is one rollback-atomic operation: every file it may remove is
+        # captured into memory first, and any deletion or directory-sync
+        # failure restores the exact pre-call snapshot (the old manifest
+        # and every segment and evidence it references, byte-for-byte)
+        # and sweeps the files this publish created, so on failure the
+        # ledger is wholly the old snapshot rather than a mixture.
+        keep_evidence = (
+            None
+            if manifest_evidence_digest is None
+            else cls._diagnostic_ledger_evidence_name(
+                manifest_evidence_digest
             )
+        )
+        reclaimed_segments = [
+            os.path.join(directory, meta["name"]) for meta in removed
+        ]
+        reclaimed_evidence: list[str] = []
+        if removed:
             # Reconcile every evidence file on disk against the one the
-            # new manifest references: this removes the superseded
+            # new manifest references: this reclaims the superseded
             # evidence and any orphan left by a publish that crashed
             # after writing its evidence but before the manifest switch.
-            for name in cls._diagnostic_ledger_evidence_files(directory):
-                if name != keep_evidence:
-                    os.remove(os.path.join(directory, name))
-            cls._fsync_directory(directory)
-        return hashlib.sha256(manifest_data).hexdigest()
+            reclaimed_evidence = [
+                os.path.join(directory, name)
+                for name in cls._diagnostic_ledger_evidence_files(directory)
+                if name != keep_evidence
+            ]
+        backed_up: dict[str, bytes] = {}
+
+        def _roll_back_commit(commit_exc: BaseException) -> None:
+            """Restore the pre-call directory snapshot after a commit
+            phase failure, then remove every file this publish created;
+            any failure here is reported as OSError chained to the
+            original failure, never silently swallowed."""
+            try:
+                for obsolete, data in backed_up.items():
+                    cls._write_diagnostic_ledger_file(
+                        obsolete, data, ".diagnostic-ledger-restore-"
+                    )
+                if manifest_raw is not None:
+                    cls._write_diagnostic_ledger_file(
+                        manifest_path,
+                        manifest_raw,
+                        ".diagnostic-ledger-manifest-",
+                    )
+                elif os.path.exists(manifest_path):
+                    os.remove(manifest_path)
+                # Sweep files introduced by this publish. Every restored
+                # file was preexisting, so it is never swept here.
+                for name in os.listdir(directory):
+                    if name not in preexisting:
+                        os.remove(os.path.join(directory, name))
+                cls._fsync_directory(directory)
+            except OSError as rollback_exc:
+                raise rollback_exc from commit_exc
+
+        try:
+            # Capture every file the commit may remove before the first
+            # deletion, so a failure at any point -- including these reads
+            # -- can restore the exact pre-call snapshot.
+            for obsolete in (*reclaimed_segments, *reclaimed_evidence):
+                with open(obsolete, "rb") as handle:
+                    backed_up[obsolete] = handle.read()
+            for obsolete in reclaimed_segments:
+                os.remove(obsolete)
+            for obsolete in reclaimed_evidence:
+                os.remove(obsolete)
+            if removed:
+                cls._fsync_directory(directory)
+        except OSError as commit_exc:
+            _roll_back_commit(commit_exc)
+            raise commit_exc
+        return new_digest
 
     @classmethod
     def _page_diagnostic_ledger_directory(
