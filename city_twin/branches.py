@@ -2778,7 +2778,10 @@ class BranchStore:
     #: against the recorded old/new digests, the recorded backups'
     #: status, and the resulting disposition with a stable reason
     #: category. Consecutive diagnostics authenticate one another
-    #: through :meth:`verify_recovery_diagnostics`.
+    #: through :meth:`verify_recovery_diagnostics`, and a ledger of
+    #: per-transaction chains is summarized and searched read-only
+    #: through :meth:`summarize_recovery_diagnostics` and
+    #: :meth:`get_recovery_diagnostics`.
     _RECOVERY_DIAGNOSTIC_FORMAT = (
         "branching-city-twin/recovery-diagnostic"
     )
@@ -6133,7 +6136,11 @@ class BranchStore:
         :class:`TypeError`, an empty string :class:`ValueError`); the
         three paths must name distinct files (even through aliases) and
         must all live in one directory, otherwise :class:`ValueError`.
-        A missing or unreadable index or progress, or any open/read
+        Identity is checked on the files themselves, not their names:
+        any two existing objects -- including hard links -- that
+        resolve to the same underlying file raise :class:`ValueError`,
+        and a failed identity probe raises :class:`OSError`. A missing
+        or unreadable index or progress, or any open/read
         failure, raises :class:`OSError`; corrupt recovery material is
         never raised but reported as a ``rejected`` diagnostic.
 
@@ -6200,6 +6207,27 @@ class BranchStore:
                 "index_path, progress_path and recovery_path must each "
                 "name a distinct file"
             )
+        # Name resolution alone cannot see hard links: compare the
+        # device/inode identity of every object that actually exists.
+        # A path that does not exist has no identity to clash -- a
+        # missing index or progress surfaces as OSError when the
+        # evidence is read, and a missing recovery record keeps its
+        # idle semantics. Any other probe failure (an unsearchable
+        # directory, a path component that is not a directory, ...)
+        # is an observation failure and propagates as OSError.
+        identities: set[tuple[int, int]] = set()
+        for value in (index_path, progress_path, recovery_path):
+            try:
+                stat_result = os.stat(value)
+            except FileNotFoundError:
+                continue
+            identity = (stat_result.st_dev, stat_result.st_ino)
+            if identity in identities:
+                raise ValueError(
+                    "index_path, progress_path and recovery_path must "
+                    "each name a distinct file"
+                )
+            identities.add(identity)
         directories = {
             os.path.dirname(os.path.realpath(index_path)),
             os.path.dirname(os.path.realpath(progress_path)),
@@ -6860,6 +6888,159 @@ class BranchStore:
                 return False
             previous = current
         return True
+
+    @classmethod
+    def _validate_recovery_diagnostic_chains(cls, chains: Any) -> None:
+        """Plain input validation shared by the cross-transaction
+        ledger entries. ``chains`` must be a :class:`tuple` of chains,
+        each chain a non-empty :class:`tuple` of diagnostic strings;
+        every defect is found before any chain is authenticated. A
+        non-tuple container or chain, or a non-:class:`str` record,
+        raises :class:`TypeError`; an empty inner chain raises
+        :class:`ValueError`. An empty outer tuple is valid."""
+        if not isinstance(chains, tuple):
+            raise TypeError(
+                "chains must be a tuple, got "
+                f"{type(chains).__name__}"
+            )
+        for chain in chains:
+            if not isinstance(chain, tuple):
+                raise TypeError(
+                    "every chain must be a tuple, got "
+                    f"{type(chain).__name__}"
+                )
+        for chain in chains:
+            if not chain:
+                raise ValueError("every chain must be non-empty")
+            for record in chain:
+                if not isinstance(record, str):
+                    raise TypeError(
+                        "every diagnostic record must be a str, got "
+                        f"{type(record).__name__}"
+                    )
+
+    @classmethod
+    def summarize_recovery_diagnostics(cls, chains: Any) -> tuple:
+        """Summarize a read-only cross-transaction ledger of recovery
+        diagnostic chains, in input order.
+
+        ``chains`` must be a :class:`tuple` of diagnostic chains --
+        each chain a non-empty :class:`tuple` of diagnostic strings
+        produced by :meth:`recovery_diagnostic`, ordered by sampling
+        time. Any container or element type defect raises
+        :class:`TypeError`, an empty inner chain raises
+        :class:`ValueError`, and an empty outer tuple returns an empty
+        tuple. All plain input validation completes before any chain
+        is authenticated; a chain that is malformed or names an
+        unreachable state raises :class:`ValueError`, as does a chain
+        that does not authenticate through
+        :meth:`verify_recovery_diagnostics`.
+
+        Each chain may leave its idle prefix for exactly one
+        transaction and must end with a transaction identity: a chain
+        that never names one raises :class:`ValueError`. One chain can
+        never span transactions (authentication already rejects the
+        identity change), and two different chains naming the same
+        transaction identity raise :class:`ValueError` -- evidence is
+        never merged or overwritten across chains.
+
+        The result is a new tuple of new dictionaries, one per chain
+        in input order, with the keys ``transaction``, ``first``,
+        ``last``, ``count``, ``terminal`` and ``reason`` in that
+        order. ``first`` and ``last`` are the first and last observed
+        dispositions, ``count`` the number of records, and ``reason``
+        the last record's stable reason -- a ``pending_commit`` or
+        ``pending_rollback`` chain keeps its pending reason and never
+        speculates an outcome. ``terminal`` is ``True`` only when the
+        last disposition is a settled end state (``committed``,
+        ``rolled_back`` or ``rejected``); a transaction still in
+        flight is never marked terminal early. Every value comes from
+        the authenticated records. The ledger is only read: nothing
+        about the diagnostic files, cache material, event graph,
+        audit or idempotency state is modified, whether the call
+        succeeds or raises.
+        """
+        cls._validate_recovery_diagnostic_chains(chains)
+        terminal_dispositions = (
+            cls._RECOVERY_DIAGNOSTIC_DISPOSITION_COMMITTED,
+            cls._RECOVERY_DIAGNOSTIC_DISPOSITION_ROLLED_BACK,
+            cls._RECOVERY_DIAGNOSTIC_DISPOSITION_REJECTED,
+        )
+        summaries = []
+        seen_transactions: list[str] = []
+        for chain in chains:
+            if not cls.verify_recovery_diagnostics(chain):
+                raise ValueError(
+                    "recovery diagnostic chain does not authenticate"
+                )
+            records = [
+                cls._parse_recovery_diagnostic(item) for item in chain
+            ]
+            transaction = records[-1]["transaction"]
+            if transaction == "":
+                raise ValueError(
+                    "recovery diagnostic chain never names a transaction"
+                )
+            if any(
+                hmac.compare_digest(transaction, known)
+                for known in seen_transactions
+            ):
+                raise ValueError(
+                    "two recovery diagnostic chains name the same "
+                    "transaction"
+                )
+            seen_transactions.append(transaction)
+            last = records[-1]
+            summaries.append(
+                {
+                    "transaction": transaction,
+                    "first": records[0]["disposition"],
+                    "last": last["disposition"],
+                    "count": len(records),
+                    "terminal": last["disposition"]
+                    in terminal_dispositions,
+                    "reason": last["reason"],
+                }
+            )
+        return tuple(summaries)
+
+    @classmethod
+    def get_recovery_diagnostics(
+        cls, chains: Any, transaction: Any
+    ) -> tuple:
+        """Retrieve one transaction's summary and records from a
+        read-only cross-transaction diagnostic ledger.
+
+        The ledger is validated completely first -- exactly as
+        :meth:`summarize_recovery_diagnostics` validates it -- and any
+        illegal chain raises before anything is returned; no partial
+        result is ever produced. ``transaction`` must be a
+        non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`); a
+        transaction identity no chain in the ledger names raises
+        :class:`KeyError`.
+
+        The result is a ``(summary, records)`` pair: a copy of the
+        transaction's summary dictionary (as
+        :meth:`summarize_recovery_diagnostics` computes it) and the
+        chain's canonical record tuple. The returned layers share
+        nothing with one another or with any internal state, and the
+        lookup modifies nothing -- not the diagnostic files, cache
+        material, event graph, audit or idempotency state -- whether
+        it succeeds or raises.
+        """
+        summaries = cls.summarize_recovery_diagnostics(chains)
+        if not isinstance(transaction, str):
+            raise TypeError(
+                "transaction must be a str, got "
+                f"{type(transaction).__name__}"
+            )
+        if not transaction:
+            raise ValueError("transaction must be a non-empty str")
+        for summary, chain in zip(summaries, chains):
+            if hmac.compare_digest(summary["transaction"], transaction):
+                return (dict(summary), tuple(chain))
+        raise KeyError(transaction)
 
     @classmethod
     def _publish_caches_recovery_locked(
