@@ -7882,6 +7882,42 @@ class BranchStore:
     #: How often a first-page directory read restarts after racing a
     #: publish before it reports the snapshot as unobservable.
     _DIAGNOSTIC_LEDGER_READ_ATTEMPTS = 3
+    _DIAGNOSTIC_LEDGER_PROOF_FORMAT = (
+        "branching-city-twin/diagnostic-ledger-proof"
+    )
+    _DIAGNOSTIC_LEDGER_PROOF_VERSION = 1
+    _DIAGNOSTIC_LEDGER_PROOF_SUPPORTED_VERSIONS = (1,)
+    _DIAGNOSTIC_LEDGER_PROOF_KEYS = (
+        "format",
+        "version",
+        "snapshot",
+        "selection",
+        "manifest",
+        "segments",
+        "evidence",
+        "items",
+        "rotated",
+        "absent",
+        "checksum",
+    )
+    _DIAGNOSTIC_LEDGER_PROOF_SNAPSHOT_KEYS = (
+        "digest",
+        "entries",
+        "bytes",
+        "dropped_entries",
+        "dropped_first_at",
+        "dropped_last_at",
+        "evidence_digest",
+    )
+    _DIAGNOSTIC_LEDGER_PROOF_SELECTION_KEYS = (
+        "mode",
+        "start",
+        "end",
+        "transactions",
+    )
+    _DIAGNOSTIC_LEDGER_PROOF_SEGMENT_KEYS = ("name", "body")
+    _DIAGNOSTIC_LEDGER_PROOF_EVIDENCE_KEYS = ("name", "body")
+    _DIAGNOSTIC_LEDGER_PROOF_ITEM_KEYS = ("at", "summary", "records")
 
     @classmethod
     def _validate_diagnostic_ledger_expected(cls, expected: Any) -> Any:
@@ -9228,6 +9264,1035 @@ class BranchStore:
             page_limit,
             bookmark,
         )
+
+    @classmethod
+    def _validate_diagnostic_ledger_proof_selection(
+        cls,
+        start: Any,
+        end: Any,
+        transactions: Any,
+    ) -> tuple[int | None, int | None, tuple[str, ...] | None]:
+        """Validate and normalize the selection arguments of
+        :meth:`export_diagnostic_ledger_proof`.
+
+        Exactly one selection mode is allowed: a time range (both
+        ``start`` and ``end`` non-``bool`` non-negative :class:`int`
+        with ``start <= end``, ``transactions`` ``None``) or a
+        transaction set (both bounds ``None`` and ``transactions`` a
+        non-empty :class:`tuple` of distinct non-empty :class:`str`).
+        A bad bound or container type raises :class:`TypeError`; a
+        negative or reversed bound, a mixed (one-``None``) bound pair,
+        an empty or duplicated identity, an empty transaction tuple or
+        selecting both modes at once raises :class:`ValueError`.
+        Transaction identities keep their request order, so the proof's
+        classification follows the caller's spelling rather than a
+        sorted one."""
+
+        def bound(value: Any, name: str) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(
+                    f"{name} must be None or a non-negative int, got "
+                    f"{type(value).__name__}"
+                )
+            return value
+
+        start_value = bound(start, "start")
+        end_value = bound(end, "end")
+        if transactions is not None and not isinstance(transactions, tuple):
+            raise TypeError(
+                "transactions must be None or a tuple, got "
+                f"{type(transactions).__name__}"
+            )
+        # Every container- and element-level type/value check completes
+        # before the exclusive-mode rules are applied.
+        identities: list[str] = []
+        if transactions is not None:
+            seen: set[str] = set()
+            for item in transactions:
+                if not isinstance(item, str):
+                    raise TypeError(
+                        "every transaction must be a str, got "
+                        f"{type(item).__name__}"
+                    )
+                if not item:
+                    raise ValueError(
+                        "transactions must not contain an empty identity"
+                    )
+                if item in seen:
+                    raise ValueError(
+                        "transactions must not contain duplicates"
+                    )
+                seen.add(item)
+                identities.append(item)
+        if (start_value is None) != (end_value is None):
+            raise ValueError(
+                "start and end must both be None or both be ints"
+            )
+        if start_value is not None:
+            if start_value < 0 or end_value < 0:
+                raise ValueError("time bounds must not be negative")
+            if start_value > end_value:
+                raise ValueError("start must not be after end")
+            if transactions is not None:
+                raise ValueError(
+                    "a time range and a transaction set cannot both be "
+                    "selected"
+                )
+            return start_value, end_value, None
+        if transactions is None:
+            raise ValueError(
+                "either a time range or a non-empty transaction set is "
+                "required"
+            )
+        if not identities:
+            raise ValueError("transactions must be a non-empty tuple")
+        return None, None, tuple(identities)
+
+    @classmethod
+    def export_diagnostic_ledger_proof(
+        cls,
+        directory: Any,
+        start: Any,
+        end: Any,
+        transactions: Any,
+    ) -> str:
+        """Export an offline-verifiable historical proof from a
+        segmented directory diagnostic ledger, strictly read-only.
+
+        ``directory`` must be a non-empty :class:`str` naming a
+        directory ledger published by :meth:`append_diagnostic_ledger`
+        (a non-:class:`str` raises :class:`TypeError`, an empty string
+        :class:`ValueError`; a missing directory, manifest or lock file,
+        or a read, lock or sync failure raises :class:`OSError`).
+        Exactly one selection mode is allowed -- see
+        :meth:`_validate_diagnostic_ledger_proof_selection` for the
+        type and value rules -- a time range (both ``start`` and
+        ``end`` non-``bool`` non-negative :class:`int`, inclusive at
+        both ends) or a non-empty :class:`tuple` of distinct non-empty
+        transaction identity strings.
+
+        In transaction mode every requested identity is classified
+        exactly as retained, rotated away or never seen. In time mode
+        only entries inside the inclusive range are returned, and the
+        proof carries every retained segment whose time span intersects
+        the range, so no retained record inside it can be omitted: a
+        segment whose span does not intersect provably contains no
+        matching entry and is omitted. When the range intersects the
+        remembered time bounds of a rotated-away prefix, the export
+        raises :class:`ValueError` rather than claiming completeness --
+        the durable prefix evidence remembers identities but cannot
+        reconstruct per-entry times.
+
+        The proof is one canonical, checksummed UTF-8 JSON string
+        binding the manifest snapshot (digest, entry count, byte count
+        and rotated-prefix summary), the selection conditions, the
+        complete manifest document, exactly the retained segments the
+        conclusion needs, the rotated-prefix evidence document (when a
+        prefix was rotated), the matched entries and the rotated and
+        absent identities. Retained segment bodies irrelevant to the
+        conclusion are omitted; nothing about them is claimed. The
+        whole export runs under a *shared* lock on the same
+        coordination file append and rotation use exclusively, with a
+        confirming manifest re-read, so it only ever observes one
+        complete pre- or post-publish snapshot. A corrupt manifest,
+        segment, prefix evidence or digest chain raises
+        :class:`ValueError`; no partial proof is ever returned.
+        """
+        cls._validate_diagnostic_ledger_path(directory)
+        start_value, end_value, identities = (
+            cls._validate_diagnostic_ledger_proof_selection(
+                start, end, transactions
+            )
+        )
+        real_directory = os.path.realpath(directory)
+        lock_path = os.path.join(
+            real_directory, cls._DIAGNOSTIC_LEDGER_LOCK_NAME
+        )
+        # Read-only and deliberately without O_CREAT, exactly like a
+        # directory page: an exported ledger always carries its
+        # coordination file, so an export never has to create one.
+        lock_fd = os.open(lock_path, os.O_RDONLY)
+        try:
+            cls._acquire_diagnostic_ledger_reader_lock(lock_fd)
+            try:
+                return cls._export_diagnostic_ledger_proof_locked(
+                    real_directory,
+                    start_value,
+                    end_value,
+                    identities,
+                )
+            finally:
+                cls._release_diagnostic_ledger_reader_lock(lock_fd)
+        finally:
+            os.close(lock_fd)
+
+    @classmethod
+    def _export_diagnostic_ledger_proof_locked(
+        cls,
+        directory: str,
+        start_value: int | None,
+        end_value: int | None,
+        identities: tuple[str, ...] | None,
+    ) -> str:
+        """Build the proof string under the shared reader lock. See
+        :meth:`export_diagnostic_ledger_proof` for the contract; the
+        caller holds the shared lock and ``directory`` is the canonical
+        ledger directory."""
+        manifest_path = os.path.join(
+            directory, cls._DIAGNOSTIC_LEDGER_MANIFEST_NAME
+        )
+        attempts = 0
+        while True:
+            attempts += 1
+            manifest_raw, stat_result = cls._read_diagnostic_ledger(
+                manifest_path
+            )
+            identity = {
+                "device": stat_result.st_dev,
+                "inode": stat_result.st_ino,
+                "size": stat_result.st_size,
+            }
+            state = cls._load_diagnostic_ledger_directory(
+                directory, manifest_raw
+            )
+            confirm_raw, confirm_stat = cls._read_diagnostic_ledger(
+                manifest_path
+            )
+            confirm_identity = {
+                "device": confirm_stat.st_dev,
+                "inode": confirm_stat.st_ino,
+                "size": confirm_stat.st_size,
+            }
+            if confirm_identity == identity and hmac.compare_digest(
+                hashlib.sha256(confirm_raw).hexdigest(), state["digest"]
+            ):
+                manifest_raw = confirm_raw
+                stat_result = confirm_stat
+                break
+            if attempts >= cls._DIAGNOSTIC_LEDGER_READ_ATTEMPTS:
+                raise RuntimeError(
+                    "the ledger changed while the proof was exported; "
+                    "restart the export instead of mixing versions"
+                )
+        dropped = state["dropped"]
+        if start_value is not None and dropped is not None:
+            # The prefix evidence remembers *who* rotated away but not
+            # per-entry times; an intersecting range cannot be proven
+            # complete from retained evidence alone.
+            if not (
+                end_value < dropped["first_at"]
+                or start_value > dropped["last_at"]
+            ):
+                raise ValueError(
+                    "the requested time range intersects a rotated-away "
+                    "prefix whose per-entry times are not retained"
+                )
+        pairs = state["pairs"]
+        summaries = state["summaries"]
+        order = sorted(
+            range(len(pairs)),
+            key=lambda index: (
+                pairs[index][0],
+                summaries[index]["transaction"],
+            ),
+        )
+        ordered = [
+            (pairs[index], summaries[index]) for index in order
+        ]
+        wanted = None if identities is None else set(identities)
+        matched: list[tuple[tuple[int, tuple[str, ...]], dict[str, Any]]] = []
+        for (at, chain), summary in ordered:
+            if wanted is not None:
+                if summary["transaction"] in wanted:
+                    matched.append(((at, chain), summary))
+            elif start_value <= at <= end_value:
+                matched.append(((at, chain), summary))
+        segments = state["segments"]
+        if wanted is not None:
+            # Absence is only provable when every retained segment is
+            # inspected, so transaction-mode proofs carry all of them.
+            needed = list(segments)
+        else:
+            needed = [
+                meta
+                for meta in segments
+                if meta["first_at"] <= end_value
+                and meta["last_at"] >= start_value
+            ]
+        segment_blocks: list[dict[str, Any]] = []
+        needed_entries: set[tuple[int, str]] = set()
+        for meta in needed:
+            segment_raw, _stat = cls._read_diagnostic_ledger(
+                os.path.join(directory, meta["name"])
+            )
+            segment_blocks.append(
+                {
+                    "name": meta["name"],
+                    "body": json.loads(
+                        segment_raw,
+                        object_pairs_hook=cls._reject_duplicate_json_keys,
+                    ),
+                }
+            )
+            # ``_transactions`` was bound from the authenticated
+            # summaries during the directory load.
+            needed_entries.update(
+                (pair[0], identity)
+                for pair, identity in zip(
+                    meta["pairs"], meta["_transactions"]
+                )
+            )
+        # Defence in depth: every matched entry must live in a needed
+        # segment; in time mode this follows from the span test, and in
+        # transaction mode every segment is needed.
+        for (at, _chain), summary in matched:
+            if (at, summary["transaction"]) not in needed_entries:
+                raise ValueError(
+                    "internal ledger layout cannot prove the selected "
+                    "entries"
+                )
+        evidence_state = state["evidence"]
+        evidence_block: dict[str, Any] | None = None
+        if evidence_state is not None:
+            evidence_raw, _stat = cls._read_diagnostic_ledger(
+                os.path.join(directory, state["evidence_name"])
+            )
+            evidence_block = {
+                "name": state["evidence_name"],
+                "body": json.loads(
+                    evidence_raw,
+                    object_pairs_hook=cls._reject_duplicate_json_keys,
+                ),
+            }
+        retained_identities = {
+            summary["transaction"] for summary in summaries
+        }
+        rotated_identities = (
+            set()
+            if evidence_state is None
+            else set(evidence_state["transactions"])
+        )
+        if wanted is None:
+            rotated: tuple[str, ...] = ()
+            absent: tuple[str, ...] = ()
+        else:
+            rotated = tuple(
+                identity
+                for identity in identities
+                if identity in rotated_identities
+                and identity not in retained_identities
+            )
+            absent = tuple(
+                identity
+                for identity in identities
+                if identity not in rotated_identities
+                and identity not in retained_identities
+            )
+        snapshot = {
+            "digest": state["digest"],
+            "entries": len(pairs),
+            "bytes": stat_result.st_size,
+            "dropped_entries": (
+                None if dropped is None else dropped["entries"]
+            ),
+            "dropped_first_at": (
+                None if dropped is None else dropped["first_at"]
+            ),
+            "dropped_last_at": (
+                None if dropped is None else dropped["last_at"]
+            ),
+            "evidence_digest": (
+                None
+                if evidence_state is None
+                else evidence_state["self_digest"]
+            ),
+        }
+        selection = {
+            "mode": "time" if wanted is None else "transactions",
+            "start": start_value,
+            "end": end_value,
+            "transactions": (
+                None if identities is None else list(identities)
+            ),
+        }
+        document: dict[str, Any] = {
+            "format": cls._DIAGNOSTIC_LEDGER_PROOF_FORMAT,
+            "version": cls._DIAGNOSTIC_LEDGER_PROOF_VERSION,
+            "snapshot": snapshot,
+            "selection": selection,
+            "manifest": json.loads(
+                manifest_raw,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            ),
+            "segments": segment_blocks,
+            "evidence": evidence_block,
+            "items": [
+                {
+                    "at": at,
+                    "summary": dict(summary),
+                    "records": list(chain),
+                }
+                for (at, chain), summary in matched
+            ],
+            "rotated": list(rotated),
+            "absent": list(absent),
+        }
+        body = dict(document)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document)
+
+    @classmethod
+    def verify_diagnostic_ledger_proof(cls, proof: Any) -> dict[str, Any]:
+        """Authenticate an exported diagnostic ledger proof with no
+        access to the original ledger directory, strictly read-only.
+
+        ``proof`` must be a non-empty :class:`str` (a non-:class:`str`
+        raises :class:`TypeError`, an empty string
+        :class:`ValueError`). Everything the conclusion depends on is
+        recomputed from the string alone: the manifest checksum and
+        snapshot summary, every included segment's checksum, digest and
+        manifest metadata (entry counts and time bounds), the
+        inter-segment digest chain through the manifest's retained
+        digests, the rotated-prefix evidence digest, identity set and
+        prefix summary, the embedded entry chains, the selection
+        conditions, the exact set of segments needed by the conclusion
+        and each requested identity's classification. A missing or
+        extra segment, a tampered checksum or digest, segments or
+        evidence spliced from a different snapshot, a time range not
+        provably covered (including one intersecting a rotated-away
+        prefix), a filter the items do not follow, or one identity
+        falling into more than one class raises :class:`ValueError`; no
+        partial result is ever returned.
+
+        Returns a new isolated mapping with ``snapshot`` (the
+        authenticated snapshot summary), ``items`` (the matched entries
+        in ledger (time, transaction) order, each a fresh ``at`` /
+        ``summary`` / ``records`` mapping), ``rotated`` and ``absent``
+        (identity tuples in the request order; both empty in time
+        mode). The returned levels share no mutable state with the
+        proof document or across calls.
+        """
+        if not isinstance(proof, str):
+            raise TypeError(
+                f"proof must be a str, got {type(proof).__name__}"
+            )
+        if not proof:
+            raise ValueError("proof must be a non-empty str")
+        document = cls._parse_diagnostic_ledger_envelope(
+            proof.encode("utf-8"),
+            cls._DIAGNOSTIC_LEDGER_PROOF_KEYS,
+            cls._DIAGNOSTIC_LEDGER_PROOF_FORMAT,
+            cls._DIAGNOSTIC_LEDGER_PROOF_SUPPORTED_VERSIONS,
+            "ledger proof",
+        )
+        return cls._verify_diagnostic_ledger_proof_document(document)
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_document(
+        cls, document: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Verify every authenticated fact inside an envelope-checked
+        proof document and rebuild the isolated result mapping. Any
+        defect raises :class:`ValueError`; the envelope checksum has
+        already been verified by the caller."""
+        snapshot = cls._verify_diagnostic_ledger_proof_snapshot(
+            document["snapshot"]
+        )
+        mode, start_value, end_value, identities = (
+            cls._verify_diagnostic_ledger_proof_selection(
+                document["selection"]
+            )
+        )
+        manifest_body = document["manifest"]
+        if not isinstance(manifest_body, dict):
+            raise ValueError("ledger proof manifest must be an object")
+        manifest_raw = cls._canonical_json(manifest_body).encode("utf-8")
+        if len(manifest_raw) != snapshot["bytes"]:
+            raise ValueError(
+                "ledger proof snapshot byte count does not match the "
+                "manifest"
+            )
+        manifest_digest = hashlib.sha256(manifest_raw).hexdigest()
+        if not hmac.compare_digest(manifest_digest, snapshot["digest"]):
+            raise ValueError(
+                "ledger proof snapshot digest does not match its manifest"
+            )
+        metas, dropped, evidence_ref, parsed_digest = (
+            cls._parse_diagnostic_ledger_manifest(manifest_raw)
+        )
+        if not hmac.compare_digest(parsed_digest, snapshot["digest"]):
+            raise ValueError(
+                "ledger proof manifest does not re-digest to the snapshot"
+            )
+        if sum(meta["entries"] for meta in metas) != snapshot["entries"]:
+            raise ValueError(
+                "ledger proof snapshot entry count does not match the "
+                "manifest"
+            )
+        cls._verify_diagnostic_ledger_proof_dropped(
+            snapshot, dropped, evidence_ref
+        )
+        if (
+            mode == "time"
+            and dropped is not None
+            and not (
+                end_value < dropped["first_at"]
+                or start_value > dropped["last_at"]
+            )
+        ):
+            raise ValueError(
+                "the proven time range intersects a rotated-away prefix "
+                "whose per-entry times are not retained"
+            )
+        expected_previous: dict[str, str] = {}
+        previous = (
+            cls._DIAGNOSTIC_LEDGER_GENESIS_PREV
+            if dropped is None
+            else dropped["digest"]
+        )
+        meta_by_name: dict[str, dict[str, Any]] = {}
+        for meta in metas:
+            expected_previous[meta["name"]] = previous
+            meta_by_name[meta["name"]] = meta
+            previous = meta["digest"]
+        if mode == "time":
+            needed_names = [
+                meta["name"]
+                for meta in metas
+                if meta["first_at"] <= end_value
+                and meta["last_at"] >= start_value
+            ]
+        else:
+            needed_names = [meta["name"] for meta in metas]
+        raw_segments = document["segments"]
+        if not isinstance(raw_segments, list):
+            raise ValueError("ledger proof segments must be a list")
+        block_names: list[str] = []
+        loaded: list[dict[str, Any]] = []
+        for block in raw_segments:
+            if not isinstance(block, dict) or set(block) != set(
+                cls._DIAGNOSTIC_LEDGER_PROOF_SEGMENT_KEYS
+            ):
+                raise ValueError("ledger proof segment block has bad keys")
+            name = block["name"]
+            index = cls._diagnostic_ledger_segment_index(name)
+            if index is None or index < 1:
+                raise ValueError("ledger proof segment name is malformed")
+            body = block["body"]
+            if not isinstance(body, dict):
+                raise ValueError("ledger proof segment body must be an object")
+            raw = cls._canonical_json(body).encode("utf-8")
+            seg_index, prev, seg_pairs, digest = (
+                cls._parse_diagnostic_ledger_segment(raw)
+            )
+            if seg_index != index:
+                raise ValueError(
+                    "ledger proof segment index does not match its name"
+                )
+            if name not in meta_by_name:
+                raise ValueError(
+                    "ledger proof carries a segment not in its snapshot"
+                )
+            meta = meta_by_name[name]
+            if not hmac.compare_digest(digest, meta["digest"]):
+                raise ValueError(
+                    "ledger proof segment digest does not match its "
+                    "snapshot manifest"
+                )
+            if not hmac.compare_digest(prev, expected_previous[name]):
+                raise ValueError(
+                    "ledger proof segment breaks the digest chain"
+                )
+            if len(seg_pairs) != meta["entries"]:
+                raise ValueError(
+                    "ledger proof segment entry count does not match its "
+                    "snapshot manifest"
+                )
+            if (
+                seg_pairs[0][0] != meta["first_at"]
+                or seg_pairs[-1][0] != meta["last_at"]
+            ):
+                raise ValueError(
+                    "ledger proof segment time bounds do not match its "
+                    "snapshot manifest"
+                )
+            block_names.append(name)
+            loaded.append({"meta": meta, "pairs": seg_pairs})
+        if block_names != needed_names:
+            raise ValueError(
+                "ledger proof does not bind exactly the segments its "
+                "selection requires"
+            )
+        all_pairs: list[tuple[int, tuple[str, ...]]] = []
+        for segment in loaded:
+            all_pairs.extend(segment["pairs"])
+        chains = tuple(chain for _at, chain in all_pairs)
+        all_summaries = cls._authenticate_recovery_diagnostic_chains(chains)
+        offset = 0
+        previous_at: int | None = None
+        for segment in loaded:
+            segment_pairs = segment["pairs"]
+            keys = [
+                (
+                    at,
+                    all_summaries[offset + position]["transaction"],
+                )
+                for position, (at, _chain) in enumerate(segment_pairs)
+            ]
+            if keys != sorted(keys):
+                raise ValueError(
+                    "ledger proof segment entries are not in canonical "
+                    "order"
+                )
+            if (
+                previous_at is not None
+                and segment_pairs[0][0] < previous_at
+            ):
+                raise ValueError(
+                    "ledger proof segments are not in time order"
+                )
+            previous_at = segment_pairs[-1][0]
+            offset += len(segment_pairs)
+        evidence = cls._verify_diagnostic_ledger_proof_evidence(
+            document["evidence"], snapshot, dropped
+        )
+        retained_identities = {
+            summary["transaction"] for summary in all_summaries
+        }
+        evidence_identities = (
+            set()
+            if evidence is None
+            else set(evidence["transactions"])
+        )
+        if retained_identities & evidence_identities:
+            raise ValueError(
+                "a transaction identity is both retained and rotated in "
+                "the proof"
+            )
+        ordered = sorted(
+            range(len(all_pairs)),
+            key=lambda index: (
+                all_pairs[index][0],
+                all_summaries[index]["transaction"],
+            ),
+        )
+        wanted = None if identities is None else set(identities)
+        expected_items = []
+        for index in ordered:
+            at, chain = all_pairs[index]
+            summary = all_summaries[index]
+            if wanted is not None:
+                selected = summary["transaction"] in wanted
+            else:
+                selected = start_value <= at <= end_value
+            if selected:
+                expected_items.append(((at, chain), summary))
+        cls._verify_diagnostic_ledger_proof_items(
+            document["items"], expected_items
+        )
+        if wanted is None:
+            for key in ("rotated", "absent"):
+                value = document[key]
+                if not isinstance(value, list) or value:
+                    raise ValueError(
+                        f"ledger proof {key} must be an empty list in "
+                        "time mode"
+                    )
+            rotated: tuple[str, ...] = ()
+            absent: tuple[str, ...] = ()
+        else:
+            rotated, absent = cls._verify_diagnostic_ledger_proof_classes(
+                identities,
+                retained_identities,
+                evidence_identities,
+                expected_items,
+                document["rotated"],
+                document["absent"],
+            )
+        return {
+            "snapshot": {
+                key: snapshot[key]
+                for key in cls._DIAGNOSTIC_LEDGER_PROOF_SNAPSHOT_KEYS
+            },
+            "items": tuple(
+                {
+                    "at": at,
+                    "summary": dict(summary),
+                    "records": chain,
+                }
+                for (at, chain), summary in expected_items
+            ),
+            "rotated": rotated,
+            "absent": absent,
+        }
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_snapshot(
+        cls, raw_snapshot: Any
+    ) -> dict[str, Any]:
+        """Validate the proof's snapshot summary block and return a
+        fresh mapping. Any malformed field raises :class:`ValueError`."""
+        if not isinstance(raw_snapshot, dict) or set(
+            raw_snapshot
+        ) != set(cls._DIAGNOSTIC_LEDGER_PROOF_SNAPSHOT_KEYS):
+            raise ValueError("ledger proof snapshot has bad keys")
+
+        def non_negative(value: Any, what: str) -> int:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(f"{what} is malformed")
+            return value
+
+        digest = cls._require_diagnostic_ledger_digest(
+            raw_snapshot["digest"], "ledger proof snapshot digest"
+        )
+        entries = non_negative(
+            raw_snapshot["entries"], "ledger proof snapshot entry count"
+        )
+        size = non_negative(
+            raw_snapshot["bytes"], "ledger proof snapshot byte count"
+        )
+        dropped_entries = raw_snapshot["dropped_entries"]
+        dropped_first_at = raw_snapshot["dropped_first_at"]
+        dropped_last_at = raw_snapshot["dropped_last_at"]
+        evidence_digest = raw_snapshot["evidence_digest"]
+        dropped_present = dropped_entries is not None
+        for value, what in (
+            (dropped_first_at, "ledger proof dropped time bound"),
+            (dropped_last_at, "ledger proof dropped time bound"),
+        ):
+            if value is None:
+                if dropped_present:
+                    raise ValueError(
+                        "ledger proof dropped summary is incomplete"
+                    )
+            else:
+                cls._require_diagnostic_ledger_time(value, what)
+                if not dropped_present:
+                    raise ValueError(
+                        "ledger proof dropped summary appears without an "
+                        "entry count"
+                    )
+        if dropped_present:
+            if (
+                isinstance(dropped_entries, bool)
+                or not isinstance(dropped_entries, int)
+                or dropped_entries < 1
+            ):
+                raise ValueError(
+                    "ledger proof dropped entry count is malformed"
+                )
+            if dropped_first_at > dropped_last_at:
+                raise ValueError(
+                    "ledger proof dropped time bounds are reversed"
+                )
+        if evidence_digest is not None:
+            cls._require_diagnostic_ledger_digest(
+                evidence_digest, "ledger proof evidence digest"
+            )
+            if not dropped_present:
+                raise ValueError(
+                    "ledger proof names prefix evidence without a "
+                    "rotated prefix"
+                )
+        elif dropped_present:
+            raise ValueError(
+                "ledger proof rotated prefix is missing its evidence digest"
+            )
+        return {
+            "digest": digest,
+            "entries": entries,
+            "bytes": size,
+            "dropped_entries": dropped_entries,
+            "dropped_first_at": dropped_first_at,
+            "dropped_last_at": dropped_last_at,
+            "evidence_digest": evidence_digest,
+        }
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_selection(
+        cls, raw_selection: Any
+    ) -> tuple[str, int | None, int | None, tuple[str, ...] | None]:
+        """Validate the proof's selection block, returning its mode and
+        normalized values. Any malformed field raises
+        :class:`ValueError`."""
+        if not isinstance(raw_selection, dict) or set(
+            raw_selection
+        ) != set(cls._DIAGNOSTIC_LEDGER_PROOF_SELECTION_KEYS):
+            raise ValueError("ledger proof selection has bad keys")
+        mode = raw_selection["mode"]
+        if mode not in ("time", "transactions"):
+            raise ValueError("ledger proof selection mode is unknown")
+        start = raw_selection["start"]
+        end = raw_selection["end"]
+        transactions = raw_selection["transactions"]
+
+        def bound(value: Any) -> int | None:
+            if value is None:
+                return None
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError("ledger proof time bound is malformed")
+            return value
+
+        start_value = bound(start)
+        end_value = bound(end)
+        if mode == "time":
+            if start_value is None or end_value is None:
+                raise ValueError(
+                    "ledger proof time selection needs both bounds"
+                )
+            if start_value > end_value:
+                raise ValueError(
+                    "ledger proof time bounds are reversed"
+                )
+            if transactions is not None:
+                raise ValueError(
+                    "ledger proof time selection must not name transactions"
+                )
+            return mode, start_value, end_value, None
+        if start_value is not None or end_value is not None:
+            raise ValueError(
+                "ledger proof transaction selection must not name time "
+                "bounds"
+            )
+        if not isinstance(transactions, list) or not transactions:
+            raise ValueError(
+                "ledger proof transaction selection must be a non-empty "
+                "list"
+            )
+        seen: set[str] = set()
+        identities: list[str] = []
+        for identity in transactions:
+            if not isinstance(identity, str) or not identity:
+                raise ValueError(
+                    "ledger proof transaction identities must be "
+                    "non-empty str"
+                )
+            if identity in seen:
+                raise ValueError(
+                    "ledger proof transaction identities must be distinct"
+                )
+            seen.add(identity)
+            identities.append(identity)
+        return mode, None, None, tuple(identities)
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_dropped(
+        cls,
+        snapshot: dict[str, Any],
+        dropped: dict[str, Any] | None,
+        evidence_ref: dict[str, Any] | None,
+    ) -> None:
+        """Cross-check the snapshot summary's rotated-prefix fields and
+        evidence pointer against the manifest's parsed ``dropped`` proof
+        and evidence reference. A disagreement raises
+        :class:`ValueError`."""
+        if dropped is None:
+            if snapshot["dropped_entries"] is not None:
+                raise ValueError(
+                    "ledger proof snapshot remembers a rotated prefix "
+                    "its manifest does not"
+                )
+            if evidence_ref is not None:
+                raise ValueError(
+                    "ledger proof manifest names evidence without a "
+                    "rotated prefix"
+                )
+            return
+        if (
+            snapshot["dropped_entries"] != dropped["entries"]
+            or snapshot["dropped_first_at"] != dropped["first_at"]
+            or snapshot["dropped_last_at"] != dropped["last_at"]
+        ):
+            raise ValueError(
+                "ledger proof snapshot prefix summary does not match its "
+                "manifest"
+            )
+        if evidence_ref is None:
+            raise ValueError(
+                "ledger proof rotated prefix is missing its evidence"
+            )
+        if not hmac.compare_digest(
+            evidence_ref["digest"], snapshot["evidence_digest"]
+        ):
+            raise ValueError(
+                "ledger proof evidence digest does not match its manifest"
+            )
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_evidence(
+        cls,
+        raw_block: Any,
+        snapshot: dict[str, Any],
+        dropped: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Validate the proof's evidence block against the snapshot and
+        parse and authenticate the embedded evidence document, returning
+        it (or ``None`` when no prefix was rotated). A missing,
+        extra-named, malformed or mismatching block raises
+        :class:`ValueError`."""
+        if dropped is None:
+            if raw_block is not None:
+                raise ValueError(
+                    "ledger proof carries evidence without a rotated prefix"
+                )
+            return None
+        if not isinstance(raw_block, dict) or set(raw_block) != set(
+            cls._DIAGNOSTIC_LEDGER_PROOF_EVIDENCE_KEYS
+        ):
+            raise ValueError("ledger proof evidence block has bad keys")
+        expected_name = cls._diagnostic_ledger_evidence_name(
+            snapshot["evidence_digest"]
+        )
+        if raw_block["name"] != expected_name:
+            raise ValueError(
+                "ledger proof evidence file name does not match its "
+                "digest"
+            )
+        body = raw_block["body"]
+        if not isinstance(body, dict):
+            raise ValueError(
+                "ledger proof evidence body must be an object"
+            )
+        raw = cls._canonical_json(body).encode("utf-8")
+        if not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(),
+            snapshot["evidence_digest"],
+        ):
+            raise ValueError(
+                "ledger proof evidence does not re-digest to its snapshot"
+            )
+        evidence = cls._parse_diagnostic_ledger_evidence(raw)
+        if (
+            evidence["digest"] != dropped["digest"]
+            or evidence["entries"] != dropped["entries"]
+            or evidence["first_at"] != dropped["first_at"]
+            or evidence["last_at"] != dropped["last_at"]
+        ):
+            raise ValueError(
+                "ledger proof evidence does not match the manifest's "
+                "rotated-prefix proof"
+            )
+        return evidence
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_items(
+        cls,
+        raw_items: Any,
+        expected_items: list[
+            tuple[tuple[int, tuple[str, ...]], dict[str, Any]]
+        ],
+    ) -> None:
+        """Require the proof's item list to equal, entry by entry in
+        canonical order, the entries re-derived from its authenticated
+        segments: same time, records and authenticated summary. Any
+        omission, extra entry or field-level mismatch raises
+        :class:`ValueError`."""
+        if not isinstance(raw_items, list):
+            raise ValueError("ledger proof items must be a list")
+        if len(raw_items) != len(expected_items):
+            raise ValueError(
+                "ledger proof does not list exactly the entries its "
+                "selection matches"
+            )
+        for raw_item, ((at, chain), summary) in zip(
+            raw_items, expected_items
+        ):
+            if not isinstance(raw_item, dict) or set(raw_item) != set(
+                cls._DIAGNOSTIC_LEDGER_PROOF_ITEM_KEYS
+            ):
+                raise ValueError("ledger proof item has bad keys")
+            if (
+                isinstance(raw_item["at"], bool)
+                or not isinstance(raw_item["at"], int)
+                or raw_item["at"] != at
+            ):
+                raise ValueError("ledger proof item time does not match")
+            raw_records = raw_item["records"]
+            if (
+                not isinstance(raw_records, list)
+                or tuple(raw_records) != chain
+            ):
+                raise ValueError(
+                    "ledger proof item records do not match the "
+                    "authenticated chain"
+                )
+            raw_summary = raw_item["summary"]
+            if not isinstance(raw_summary, dict) or raw_summary != summary:
+                raise ValueError(
+                    "ledger proof item summary does not match the "
+                    "re-derived summary"
+                )
+
+    @classmethod
+    def _verify_diagnostic_ledger_proof_classes(
+        cls,
+        identities: tuple[str, ...],
+        retained: set[str],
+        evidence: set[str],
+        expected_items: list[
+            tuple[tuple[int, tuple[str, ...]], dict[str, Any]]
+        ],
+        raw_rotated: Any,
+        raw_absent: Any,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Re-derive the three-way classification of every requested
+        identity (retained via a matched item, rotated via the prefix
+        evidence, never seen) and require the proof's ``rotated`` and
+        ``absent`` lists to match, in request order. An identity in more
+        than one class, a retained identity without an item, or an
+        unrequested name in either list raises :class:`ValueError`."""
+        matched = {summary["transaction"] for _pair, summary in expected_items}
+        requested = set(identities)
+        retained_without_item = (retained & requested) - matched
+        if retained_without_item:
+            raise ValueError(
+                "a retained transaction identity is missing from the "
+                "proven items"
+            )
+        rotated: list[str] = []
+        absent: list[str] = []
+        for identity in identities:
+            in_retained = identity in retained
+            in_evidence = identity in evidence
+            if in_retained and in_evidence:
+                raise ValueError(
+                    "a transaction identity is classified as both "
+                    "retained and rotated"
+                )
+            if in_retained:
+                continue
+            if in_evidence:
+                rotated.append(identity)
+            else:
+                absent.append(identity)
+        for name, raw in (("rotated", raw_rotated), ("absent", raw_absent)):
+            if not isinstance(raw, list) or any(
+                not isinstance(item, str) for item in raw
+            ):
+                raise ValueError(f"ledger proof {name} must be a list of str")
+        if tuple(raw_rotated) != tuple(rotated):
+            raise ValueError(
+                "ledger proof rotated identities do not match the "
+                "re-derived classification"
+            )
+        if tuple(raw_absent) != tuple(absent):
+            raise ValueError(
+                "ledger proof absent identities do not match the "
+                "re-derived classification"
+            )
+        return tuple(rotated), tuple(absent)
 
     @classmethod
     def _publish_caches_recovery_locked(
