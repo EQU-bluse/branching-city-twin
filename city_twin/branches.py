@@ -2767,6 +2767,106 @@ class BranchStore:
         _RECOVERY_CACHE_PHASE_PROGRESS,
     )
 
+    #: Read-only cross-restart recovery diagnostics. A diagnostic is a
+    #: compact, checksummed JSON document that only *reports* what the
+    #: cross-process recovery state machine would converge; it never
+    #: performs recovery and never echoes any material body (the
+    #: transaction identity is the checksum of a valid recovery record or
+    #: the raw-byte digest of a damaged one). Each diagnostic after the
+    #: first links to its predecessor's digest, so a run of observations
+    #: taken across the record cleanup can be authenticated as one
+    #: transaction.
+    _RECOVERY_DIAGNOSTIC_FORMAT = (
+        "branching-city-twin/recovery-diagnostic"
+    )
+    _RECOVERY_DIAGNOSTIC_VERSION = 1
+    _RECOVERY_DIAGNOSTIC_SUPPORTED_VERSIONS = (1,)
+    _RECOVERY_DIAGNOSTIC_KEYS = (
+        "format",
+        "version",
+        "transaction",
+        "previous",
+        "state",
+        "phase",
+        "index",
+        "progress",
+        "backups",
+        "disposition",
+        "reason",
+        "checksum",
+    )
+    _RECOVERY_DIAGNOSTIC_TARGET_KEYS = (
+        "exists",
+        "state",
+        "old_digest",
+        "new_digest",
+    )
+    _RECOVERY_DIAGNOSTIC_BACKUP_KEYS = ("name", "state")
+    #: Observed state of one published target against the record.
+    _RECOVERY_DIAGNOSTIC_TARGET_OLD = "old"
+    _RECOVERY_DIAGNOSTIC_TARGET_NEW = "new"
+    _RECOVERY_DIAGNOSTIC_TARGET_SAME = "same"
+    _RECOVERY_DIAGNOSTIC_TARGET_MISSING = "missing"
+    _RECOVERY_DIAGNOSTIC_TARGET_UNKNOWN = "unknown"
+    _RECOVERY_DIAGNOSTIC_TARGET_STATES = (
+        _RECOVERY_DIAGNOSTIC_TARGET_OLD,
+        _RECOVERY_DIAGNOSTIC_TARGET_NEW,
+        _RECOVERY_DIAGNOSTIC_TARGET_SAME,
+        _RECOVERY_DIAGNOSTIC_TARGET_MISSING,
+        _RECOVERY_DIAGNOSTIC_TARGET_UNKNOWN,
+    )
+    #: Observed state of a recorded backup on disk.
+    _RECOVERY_DIAGNOSTIC_BACKUP_VALID = "valid"
+    _RECOVERY_DIAGNOSTIC_BACKUP_MISSING = "missing"
+    _RECOVERY_DIAGNOSTIC_BACKUP_CORRUPT = "corrupt"
+    #: Overall transaction state reported to the caller.
+    _RECOVERY_DIAGNOSTIC_IDLE = "idle"
+    _RECOVERY_DIAGNOSTIC_PENDING_COMMIT = "pending_commit"
+    _RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK = "pending_rollback"
+    _RECOVERY_DIAGNOSTIC_COMMITTED = "committed"
+    _RECOVERY_DIAGNOSTIC_ROLLED_BACK = "rolled_back"
+    _RECOVERY_DIAGNOSTIC_REJECTED = "rejected"
+    _RECOVERY_DIAGNOSTIC_STATES = (
+        _RECOVERY_DIAGNOSTIC_IDLE,
+        _RECOVERY_DIAGNOSTIC_PENDING_COMMIT,
+        _RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK,
+        _RECOVERY_DIAGNOSTIC_COMMITTED,
+        _RECOVERY_DIAGNOSTIC_ROLLED_BACK,
+        _RECOVERY_DIAGNOSTIC_REJECTED,
+    )
+    #: The disposition each state implies: finish the commit, perform
+    #: the rollback, nothing left to do once settled, or refuse recovery.
+    _RECOVERY_DIAGNOSTIC_DISPOSITION_COMMIT = "commit"
+    _RECOVERY_DIAGNOSTIC_DISPOSITION_ROLLBACK = "rollback"
+    _RECOVERY_DIAGNOSTIC_DISPOSITION_NONE = "none"
+    _RECOVERY_DIAGNOSTIC_DISPOSITION_REFUSE = "refuse"
+    _RECOVERY_DIAGNOSTIC_STATE_DISPOSITIONS = {
+        _RECOVERY_DIAGNOSTIC_IDLE: _RECOVERY_DIAGNOSTIC_DISPOSITION_NONE,
+        _RECOVERY_DIAGNOSTIC_PENDING_COMMIT: (
+            _RECOVERY_DIAGNOSTIC_DISPOSITION_COMMIT
+        ),
+        _RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK: (
+            _RECOVERY_DIAGNOSTIC_DISPOSITION_ROLLBACK
+        ),
+        _RECOVERY_DIAGNOSTIC_COMMITTED: (
+            _RECOVERY_DIAGNOSTIC_DISPOSITION_NONE
+        ),
+        _RECOVERY_DIAGNOSTIC_ROLLED_BACK: (
+            _RECOVERY_DIAGNOSTIC_DISPOSITION_NONE
+        ),
+        _RECOVERY_DIAGNOSTIC_REJECTED: (
+            _RECOVERY_DIAGNOSTIC_DISPOSITION_REFUSE
+        ),
+    }
+    #: Stable rejection reason categories.
+    _RECOVERY_DIAGNOSTIC_REASON_NONE = ""
+    _RECOVERY_DIAGNOSTIC_REASON_RECORD = "invalid_record"
+    _RECOVERY_DIAGNOSTIC_REASON_PHASE = "phase_contradiction"
+    _RECOVERY_DIAGNOSTIC_REASON_TARGET = "target_contradiction"
+    _RECOVERY_DIAGNOSTIC_REASON_BACKUP = "backup_invalid"
+    _RECOVERY_DIAGNOSTIC_REASON_EVIDENCE = "evidence_regression"
+    _RECOVERY_DIAGNOSTIC_REASON_TRANSACTION = "transaction_changed"
+
     @classmethod
     def _generation_number(cls, name: str) -> int | None:
         """Number of a legal generation directory name, else ``None``."""
@@ -7715,6 +7815,882 @@ class BranchStore:
                 "audit record 'checksum' must be a 64-character "
                 "lowercase hex string"
             )
+
+    @classmethod
+    def _validate_diagnostic_paths(
+        cls,
+        index_path: Any,
+        progress_path: Any,
+        recovery_path: Any,
+    ) -> None:
+        """Validate the three paths of a read-only recovery diagnostic:
+        each must be a non-empty :class:`str` (a non-``str`` raises
+        :class:`TypeError`, an empty string :class:`ValueError`), no two
+        may name the same file even through aliases, and all three must
+        live in one directory (the publication protocol keeps every
+        backup beside the record); an aliasing or placement violation
+        raises :class:`ValueError`."""
+        for name, value in (
+            ("index_path", index_path),
+            ("progress_path", progress_path),
+            ("recovery_path", recovery_path),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"{name} must be a str, got {type(value).__name__}"
+                )
+        for name, value in (
+            ("index_path", index_path),
+            ("progress_path", progress_path),
+            ("recovery_path", recovery_path),
+        ):
+            if not value:
+                raise ValueError(f"{name} must be a non-empty str")
+        reals = (
+            os.path.realpath(index_path),
+            os.path.realpath(progress_path),
+            os.path.realpath(recovery_path),
+        )
+        if len(set(reals)) != 3:
+            raise ValueError(
+                "the index, progress and recovery paths must not name the "
+                "same file"
+            )
+        directories = {os.path.dirname(path) for path in reals}
+        if len(directories) != 1:
+            raise ValueError(
+                "the index, progress and recovery files must all live in "
+                "the same directory"
+            )
+
+    @classmethod
+    def _diagnostic_body_from_document(
+        cls, document: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Strip and return the checksum-covered body of a parsed
+        diagnostic document, preserving key order."""
+        return {
+            key: document[key]
+            for key in cls._RECOVERY_DIAGNOSTIC_KEYS
+            if key != "checksum"
+        }
+
+    @classmethod
+    def _validate_diagnostic_document(cls, document: Any) -> None:
+        """Validate the structure and field domains of a parsed recovery
+        diagnostic envelope, including the state/phase reachability the
+        state machine itself can produce. Any deviation raises
+        :class:`ValueError`."""
+        if not isinstance(document, dict) or set(document) != set(
+            cls._RECOVERY_DIAGNOSTIC_KEYS
+        ):
+            raise ValueError("recovery diagnostic has bad top-level keys")
+        if document["format"] != cls._RECOVERY_DIAGNOSTIC_FORMAT:
+            raise ValueError("recovery diagnostic has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in cls._RECOVERY_DIAGNOSTIC_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("recovery diagnostic has an unsupported version")
+
+        def is_digest(value: Any) -> bool:
+            return (
+                isinstance(value, str)
+                and len(value) == 64
+                and not set(value) - cls._HEX_DIGITS
+            )
+
+        transaction = document["transaction"]
+        if transaction is not None and not is_digest(transaction):
+            raise ValueError(
+                "recovery diagnostic transaction must be null or a "
+                "64-character hex digest"
+            )
+        previous = document["previous"]
+        if previous != "" and not is_digest(previous):
+            raise ValueError(
+                "recovery diagnostic previous must be an empty string or "
+                "a 64-character hex digest"
+            )
+        state = document["state"]
+        if state not in cls._RECOVERY_DIAGNOSTIC_STATES:
+            raise ValueError("recovery diagnostic has an unknown state")
+        phase = document["phase"]
+        if phase is not None and phase not in cls._RECOVERY_CACHE_PHASES:
+            raise ValueError("recovery diagnostic has an unknown phase")
+        if state in (
+            cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT,
+            cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK,
+        ) and phase is None:
+            raise ValueError(
+                "a pending recovery diagnostic must name the recorded "
+                "phase"
+            )
+        if state in (
+            cls._RECOVERY_DIAGNOSTIC_IDLE,
+            cls._RECOVERY_DIAGNOSTIC_COMMITTED,
+            cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK,
+        ) and phase is not None:
+            raise ValueError(
+                "a settled recovery diagnostic must not name a phase"
+            )
+        disposition = document["disposition"]
+        if disposition != cls._RECOVERY_DIAGNOSTIC_STATE_DISPOSITIONS[state]:
+            raise ValueError(
+                "recovery diagnostic disposition does not match its state"
+            )
+        reason = document["reason"]
+        valid_reasons = {
+            cls._RECOVERY_DIAGNOSTIC_REASON_NONE,
+            cls._RECOVERY_DIAGNOSTIC_REASON_RECORD,
+            cls._RECOVERY_DIAGNOSTIC_REASON_PHASE,
+            cls._RECOVERY_DIAGNOSTIC_REASON_TARGET,
+            cls._RECOVERY_DIAGNOSTIC_REASON_BACKUP,
+            cls._RECOVERY_DIAGNOSTIC_REASON_EVIDENCE,
+            cls._RECOVERY_DIAGNOSTIC_REASON_TRANSACTION,
+        }
+        if reason not in valid_reasons:
+            raise ValueError("recovery diagnostic has an unknown reason")
+        if (state == cls._RECOVERY_DIAGNOSTIC_REJECTED) == (reason == ""):
+            raise ValueError(
+                "recovery diagnostic reason must be set exactly for a "
+                "rejected state"
+            )
+        if state == cls._RECOVERY_DIAGNOSTIC_IDLE:
+            # Idle observations may chain to earlier idle ones through
+            # the predecessor link, but never carry a transaction or
+            # phase.
+            if transaction is not None or phase is not None:
+                raise ValueError(
+                    "an idle recovery diagnostic must carry no "
+                    "transaction identity or phase"
+                )
+        elif transaction is None:
+            raise ValueError(
+                "a non-idle recovery diagnostic must carry a transaction "
+                "identity"
+            )
+
+        def validate_target(value: Any, label: str) -> None:
+            if not isinstance(value, dict) or set(value) != set(
+                cls._RECOVERY_DIAGNOSTIC_TARGET_KEYS
+            ):
+                raise ValueError(
+                    f"recovery diagnostic {label} target has bad keys"
+                )
+            if not isinstance(value["exists"], bool):
+                raise ValueError(
+                    f"recovery diagnostic {label} target existence must be "
+                    "a bool"
+                )
+            target_state = value["state"]
+            if target_state is not None and (
+                target_state not in cls._RECOVERY_DIAGNOSTIC_TARGET_STATES
+            ):
+                raise ValueError(
+                    f"recovery diagnostic {label} target has an unknown state"
+                )
+            for name in ("old_digest", "new_digest"):
+                digest = value[name]
+                if digest is not None and not is_digest(digest):
+                    raise ValueError(
+                        f"recovery diagnostic {label} target {name} must be "
+                        "null or a 64-character hex digest"
+                    )
+
+        validate_target(document["index"], "index")
+        validate_target(document["progress"], "progress")
+        if state == cls._RECOVERY_DIAGNOSTIC_IDLE:
+            for label in ("index", "progress"):
+                view = document[label]
+                if (
+                    view["state"] is not None
+                    or view["old_digest"] is not None
+                    or view["new_digest"] is not None
+                ):
+                    raise ValueError(
+                        f"an idle diagnostic must not judge the {label} "
+                        "target against a record"
+                    )
+        if state in (
+            cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT,
+            cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK,
+        ):
+            for label in ("index", "progress"):
+                if document[label]["state"] is None:
+                    raise ValueError(
+                        f"a pending diagnostic must judge the {label} "
+                        "target against the record"
+                    )
+        backups = document["backups"]
+        if not isinstance(backups, list):
+            raise ValueError("recovery diagnostic backups must be an array")
+        for entry in backups:
+            if not isinstance(entry, dict) or set(entry) != set(
+                cls._RECOVERY_DIAGNOSTIC_BACKUP_KEYS
+            ):
+                raise ValueError("recovery diagnostic backup has bad keys")
+            name = entry["name"]
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in (".", "..")
+                or "/" in name
+                or "\\" in name
+                or "\x00" in name
+            ):
+                raise ValueError(
+                    "recovery diagnostic backup name must be a bare file "
+                    "name in the recovery directory"
+                )
+            if entry["state"] not in (
+                cls._RECOVERY_DIAGNOSTIC_BACKUP_VALID,
+                cls._RECOVERY_DIAGNOSTIC_BACKUP_MISSING,
+                cls._RECOVERY_DIAGNOSTIC_BACKUP_CORRUPT,
+            ):
+                raise ValueError(
+                    "recovery diagnostic backup has an unknown state"
+                )
+        checksum = document["checksum"]
+        if not is_digest(checksum):
+            raise ValueError(
+                "recovery diagnostic checksum must be a 64-character "
+                "lowercase hex string"
+            )
+
+    @classmethod
+    def _parse_diagnostic(cls, text: Any, *, name: str) -> dict[str, Any]:
+        """Strictly parse and authenticate one recovery diagnostic
+        string, returning its checksum-covered body. A non-:class:`str`
+        raises :class:`TypeError`; an empty string, unparsable JSON,
+        duplicate keys, non-canonical encoding, structural, version or
+        checksum defect raises :class:`ValueError`."""
+        if not isinstance(text, str):
+            raise TypeError(
+                f"{name} must be a str, got {type(text).__name__}"
+            )
+        if not text:
+            raise ValueError(f"{name} must be a non-empty str")
+        try:
+            document = json.loads(
+                text,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{name} is not valid JSON: {exc}") from exc
+        cls._validate_diagnostic_document(document)
+        if cls._canonical_json(document) != text:
+            raise ValueError(f"{name} is not canonical compact JSON")
+        body = cls._diagnostic_body_from_document(document)
+        expected = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(expected, document["checksum"]):
+            raise ValueError(f"{name} checksum does not match")
+        body = dict(body)
+        body["checksum"] = document["checksum"]
+        return body
+
+    @classmethod
+    def _diagnostic_lexists_view(cls, target: str) -> dict[str, Any]:
+        """Existence-only view that never opens the target. Used once a
+        predecessor's summary or a damaged record is the only evidence:
+        after a completed rollback a previously absent target is
+        legitimately gone, so its absence must not surface as an
+        :class:`OSError`."""
+        return {
+            "exists": os.path.lexists(target),
+            "state": None,
+            "old_digest": None,
+            "new_digest": None,
+        }
+
+    @classmethod
+    def _diagnostic_presence_view(cls, target: str) -> dict[str, Any]:
+        """Existence-and-readability view for paths whose bytes cannot
+        be matched against a usable record (no record or a damaged
+        one). A missing file or an open/read failure propagates as
+        :class:`OSError`: without a valid record nothing can explain an
+        absent cache. The bytes are read but never reported -- only
+        existence is."""
+        with open(target, "rb") as handle:
+            while True:
+                chunk = handle.read(cls._RECOVERY_CACHE_BACKUP_CHUNK)
+                if not chunk:
+                    break
+        return {
+            "exists": True,
+            "state": None,
+            "old_digest": None,
+            "new_digest": None,
+        }
+
+    @classmethod
+    def _diagnostic_target_view(
+        cls, target: str, described: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Read-only classification of one published target against the
+        recorded old/new digests. ``"unknown"`` names present bytes
+        matching neither digest; ``"missing"`` names an absent target
+        although the record promised it previously existed; an absent
+        target the record also marks previously absent is ``"old"``.
+        A present file that fails to open or read propagates
+        :class:`OSError`."""
+        exists = os.path.lexists(target)
+        if not exists and not described["old_exists"]:
+            state = cls._RECOVERY_DIAGNOSTIC_TARGET_OLD
+        elif not exists:
+            state = cls._RECOVERY_DIAGNOSTIC_TARGET_MISSING
+        else:
+            digest = cls._sha256_file(target)
+            matches_new = hmac.compare_digest(
+                digest, described["new_digest"]
+            )
+            matches_old = described["old_exists"] and hmac.compare_digest(
+                digest, described["old_digest"]
+            )
+            if matches_new and matches_old:
+                state = cls._RECOVERY_DIAGNOSTIC_TARGET_SAME
+            elif matches_new:
+                state = cls._RECOVERY_DIAGNOSTIC_TARGET_NEW
+            elif matches_old:
+                state = cls._RECOVERY_DIAGNOSTIC_TARGET_OLD
+            else:
+                state = cls._RECOVERY_DIAGNOSTIC_TARGET_UNKNOWN
+        return {
+            "exists": exists,
+            "state": state,
+            "old_digest": described["old_digest"] or None,
+            "new_digest": described["new_digest"] or None,
+        }
+
+    @classmethod
+    def _diagnostic_backups_view(
+        cls, directory: str, record: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        """Read-only status of every backup the record names: present
+        and byte-for-byte the recorded old bytes (``"valid"``), present
+        with different bytes (``"corrupt"``) or absent (``"missing"``)."""
+        backups: list[dict[str, str]] = []
+        for label in ("index", "progress"):
+            described = record[label]
+            if not described["old_exists"]:
+                continue
+            name = described["backup"]
+            backup_path = os.path.join(directory, name)
+            if not os.path.lexists(backup_path):
+                backups.append(
+                    {
+                        "name": name,
+                        "state": cls._RECOVERY_DIAGNOSTIC_BACKUP_MISSING,
+                    }
+                )
+                continue
+            backup_digest = cls._sha256_file(backup_path)
+            if hmac.compare_digest(backup_digest, described["old_digest"]):
+                state = cls._RECOVERY_DIAGNOSTIC_BACKUP_VALID
+            else:
+                state = cls._RECOVERY_DIAGNOSTIC_BACKUP_CORRUPT
+            backups.append({"name": name, "state": state})
+        return backups
+
+    @classmethod
+    def _diagnostic_current_verdict(
+        cls,
+        record: dict[str, Any],
+        index_view: dict[str, Any],
+        progress_view: dict[str, Any],
+        backups: list[dict[str, str]],
+    ) -> tuple[str, str]:
+        """Classify current sound evidence exactly as the recovery state
+        machine can reach it, returning ``(state, reason)`` where reason
+        is empty for every non-rejected state. Commit requires the
+        recorded phase to allow it and both targets to hold the new
+        bytes; otherwise the phase/state combination must be one the
+        protocol can roll back from, with every backup the rollback
+        needs present and valid; anything else is a rejection in the
+        stable category -- phase contradiction, target digest mismatch
+        or invalid backup."""
+        phase = record["phase"]
+        states = {
+            "index": index_view["state"],
+            "progress": progress_view["state"],
+        }
+        commit_allowed = phase in (
+            cls._RECOVERY_CACHE_PHASE_INDEX,
+            cls._RECOVERY_CACHE_PHASE_PROGRESS,
+        ) and all(
+            state
+            in (
+                cls._RECOVERY_DIAGNOSTIC_TARGET_NEW,
+                cls._RECOVERY_DIAGNOSTIC_TARGET_SAME,
+            )
+            for state in states.values()
+        )
+        if commit_allowed:
+            return (
+                cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT,
+                cls._RECOVERY_DIAGNOSTIC_REASON_NONE,
+            )
+        rollback_rows = {
+            cls._RECOVERY_CACHE_PHASE_PREPARED: (
+                ("old", "old"),
+                ("new", "old"),
+            ),
+            cls._RECOVERY_CACHE_PHASE_INDEX: (
+                ("old", "old"),
+                ("new", "old"),
+                ("old", "new"),
+                ("new", "new"),
+            ),
+        }
+
+        def concrete(state: str) -> tuple[str, ...]:
+            if state == cls._RECOVERY_DIAGNOSTIC_TARGET_SAME:
+                return ("old", "new")
+            return (state,)
+
+        rollback_allowed = phase in rollback_rows and any(
+            (index_state, progress_state) in rollback_rows[phase]
+            for index_state in concrete(states["index"])
+            for progress_state in concrete(states["progress"])
+        )
+        if not rollback_allowed:
+            if cls._RECOVERY_DIAGNOSTIC_TARGET_UNKNOWN in (
+                states.values()
+            ) or cls._RECOVERY_DIAGNOSTIC_TARGET_MISSING in states.values():
+                reason = cls._RECOVERY_DIAGNOSTIC_REASON_TARGET
+            else:
+                reason = cls._RECOVERY_DIAGNOSTIC_REASON_PHASE
+            return cls._RECOVERY_DIAGNOSTIC_REJECTED, reason
+        # The rollback mirrors _recover_cache_publication_locked: a
+        # target still carrying the new bytes must be restorable from its
+        # backup, and a surviving backup must always match the recorded
+        # old bytes.
+        backup_states = {entry["name"]: entry["state"] for entry in backups}
+        for label, view in (("index", index_view), ("progress", progress_view)):
+            if not record[label]["old_exists"]:
+                continue
+            name = record[label]["backup"]
+            status = backup_states.get(name)
+            if view["state"] == cls._RECOVERY_DIAGNOSTIC_TARGET_NEW:
+                if status != cls._RECOVERY_DIAGNOSTIC_BACKUP_VALID:
+                    return (
+                        cls._RECOVERY_DIAGNOSTIC_REJECTED,
+                        cls._RECOVERY_DIAGNOSTIC_REASON_BACKUP,
+                    )
+            elif status == cls._RECOVERY_DIAGNOSTIC_BACKUP_CORRUPT:
+                return (
+                    cls._RECOVERY_DIAGNOSTIC_REJECTED,
+                    cls._RECOVERY_DIAGNOSTIC_REASON_BACKUP,
+                )
+        return (
+            cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK,
+            cls._RECOVERY_DIAGNOSTIC_REASON_NONE,
+        )
+
+    @classmethod
+    def _diagnostic_continue(
+        cls,
+        predecessor: dict[str, Any],
+        current: str | None,
+        current_reason: str,
+    ) -> tuple[str, str]:
+        """Apply a predecessor's summary to current sound evidence.
+
+        ``current`` is the verdict of the matching record still on disk
+        (``pending_commit``/``pending_rollback``/``rejected``) or
+        ``None`` when the record disappeared (cleanup completed) or
+        became unreadable while the transaction identity still matched.
+        A pending disposition continues or converges to its committed
+        or rolled-back outcome; a refusal persists with its original
+        reason; a disposition switch, degraded evidence or any
+        reprocessing after a final disposition is an evidence
+        regression. Returns the reported ``(state, reason)``.
+        """
+        prior = predecessor["state"]
+        none_reason = cls._RECOVERY_DIAGNOSTIC_REASON_NONE
+        regression = cls._RECOVERY_DIAGNOSTIC_REASON_EVIDENCE
+        if prior == cls._RECOVERY_DIAGNOSTIC_REJECTED:
+            if current is None:
+                # The record is gone but the predecessor still refused:
+                # the refusal stands with its original reason.
+                return cls._RECOVERY_DIAGNOSTIC_REJECTED, predecessor[
+                    "reason"
+                ]
+            if current == cls._RECOVERY_DIAGNOSTIC_REJECTED:
+                # Fresh evidence is still refused; report its reason. A
+                # reason change across the run fails verification there.
+                return cls._RECOVERY_DIAGNOSTIC_REJECTED, current_reason
+            # Sound, recoverable evidence after a refusal is a
+            # regression the predecessor cannot explain.
+            return cls._RECOVERY_DIAGNOSTIC_REJECTED, regression
+        if current is None:
+            if prior == cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT:
+                return cls._RECOVERY_DIAGNOSTIC_COMMITTED, none_reason
+            if prior == cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK:
+                return cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK, none_reason
+            # Repeated settled observations with the record still gone
+            # simply restate the disposition.
+            return prior, none_reason
+        if (
+            prior == cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT
+            and current == cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT
+        ) or (
+            prior == cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK
+            and current == cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK
+        ):
+            return prior, none_reason
+        if current == cls._RECOVERY_DIAGNOSTIC_REJECTED:
+            return cls._RECOVERY_DIAGNOSTIC_REJECTED, current_reason
+        return cls._RECOVERY_DIAGNOSTIC_REJECTED, regression
+
+    @classmethod
+    def _recovery_diagnostic_body(
+        cls,
+        index_path: str,
+        progress_path: str,
+        recovery_path: str,
+        predecessor: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Gather the checksum-covered diagnostic body from the files on
+        disk without modifying anything. The judgment mirrors the
+        reachable combinations of the cross-process recovery state
+        machine, read-only."""
+        directory = os.path.dirname(os.path.abspath(recovery_path))
+        previous_digest = (
+            "" if predecessor is None else predecessor["checksum"]
+        )
+
+        def document(
+            *,
+            transaction: Any,
+            state: str,
+            phase: str | None,
+            index_view: dict[str, Any],
+            progress_view: dict[str, Any],
+            backups: list[dict[str, str]],
+            reason: str,
+        ) -> dict[str, Any]:
+            return {
+                "format": cls._RECOVERY_DIAGNOSTIC_FORMAT,
+                "version": cls._RECOVERY_DIAGNOSTIC_VERSION,
+                "transaction": transaction,
+                "previous": previous_digest,
+                "state": state,
+                "phase": phase,
+                "index": index_view,
+                "progress": progress_view,
+                "backups": backups,
+                "disposition": (
+                    cls._RECOVERY_DIAGNOSTIC_STATE_DISPOSITIONS[state]
+                ),
+                "reason": reason,
+            }
+
+        presence_cache: dict[str, dict[str, Any]] = {}
+
+        def presence(label: str, *, strict: bool) -> dict[str, Any]:
+            if label not in presence_cache:
+                path = index_path if label == "index" else progress_path
+                # Lenient observations never open the targets: a
+                # predecessor can span a rollback that restored absence,
+                # and a damaged record cannot explain what it should
+                # contain. Only a first idle observation with no record
+                # at all requires both caches present and readable.
+                if strict:
+                    presence_cache[label] = cls._diagnostic_presence_view(
+                        path
+                    )
+                else:
+                    presence_cache[label] = cls._diagnostic_lexists_view(
+                        path
+                    )
+            return presence_cache[label]
+
+        if not os.path.lexists(recovery_path):
+            if predecessor is None:
+                return document(
+                    transaction=None,
+                    state=cls._RECOVERY_DIAGNOSTIC_IDLE,
+                    phase=None,
+                    index_view=presence("index", strict=True),
+                    progress_view=presence("progress", strict=True),
+                    backups=[],
+                    reason=cls._RECOVERY_DIAGNOSTIC_REASON_NONE,
+                )
+            if predecessor["state"] == cls._RECOVERY_DIAGNOSTIC_IDLE:
+                # Still no transaction: an idle observation chains to
+                # another idle one.
+                return document(
+                    transaction=None,
+                    state=cls._RECOVERY_DIAGNOSTIC_IDLE,
+                    phase=None,
+                    index_view=presence("index", strict=False),
+                    progress_view=presence("progress", strict=False),
+                    backups=[],
+                    reason=cls._RECOVERY_DIAGNOSTIC_REASON_NONE,
+                )
+            state, reason = cls._diagnostic_continue(predecessor, None, "")
+            return document(
+                transaction=predecessor["transaction"],
+                state=state,
+                phase=None,
+                index_view=presence("index", strict=False),
+                progress_view=presence("progress", strict=False),
+                backups=[],
+                reason=reason,
+            )
+
+        with open(recovery_path, "rb") as handle:
+            raw = handle.read()
+        try:
+            record = cls._parse_cache_recovery_record(raw)
+        except ValueError:
+            transaction = hashlib.sha256(raw).hexdigest()
+            if predecessor is None or not hmac.compare_digest(
+                predecessor["transaction"] or "", transaction
+            ):
+                if predecessor is not None and predecessor["state"] in (
+                    cls._RECOVERY_DIAGNOSTIC_COMMITTED,
+                    cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK,
+                ):
+                    reason = cls._RECOVERY_DIAGNOSTIC_REASON_EVIDENCE
+                elif predecessor is not None:
+                    reason = cls._RECOVERY_DIAGNOSTIC_REASON_TRANSACTION
+                else:
+                    reason = cls._RECOVERY_DIAGNOSTIC_REASON_RECORD
+                return document(
+                    transaction=transaction,
+                    state=cls._RECOVERY_DIAGNOSTIC_REJECTED,
+                    phase=None,
+                    index_view=presence("index", strict=False),
+                    progress_view=presence("progress", strict=False),
+                    backups=[],
+                    reason=reason,
+                )
+            # Same transaction, but its durable record is now damaged.
+            state, reason = cls._diagnostic_continue(
+                predecessor,
+                cls._RECOVERY_DIAGNOSTIC_REJECTED,
+                cls._RECOVERY_DIAGNOSTIC_REASON_RECORD,
+            )
+            return document(
+                transaction=transaction,
+                state=state,
+                phase=None,
+                index_view=presence("index", strict=False),
+                progress_view=presence("progress", strict=False),
+                backups=[],
+                reason=reason,
+            )
+
+        transaction = record["checksum"]
+        phase = record["phase"]
+        index_view = cls._diagnostic_target_view(index_path, record["index"])
+        progress_view = cls._diagnostic_target_view(
+            progress_path, record["progress"]
+        )
+        backups = cls._diagnostic_backups_view(directory, record)
+        if predecessor is not None and not hmac.compare_digest(
+            predecessor["transaction"] or "", transaction
+        ):
+            # A different durable transaction under a still-pending
+            # predecessor means the evidence switched mid-flight; under
+            # a settled predecessor a new record is a fresh publication
+            # being reprocessed after the disposition.
+            if predecessor["state"] in (
+                cls._RECOVERY_DIAGNOSTIC_COMMITTED,
+                cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK,
+            ):
+                reason = cls._RECOVERY_DIAGNOSTIC_REASON_EVIDENCE
+            else:
+                reason = cls._RECOVERY_DIAGNOSTIC_REASON_TRANSACTION
+            return document(
+                transaction=transaction,
+                state=cls._RECOVERY_DIAGNOSTIC_REJECTED,
+                phase=phase,
+                index_view=index_view,
+                progress_view=progress_view,
+                backups=backups,
+                reason=reason,
+            )
+        current, current_reason = cls._diagnostic_current_verdict(
+            record, index_view, progress_view, backups
+        )
+        if predecessor is None:
+            state, reason = current, current_reason
+        else:
+            state, reason = cls._diagnostic_continue(
+                predecessor, current, current_reason
+            )
+        return document(
+            transaction=transaction,
+            state=state,
+            phase=phase,
+            index_view=index_view,
+            progress_view=progress_view,
+            backups=backups,
+            reason=reason,
+        )
+
+    @classmethod
+    def recovery_diagnostic(
+        cls,
+        index_path: Any,
+        progress_path: Any,
+        recovery_path: Any,
+        previous: Any = None,
+    ) -> str:
+        """Observe the cross-process cache-publication recovery state
+        machine read-only and return a sealed, canonical diagnostic
+        string. Nothing is recovered or modified: the targets, backups,
+        recovery record, canonical chain, generation directories and
+        business state are all only read.
+
+        The three paths must each be a non-empty :class:`str` (a
+        non-``str`` raises :class:`TypeError`, an empty string
+        :class:`ValueError`); no two may alias the same file and all
+        three must share one directory (otherwise
+        :class:`ValueError`). ``previous`` is ``None`` for the first
+        observation of a transaction or the canonical diagnostic string
+        returned by an earlier call, used to continue the same
+        transaction after the recovery record has been cleaned up; a
+        wrong type raises :class:`TypeError` and an empty, malformed,
+        non-canonical, duplicate-key, wrong-version/structure or
+        checksum-bad string raises :class:`ValueError`. On the first
+        observation of a transaction a missing index or progress file,
+        or any open or read failure, raises :class:`OSError`; a
+        continued observation can instead report a settled rollback
+        that restored the targets to recorded absence. Damaged
+        recovery material is always expressed as a rejected
+        diagnostic rather than raised.
+
+        With no recovery record and no predecessor the report is idle.
+        A valid record's checksum is the transaction identity and the
+        evidence is judged exactly as the recovery state machine can
+        reach it: pending commit when the recorded phase allows it and
+        both targets carry the recorded new bytes, otherwise pending
+        rollback for a phase/digest combination the protocol can roll
+        back from (provided every backup the rollback needs is present
+        and byte-for-byte the recorded old bytes), and rejected -- with
+        a stable reason category -- on a phase contradiction, a target
+        matching neither recorded digest or missing while recorded, or a
+        missing/corrupt required backup. A damaged record's identity is
+        the SHA-256 of its raw bytes and no material body is ever
+        echoed; the diagnostic carries only digests, states and backup
+        names. With a predecessor whose transaction identity still
+        matches, its summary decides committed versus rolled back after
+        the record disappeared; an identity change is a transaction
+        rejection and sound evidence that regressed against the
+        predecessor's disposition an evidence rejection.
+
+        The returned string is UTF-8 compact JSON with no BOM and no
+        trailing newline; identical evidence produces byte-identical
+        strings. It records the version, transaction identity,
+        predecessor summary, phase, both targets' verdicts, backup
+        states, disposition and reason, sealed with SHA-256.
+        """
+        cls._validate_diagnostic_paths(
+            index_path, progress_path, recovery_path
+        )
+        predecessor: dict[str, Any] | None = None
+        if previous is not None:
+            predecessor = cls._parse_diagnostic(
+                previous, name="previous diagnostic"
+            )
+        body = cls._recovery_diagnostic_body(
+            index_path, progress_path, recovery_path, predecessor
+        )
+        document = dict(body)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document)
+
+    @classmethod
+    def verify_recovery_diagnostics(cls, records: Any) -> bool:
+        """Authenticate a consecutive run of diagnostic strings
+        read-only.
+
+        ``records`` must be exactly a :class:`tuple` of :class:`str`
+        values (any other container or element type raises
+        :class:`TypeError`); the empty tuple returns ``True``. Each
+        string must individually be a sealed diagnostic -- an empty,
+        malformed, non-canonical, duplicate-key, wrong-version/
+        structure or checksum-bad entry raises :class:`ValueError`.
+        When every entry is sound, the run must additionally be one
+        continuous transaction: the first entry must start the run,
+        each later entry's predecessor summary must equal the preceding
+        entry's own summary, the transaction identity must stay
+        constant, and the state sequence must be one the recovery state
+        machine can produce -- pending observations continuing,
+        converging once to their committed or rolled-back disposition
+        (which then stays put), or persisting as rejected with the same
+        reason. Regressed evidence, a transaction switch, a disposition
+        switch or any reprocessing after a final disposition returns
+        ``False``. Nothing on disk is read or modified.
+        """
+        if not isinstance(records, tuple):
+            raise TypeError(
+                f"records must be a tuple, got {type(records).__name__}"
+            )
+        if not records:
+            return True
+        bodies: list[dict[str, Any]] = []
+        for index, record in enumerate(records):
+            if not isinstance(record, str):
+                raise TypeError(
+                    "each diagnostic record must be a str, got "
+                    f"{type(record).__name__} at index {index}"
+                )
+            bodies.append(
+                cls._parse_diagnostic(
+                    record, name=f"recovery diagnostic at index {index}"
+                )
+            )
+        first = bodies[0]
+        if first["previous"] != "":
+            return False
+        allowed = {
+            cls._RECOVERY_DIAGNOSTIC_IDLE: (
+                cls._RECOVERY_DIAGNOSTIC_IDLE,
+            ),
+            cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT: (
+                cls._RECOVERY_DIAGNOSTIC_PENDING_COMMIT,
+                cls._RECOVERY_DIAGNOSTIC_COMMITTED,
+            ),
+            cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK: (
+                cls._RECOVERY_DIAGNOSTIC_PENDING_ROLLBACK,
+                cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK,
+            ),
+            cls._RECOVERY_DIAGNOSTIC_COMMITTED: (
+                cls._RECOVERY_DIAGNOSTIC_COMMITTED,
+            ),
+            cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK: (
+                cls._RECOVERY_DIAGNOSTIC_ROLLED_BACK,
+            ),
+            cls._RECOVERY_DIAGNOSTIC_REJECTED: (
+                cls._RECOVERY_DIAGNOSTIC_REJECTED,
+            ),
+        }
+        prior = first
+        for body in bodies[1:]:
+            if body["previous"] != prior["checksum"]:
+                return False
+            if body["transaction"] != prior["transaction"]:
+                return False
+            if body["state"] not in allowed[prior["state"]]:
+                return False
+            if (
+                prior["state"] == cls._RECOVERY_DIAGNOSTIC_REJECTED
+                and body["reason"] != prior["reason"]
+            ):
+                return False
+            prior = body
+        return True
 
     @classmethod
     def _is_legal_generation_name(cls, value: str) -> bool:
