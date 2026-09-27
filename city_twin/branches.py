@@ -4073,6 +4073,43 @@ class BranchStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
 
     @classmethod
+    def _acquire_diagnostic_ledger_reader_lock(cls, fd: int) -> None:
+        """Acquire a *shared* lock on the diagnostic-ledger coordination
+        file for the duration of one directory page. Any number of
+        readers may hold it concurrently, but it excludes an exclusive
+        publisher lock for the whole publish -- including rotated
+        segment and superseded-evidence garbage collection -- so a page
+        can never observe a half-switched snapshot and a publisher can
+        never delete a segment an in-progress reader may still open.
+        Acquisition blocks until granted; a locking system failure
+        raises :class:`OSError`. Closing ``fd`` (or the process exiting,
+        however abruptly) releases the lock at the operating-system
+        level, so a reader that crashes leaves no occupancy a later
+        publisher must wait on or explicitly reclaim."""
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            while True:
+                try:
+                    # Shared (read) lock on one byte at position zero.
+                    msvcrt.locking(fd, msvcrt.LK_NBRLCK, 1)
+                    return
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                        raise
+                    time.sleep(cls._RECOVERY_CHAIN_LOCK_POLL)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+
+    @classmethod
+    def _release_diagnostic_ledger_reader_lock(cls, fd: int) -> None:
+        """Release a shared directory-page reader lock on ``fd``."""
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    @classmethod
     def _validate_index_path(cls, index_path: Any) -> None:
         """Validate an index file ``index_path`` argument: a non-``str``
         raises :class:`TypeError`, an empty string :class:`ValueError`."""
@@ -7786,6 +7823,7 @@ class BranchStore:
         "version",
         "segments",
         "dropped",
+        "evidence",
         "checksum",
     )
     _DIAGNOSTIC_LEDGER_MANIFEST_SEGMENT_KEYS = (
@@ -7801,6 +7839,29 @@ class BranchStore:
         "first_at",
         "last_at",
     )
+    _DIAGNOSTIC_LEDGER_EVIDENCE_KEYS = ("digest",)
+    #: Durable, authenticated evidence of every transaction identity
+    #: ever rotated out of the retained segments. The evidence document
+    #: binds the identity set to the removed prefix's last segment
+    #: digest, its total entry count and time bounds, and authenticates
+    #: itself with a SHA-256 checksum, so the prefix stays exactly
+    #: remembered across restarts even after its segment files are gone.
+    _DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_FORMAT = (
+        "branching-city-twin/diagnostic-ledger-prefix-evidence"
+    )
+    _DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_VERSION = 1
+    _DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_SUPPORTED_VERSIONS = (1,)
+    _DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_KEYS = (
+        "format",
+        "version",
+        "digest",
+        "entries",
+        "first_at",
+        "last_at",
+        "transactions",
+        "checksum",
+    )
+    _DIAGNOSTIC_LEDGER_EVIDENCE_PREFIX = "dropped-evidence-"
     _DIAGNOSTIC_LEDGER_SEGMENT_FORMAT = (
         "branching-city-twin/diagnostic-ledger-segment"
     )
@@ -7875,6 +7936,36 @@ class BranchStore:
         return int(digits)
 
     @classmethod
+    def _diagnostic_ledger_evidence_name(cls, digest: str) -> str:
+        """Content-addressed file name of the prefix evidence whose
+        content has SHA-256 hex ``digest``. The full digest is used, so
+        the name binds the exact content: a fresh rotation publishes a
+        distinct name, the new evidence is in place before the manifest
+        switch and the previous evidence only becomes garbage once that
+        switch is durable."""
+        return f"{cls._DIAGNOSTIC_LEDGER_EVIDENCE_PREFIX}{digest}.json"
+
+    @classmethod
+    def _diagnostic_ledger_evidence_files(cls, directory: str) -> list[str]:
+        """The on-disk prefix-evidence file names present in
+        ``directory`` (content-addressed, possibly including a stale
+        generation awaiting garbage collection). A directory read
+        failure raises :class:`OSError`."""
+        names: list[str] = []
+        prefix = cls._DIAGNOSTIC_LEDGER_EVIDENCE_PREFIX
+        suffix = ".json"
+        for name in os.listdir(directory):
+            if (
+                name.startswith(prefix)
+                and name.endswith(suffix)
+                and not (
+                    set(name[len(prefix) : -len(suffix)]) - cls._HEX_DIGITS
+                )
+            ):
+                names.append(name)
+        return sorted(names)
+
+    @classmethod
     def _require_diagnostic_ledger_digest(cls, value: Any, what: str) -> str:
         """Require a 64-character lowercase hex digest field inside a
         manifest or segment; anything else raises :class:`ValueError`."""
@@ -7925,11 +8016,15 @@ class BranchStore:
         cls,
         segments: list[dict[str, Any]],
         dropped: dict[str, Any] | None,
+        evidence_digest: str | None,
     ) -> bytes:
         """Serialize the directory manifest to its canonical bytes,
         checksummed like a segment. ``segments`` carries one metadata
         mapping per retained segment in chain order; ``dropped`` is the
-        continuity proof for the rotated-away prefix, or ``None``."""
+        continuity proof for the rotated-away prefix, or ``None``;
+        ``evidence_digest`` is the content digest of the durable
+        transaction-identity evidence covering that prefix (present
+        exactly when ``dropped`` is), or ``None``."""
         document: dict[str, Any] = {
             "format": cls._DIAGNOSTIC_LEDGER_MANIFEST_FORMAT,
             "version": cls._DIAGNOSTIC_LEDGER_MANIFEST_VERSION,
@@ -7948,12 +8043,121 @@ class BranchStore:
                     for key in cls._DIAGNOSTIC_LEDGER_DROPPED_KEYS
                 }
             ),
+            "evidence": (
+                None
+                if evidence_digest is None
+                else {"digest": evidence_digest}
+            ),
         }
         body = dict(document)
         document["checksum"] = hashlib.sha256(
             cls._canonical_json(body).encode("utf-8")
         ).hexdigest()
         return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def _diagnostic_ledger_evidence_document(
+        cls,
+        identities: list[str],
+        dropped: dict[str, Any],
+    ) -> bytes:
+        """Serialize the durable uniqueness evidence for the whole
+        rotated-away prefix to canonical bytes. The evidence binds the
+        exact set of rotated-away transaction identities to the
+        prefix's last segment digest, its total entry count and its
+        time bounds (the same facts the manifest's ``dropped`` proof
+        carries), and authenticates itself with a SHA-256 checksum.
+        ``identities`` must already be de-duplicated in prefix order;
+        ``dropped`` describes the complete prefix covered."""
+        document: dict[str, Any] = {
+            "format": cls._DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_FORMAT,
+            "version": cls._DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_VERSION,
+            "digest": dropped["digest"],
+            "entries": dropped["entries"],
+            "first_at": dropped["first_at"],
+            "last_at": dropped["last_at"],
+            "transactions": identities,
+        }
+        body = dict(document)
+        document["checksum"] = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        return cls._canonical_json(document).encode("utf-8")
+
+    @classmethod
+    def _parse_diagnostic_ledger_evidence(
+        cls, raw: bytes
+    ) -> dict[str, Any]:
+        """Strictly parse and authenticate prefix-uniqueness evidence
+        bytes, returning a fresh mapping with the covered prefix's last
+        segment digest (``digest``), total entry count, time bounds and
+        the exact tuple of remembered transaction identities.
+
+        Every identity must be a 64-character lowercase hex digest and
+        the list must hold no duplicates: identity judgement is exact,
+        never probabilistic. Any encoding, canonical-form, structure,
+        version, field, duplicate-identity or checksum defect raises
+        :class:`ValueError`; no partial view is produced."""
+        document = cls._parse_diagnostic_ledger_envelope(
+            raw,
+            cls._DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_KEYS,
+            cls._DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_FORMAT,
+            cls._DIAGNOSTIC_LEDGER_PREFIX_EVIDENCE_SUPPORTED_VERSIONS,
+            "ledger prefix evidence",
+        )
+        digest = cls._require_diagnostic_ledger_digest(
+            document["digest"], "ledger prefix evidence prefix digest"
+        )
+        entries = document["entries"]
+        if (
+            isinstance(entries, bool)
+            or not isinstance(entries, int)
+            or entries < 1
+        ):
+            raise ValueError(
+                "ledger prefix evidence entry count is malformed"
+            )
+        first_at = cls._require_diagnostic_ledger_time(
+            document["first_at"], "ledger prefix evidence time"
+        )
+        last_at = cls._require_diagnostic_ledger_time(
+            document["last_at"], "ledger prefix evidence time"
+        )
+        if first_at > last_at:
+            raise ValueError(
+                "ledger prefix evidence time bounds are reversed"
+            )
+        raw_identities = document["transactions"]
+        if not isinstance(raw_identities, list) or not raw_identities:
+            raise ValueError(
+                "ledger prefix evidence transactions must be a "
+                "non-empty list"
+            )
+        seen: set[str] = set()
+        identities: list[str] = []
+        for identity in raw_identities:
+            cls._require_diagnostic_ledger_digest(
+                identity, "ledger prefix evidence transaction identity"
+            )
+            if identity in seen:
+                raise ValueError(
+                    "ledger prefix evidence repeats a transaction "
+                    "identity"
+                )
+            seen.add(identity)
+            identities.append(identity)
+        if len(identities) != entries:
+            raise ValueError(
+                "ledger prefix evidence entry count does not match "
+                "its transaction identities"
+            )
+        return {
+            "digest": digest,
+            "entries": entries,
+            "first_at": first_at,
+            "last_at": last_at,
+            "transactions": tuple(identities),
+        }
 
     @classmethod
     def _parse_diagnostic_ledger_envelope(
@@ -8089,8 +8293,27 @@ class BranchStore:
         dropped = cls._parse_diagnostic_ledger_dropped(
             document["dropped"]
         )
+        raw_evidence = document["evidence"]
+        if raw_evidence is None:
+            evidence = None
+        else:
+            if not isinstance(raw_evidence, dict) or set(
+                raw_evidence
+            ) != set(cls._DIAGNOSTIC_LEDGER_EVIDENCE_KEYS):
+                raise ValueError("ledger manifest evidence has bad keys")
+            evidence = {
+                "digest": cls._require_diagnostic_ledger_digest(
+                    raw_evidence["digest"],
+                    "ledger manifest evidence digest",
+                )
+            }
+        if (dropped is None) != (evidence is None):
+            raise ValueError(
+                "ledger manifest dropped proof and prefix evidence "
+                "must agree"
+            )
         digest = hashlib.sha256(raw).hexdigest()
-        return segments, dropped, digest
+        return segments, dropped, evidence, digest
 
     @classmethod
     def _parse_diagnostic_ledger_dropped(
@@ -8196,21 +8419,24 @@ class BranchStore:
         cls, directory: str, manifest_raw: bytes
     ) -> dict[str, Any]:
         """Authenticate a directory ledger snapshot: parse the manifest
-        bytes, then read, parse and authenticate every retained segment
-        and verify the manifest's digests, the inter-segment digest
-        chain, the rotated-prefix continuity link, per-segment
-        canonical order, non-decreasing times across segment boundaries
-        and ledger-wide chain authentication (including transaction
-        uniqueness).
+        bytes, then read, parse and authenticate every retained segment,
+        the durable rotated-prefix uniqueness evidence and verify the
+        manifest's digests, the inter-segment digest chain, the
+        rotated-prefix continuity link, the evidence's identity set and
+        prefix summary, per-segment canonical order, non-decreasing times
+        across segment boundaries and ledger-wide chain authentication
+        (including transaction uniqueness).
 
         Returns a mapping with ``segments`` (one mapping per retained
-        segment: the manifest metadata plus its ``pairs``), ``dropped``,
-        ``digest`` (the manifest's content digest), ``pairs`` and
-        ``summaries`` (all entries in segment order with one summary
-        each). A missing or unreadable segment raises :class:`OSError`;
-        any content defect raises :class:`ValueError` and no partial
-        view is produced."""
-        segments, dropped, manifest_digest = (
+        segment: the manifest metadata plus its ``pairs`` and its
+        ``_transactions`` in stored order), ``dropped``, ``evidence``
+        (the parsed prefix evidence, or ``None``), ``evidence_name``
+        (its file name, or ``None``), ``digest`` (the manifest's content
+        digest), ``pairs`` and ``summaries`` (all entries in segment
+        order with one summary each). A missing or unreadable segment
+        or evidence file raises :class:`OSError`; any content defect
+        raises :class:`ValueError` and no partial view is produced."""
+        segments, dropped, evidence_ref, manifest_digest = (
             cls._parse_diagnostic_ledger_manifest(manifest_raw)
         )
         previous_digest = (
@@ -8273,11 +8499,60 @@ class BranchStore:
                 raise ValueError(
                     "ledger segments are not in time order"
                 )
+            segment["_transactions"] = tuple(
+                summaries[offset + position]["transaction"]
+                for position in range(len(segment["pairs"]))
+            )
             previous_at = segment["pairs"][-1][0]
             offset += len(segment["pairs"])
+        evidence_name: str | None = None
+        evidence: dict[str, Any] | None = None
+        if evidence_ref is not None:
+            evidence_name = cls._diagnostic_ledger_evidence_name(
+                evidence_ref["digest"]
+            )
+            evidence_raw, _stat = cls._read_diagnostic_ledger(
+                os.path.join(directory, evidence_name)
+            )
+            if not hmac.compare_digest(
+                hashlib.sha256(evidence_raw).hexdigest(),
+                evidence_ref["digest"],
+            ):
+                raise ValueError(
+                    "ledger prefix evidence digest does not match the "
+                    "manifest"
+                )
+            evidence = cls._parse_diagnostic_ledger_evidence(evidence_raw)
+            evidence["self_digest"] = hashlib.sha256(
+                evidence_raw
+            ).hexdigest()
+            assert dropped is not None
+            if (
+                evidence["digest"] != dropped["digest"]
+                or evidence["entries"] != dropped["entries"]
+                or evidence["first_at"] != dropped["first_at"]
+                or evidence["last_at"] != dropped["last_at"]
+            ):
+                raise ValueError(
+                    "ledger prefix evidence does not match the "
+                    "dropped-prefix proof"
+                )
+            retained_transactions = {
+                identity
+                for segment in loaded
+                for identity in segment["_transactions"]
+            }
+            remembered = set(evidence["transactions"])
+            if retained_transactions & remembered:
+                raise ValueError(
+                    "ledger prefix evidence repeats a transaction "
+                    "identity still retained"
+                )
         return {
             "segments": loaded,
             "dropped": dropped,
+            "evidence": evidence,
+            "evidence_name": evidence_name,
             "digest": manifest_digest,
             "pairs": all_pairs,
             "summaries": summaries,
@@ -8345,11 +8620,15 @@ class BranchStore:
         regressing time, an empty chain, a malformed record, a sequence
         that does not authenticate, a chain that never names a
         transaction or a transaction identity duplicated within
-        ``entries`` raises :class:`ValueError`. Additionally, the first
-        appended time must not be earlier than the ledger's current
-        last entry and no appended transaction identity may already
-        appear in the ledger; either violation raises
-        :class:`ValueError`.
+        ``entries`` raises :class:`ValueError`. Uniqueness is one exact
+        judgement spanning the retained segments, a durable,
+        authenticated record of every identity already rotated away and
+        the new batch: after the oldest segments leave retention their
+        transaction identities are still precisely remembered (never
+        probabilistically), so appending one of them again raises
+        :class:`ValueError` rather than being accepted because the
+        segment file is gone. Additionally, the first appended time must
+        not be earlier than the ledger's current last entry.
 
         ``expected`` is the optimistic-concurrency token: ``None`` for
         the first publish (only accepted when no manifest exists yet),
@@ -8374,31 +8653,41 @@ class BranchStore:
         operating-system file lock on a fixed coordination file inside
         the canonical (symlink- and alias-resolved) ledger directory,
         so equivalent spellings of the same directory compete for the
-        same lock. The manifest, every retained segment and the
-        expected snapshot are re-authenticated inside the lock, never
-        against state observed before it was taken, so concurrent
-        callers holding the same old snapshot see at most one publish
-        succeed: every other caller acquires the lock afterwards and
-        raises :class:`RuntimeError` without overwriting the winning
-        data. A corrupt manifest, segment encoding or digest chain
-        raises :class:`ValueError`; lock, read, write, flush, replace
-        or sync failures raise :class:`OSError`.
+        same lock. The manifest, every retained segment, the
+        rotated-prefix uniqueness evidence and the expected snapshot are
+        re-authenticated inside the lock, never against state observed
+        before it was taken, so concurrent callers holding the same old
+        snapshot see at most one publish succeed: every other caller
+        acquires the lock afterwards and raises :class:`RuntimeError`
+        without writing a segment, manifest or evidence file. A corrupt
+        manifest, segment, prefix evidence or digest chain raises
+        :class:`ValueError`; lock, read, write, flush, replace or sync
+        failures raise :class:`OSError`.
 
         The new entries are stored sorted by time and then transaction
         identity in new immutable segments of at most ``segment_limit``
         entries each, every segment linked to its predecessor's digest
         so the segments form a hash chain. When more than ``keep``
-        segments would be retained, the oldest are rotated away and the
+        segments would be retained, the oldest are rotated away; the
         manifest records the removed prefix's last segment digest,
-        total entry count and time bounds, so the ledger's continuity
-        stays provable from the manifest alone. The new segments and
-        the new manifest are durably written (flushed, fsync-ed,
-        directory-synced) before the visible manifest is atomically
-        replaced; a failure before that switch raises and leaves the
-        old snapshot byte-for-byte readable with no partial result
-        visible, and rotated-away segment files are removed only after
-        the new manifest is durable. Returns the new snapshot digest,
-        which the next append passes as ``expected``.
+        total entry count and time bounds, and a separate durable,
+        checksummed evidence file binds the exact identities of every
+        transaction in the whole removed prefix, so the ledger's
+        continuity and transaction uniqueness stay provable and
+        enforceable after the old segment files are gone. The new
+        segments, the new evidence and the new manifest are durably
+        written (flushed, fsync-ed, directory-synced) before the
+        visible manifest is atomically replaced; a failure before that
+        switch raises and leaves the old snapshot -- manifest, retained
+        segments and evidence -- byte-for-byte readable with no partial
+        result visible. Rotated-away segment files (and a superseded
+        evidence file) are removed only after the new manifest is
+        durable and only once the exclusive publish lock can be held,
+        i.e. once every in-progress directory page's shared lock has
+        drained; a reader that exits abruptly releases its shared lock
+        at the operating-system level, so its occupancy is reclaimed
+        automatically. Returns the new snapshot digest, which the next
+        append passes as ``expected``.
         """
         cls._validate_diagnostic_ledger_path(directory)
         pairs = cls._validate_diagnostic_ledger_entries(entries)
@@ -8446,9 +8735,9 @@ class BranchStore:
     ) -> str:
         """Publish one appended snapshot under the directory lock and
         return its digest. The caller holds the lock and has validated
-        every argument; the manifest, the retained segments and the
-        expected snapshot are (re-)authenticated here, inside the
-        lock."""
+        every argument; the manifest, every retained segment, the
+        rotated-prefix uniqueness evidence and the expected snapshot are
+        (re-)authenticated here, inside the lock."""
         manifest_path = os.path.join(
             directory, cls._DIAGNOSTIC_LEDGER_MANIFEST_NAME
         )
@@ -8467,6 +8756,8 @@ class BranchStore:
             state: dict[str, Any] = {
                 "segments": [],
                 "dropped": None,
+                "evidence": None,
+                "evidence_name": None,
                 "pairs": [],
                 "summaries": [],
             }
@@ -8491,9 +8782,15 @@ class BranchStore:
                     "appended entry times must not be earlier than the "
                     "ledger's last entry"
                 )
+        # One exact uniqueness judgement spans the retained segments,
+        # the durable evidence of every already rotated-away prefix and
+        # the new batch: a transaction that left the retained segments
+        # is still remembered and is rejected precisely.
         existing_transactions = {
             summary["transaction"] for summary in state["summaries"]
         }
+        if state["evidence"] is not None:
+            existing_transactions.update(state["evidence"]["transactions"])
         for summary in new_summaries:
             if summary["transaction"] in existing_transactions:
                 raise ValueError(
@@ -8508,6 +8805,7 @@ class BranchStore:
             ),
         )
         sorted_pairs = [pairs[index] for index in order]
+        sorted_summaries = [new_summaries[index] for index in order]
         retained = list(state["segments"])
         next_index = retained[-1]["index"] + 1 if retained else 1
         if retained:
@@ -8516,55 +8814,146 @@ class BranchStore:
             previous_digest = state["dropped"]["digest"]
         else:
             previous_digest = cls._DIAGNOSTIC_LEDGER_GENESIS_PREV
-        for start in range(0, len(sorted_pairs), segment_limit):
-            chunk = sorted_pairs[start : start + segment_limit]
-            data = cls._diagnostic_ledger_segment_document(
-                next_index, previous_digest, chunk
-            )
-            name = cls._diagnostic_ledger_segment_name(next_index)
-            cls._write_diagnostic_ledger_file(
-                os.path.join(directory, name),
-                data,
-                ".diagnostic-ledger-segment-",
-            )
-            previous_digest = hashlib.sha256(data).hexdigest()
-            retained.append(
-                {
-                    "name": name,
-                    "index": next_index,
-                    "digest": previous_digest,
-                    "entries": len(chunk),
-                    "first_at": chunk[0][0],
-                    "last_at": chunk[-1][0],
+        # Every file published before the atomic manifest switch is
+        # unreferenced by the still-visible old manifest. If anything
+        # fails before that switch, these are rolled back so the
+        # directory holds no half-publish residue; only names that did
+        # not exist when the publish began are removed.
+        preexisting = set(os.listdir(directory))
+        created: list[str] = []
+        evidence_name: str | None = None
+        manifest_evidence_digest: str | None
+        try:
+            position = 0
+            for start in range(0, len(sorted_pairs), segment_limit):
+                chunk = sorted_pairs[start : start + segment_limit]
+                chunk_summaries = sorted_summaries[
+                    position : position + len(chunk)
+                ]
+                data = cls._diagnostic_ledger_segment_document(
+                    next_index, previous_digest, chunk
+                )
+                name = cls._diagnostic_ledger_segment_name(next_index)
+                segment_path = os.path.join(directory, name)
+                cls._write_diagnostic_ledger_file(
+                    segment_path,
+                    data,
+                    ".diagnostic-ledger-segment-",
+                )
+                created.append(segment_path)
+                previous_digest = hashlib.sha256(data).hexdigest()
+                retained.append(
+                    {
+                        "name": name,
+                        "index": next_index,
+                        "digest": previous_digest,
+                        "entries": len(chunk),
+                        "first_at": chunk[0][0],
+                        "last_at": chunk[-1][0],
+                        "_transactions": tuple(
+                            summary["transaction"]
+                            for summary in chunk_summaries
+                        ),
+                    }
+                )
+                next_index += 1
+                position += len(chunk)
+            dropped = state["dropped"]
+            removed: list[dict[str, Any]] = []
+            excess = len(retained) - keep
+            if excess > 0:
+                removed = retained[:excess]
+                retained = retained[excess:]
+                dropped = {
+                    "digest": removed[-1]["digest"],
+                    "entries": (dropped["entries"] if dropped else 0)
+                    + sum(meta["entries"] for meta in removed),
+                    "first_at": (
+                        dropped["first_at"]
+                        if dropped
+                        else removed[0]["first_at"]
+                    ),
+                    "last_at": removed[-1]["last_at"],
                 }
+            # The prefix evidence is rewritten (under a fresh,
+            # content-addressed name) before the manifest switch,
+            # carrying forward every previously remembered identity and
+            # adding the identities of the segments removed here.
+            if removed:
+                identities: list[str] = []
+                if state["evidence"] is not None:
+                    identities.extend(state["evidence"]["transactions"])
+                for meta in removed:
+                    identities.extend(meta["_transactions"])
+                evidence_data = cls._diagnostic_ledger_evidence_document(
+                    identities, dropped
+                )
+                evidence_digest = hashlib.sha256(
+                    evidence_data
+                ).hexdigest()
+                evidence_name = cls._diagnostic_ledger_evidence_name(
+                    evidence_digest
+                )
+                evidence_path = os.path.join(directory, evidence_name)
+                cls._write_diagnostic_ledger_file(
+                    evidence_path,
+                    evidence_data,
+                    ".diagnostic-ledger-evidence-",
+                )
+                created.append(evidence_path)
+                manifest_evidence_digest = evidence_digest
+            else:
+                # No new rotation: keep pointing at the existing
+                # evidence, if any.
+                manifest_evidence_digest = (
+                    None
+                    if state["evidence"] is None
+                    else state["evidence"]["self_digest"]
+                )
+            manifest_data = cls._diagnostic_ledger_manifest_document(
+                retained, dropped, manifest_evidence_digest
             )
-            next_index += 1
-        dropped = state["dropped"]
-        removed: list[dict[str, Any]] = []
-        excess = len(retained) - keep
-        if excess > 0:
-            removed = retained[:excess]
-            retained = retained[excess:]
-            dropped = {
-                "digest": removed[-1]["digest"],
-                "entries": (dropped["entries"] if dropped else 0)
-                + sum(meta["entries"] for meta in removed),
-                "first_at": (
-                    dropped["first_at"] if dropped else removed[0]["first_at"]
-                ),
-                "last_at": removed[-1]["last_at"],
-            }
-        manifest_data = cls._diagnostic_ledger_manifest_document(
-            retained, dropped
-        )
-        cls._write_diagnostic_ledger_file(
-            manifest_path, manifest_data, ".diagnostic-ledger-manifest-"
-        )
-        # Rotated-away segments are only garbage-collected once the
-        # manifest that no longer names them is durable and visible.
+            cls._write_diagnostic_ledger_file(
+                manifest_path,
+                manifest_data,
+                ".diagnostic-ledger-manifest-",
+            )
+        except BaseException:
+            # The visible manifest still names only the old snapshot, so
+            # deleting the newly staged files (never the old ones, which
+            # remain in ``preexisting``) restores the directory to its
+            # pre-publish state. Cleanup errors are suppressed so the
+            # original failure surfaces.
+            for staged in created:
+                if os.path.basename(staged) not in preexisting:
+                    with contextlib.suppress(OSError):
+                        os.remove(staged)
+            with contextlib.suppress(OSError):
+                cls._fsync_directory(directory)
+            raise
+        # Rotated-away segments and superseded/orphan evidence are only
+        # garbage-collected once the manifest naming the new generation
+        # is durable and visible. The caller's exclusive publish lock
+        # waits for every shared reader lock to drain, so no in-progress
+        # reader is still resolving these names; a reader that already
+        # opened a file keeps its unlinked inode readable by the kernel.
         for meta in removed:
             os.remove(os.path.join(directory, meta["name"]))
         if removed:
+            keep_evidence = (
+                None
+                if manifest_evidence_digest is None
+                else cls._diagnostic_ledger_evidence_name(
+                    manifest_evidence_digest
+                )
+            )
+            # Reconcile every evidence file on disk against the one the
+            # new manifest references: this removes the superseded
+            # evidence and any orphan left by a publish that crashed
+            # after writing its evidence but before the manifest switch.
+            for name in cls._diagnostic_ledger_evidence_files(directory):
+                if name != keep_evidence:
+                    os.remove(os.path.join(directory, name))
             cls._fsync_directory(directory)
         return hashlib.sha256(manifest_data).hexdigest()
 
@@ -8579,10 +8968,60 @@ class BranchStore:
         bookmark: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Read one snapshot-consistent page from a directory ledger.
-        The manifest binds the visible snapshot; it is re-read after
-        the segments so a publish racing the read is detected and the
-        read restarted (a first page) or reported (a resumed page)
-        rather than mixing two versions."""
+
+        The whole read runs under a *shared* lock on the ledger's
+        coordination file, which excludes an exclusive publisher lock
+        for the entire publish (manifest switch and rotated-segment
+        garbage collection). A page therefore observes only the complete
+        snapshot from before or after a switch -- never a mixture -- and
+        a segment an in-progress reader may still open is never deleted.
+        The shared lock is released when the call returns, and the
+        operating system also releases it if the reader exits abruptly,
+        so crashed readers leave no occupancy to block later publishers.
+        As a second line of defence the manifest is re-read after the
+        segments and compared, so a publish that somehow raced the lock
+        is detected and the read restarted (a first page) or reported (a
+        resumed page) rather than mixing two versions."""
+        real_path = os.path.realpath(path)
+        lock_path = os.path.join(
+            real_path, cls._DIAGNOSTIC_LEDGER_LOCK_NAME
+        )
+        # Read-only, and deliberately without O_CREAT: a directory
+        # ledger always carries its coordination file (the first
+        # append creates it before the manifest), so a page never has
+        # to write, and a directory without one -- hence without a
+        # manifest -- raises OSError having created nothing.
+        lock_fd = os.open(lock_path, os.O_RDONLY)
+        try:
+            cls._acquire_diagnostic_ledger_reader_lock(lock_fd)
+            try:
+                return cls._page_diagnostic_ledger_directory_locked(
+                    real_path,
+                    start_value,
+                    end_value,
+                    filter_transactions,
+                    page_limit,
+                    bookmark,
+                )
+            finally:
+                cls._release_diagnostic_ledger_reader_lock(lock_fd)
+        finally:
+            os.close(lock_fd)
+
+    @classmethod
+    def _page_diagnostic_ledger_directory_locked(
+        cls,
+        path: str,
+        start_value: int | None,
+        end_value: int | None,
+        filter_transactions: tuple[str, ...] | None,
+        page_limit: int,
+        bookmark: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Read one directory page under the shared reader lock. See
+        :meth:`_page_diagnostic_ledger_directory` for the locking
+        contract; the caller holds the shared lock and ``path`` is the
+        canonical ledger directory."""
         manifest_path = os.path.join(
             path, cls._DIAGNOSTIC_LEDGER_MANIFEST_NAME
         )
