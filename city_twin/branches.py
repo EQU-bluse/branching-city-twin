@@ -10645,11 +10645,16 @@ class BranchStore:
         non-canonical JSON, duplicate keys, an unknown version or
         structure, a checksum mismatch or an internal inconsistency
         (boundary or last-proof view not agreeing with the cumulative
-        state) raises :class:`ValueError` -- and only then are the new
-        proofs authenticated strictly in input order; an empty,
-        non-canonical or non-authenticating proof, or a transaction
-        identity set disagreeing with the checkpoint's ordered set,
-        raises :class:`ValueError`. No partial result is ever returned.
+        state) raises :class:`ValueError`. A checkpoint whose sealed
+        status is ``"failed"`` answers empty read-only queries forever;
+        a non-empty continuation of one is rejected immediately after
+        the checkpoint authenticates -- :class:`RuntimeError`, raised
+        before any new proof is read or authenticated, no matter what
+        the batch contains. Only otherwise are the new proofs
+        authenticated strictly in input order; an empty, non-canonical
+        or non-authenticating proof, or a transaction identity set
+        disagreeing with the checkpoint's ordered set, raises
+        :class:`ValueError`. No partial result is ever returned.
 
         An empty new-proof tuple is a read-only query: the returned
         audit is equal in every item to the sealed audit (the result a
@@ -10692,6 +10697,14 @@ class BranchStore:
                     f"{type(proof).__name__}"
                 )
         state = cls._parse_proof_audit_checkpoint(checkpoint)
+        if proofs and state["audit"]["status"] == "failed":
+            # A sealed failure is terminal: reject a non-empty
+            # continuation the instant the checkpoint authenticates,
+            # before any new proof is read or authenticated.
+            raise RuntimeError(
+                "the proof audit checkpoint already records a failed "
+                "terminal state; only an empty continuation is allowed"
+            )
         new_authenticated: list[dict[str, Any]] = []
         reference_mode = (
             None
@@ -10715,11 +10728,6 @@ class BranchStore:
                 "audit": state["audit"],
                 "checkpoint": checkpoint,
             }
-        if state["audit"]["status"] == "failed":
-            raise RuntimeError(
-                "the proof audit checkpoint already records a failed "
-                "terminal state; only an empty continuation is allowed"
-            )
         previous_count = state["count"]
         prior_status = state["audit"]["status"]
         hops: list[dict[str, Any]] = list(state["audit"]["hops"])
@@ -22435,3 +22443,803 @@ class BranchStore:
             raise ValueError("at must be a non-negative int")
         self._require_known_branch(name)
         return self._graph.replay_at(self._heads[name], at_value)
+
+
+class CheckpointRepository:
+    """A concurrency-safe, durable repository for one offline proof-audit
+    checkpoint and the request evidence around it.
+
+    The repository is a single UTF-8 compact JSON document at ``path``:
+    it records the repository format/version, the current checkpoint
+    string, the SHA-256 digest of that checkpoint and an append-only
+    list of request-evidence records (request id, operation kind,
+    authenticated input digest and the checkpoint/digest the operation
+    returned). A SHA-256 checksum covers every other field, so any
+    tampering is rejected when the document is read.
+
+    All three operations -- :meth:`load`, :meth:`save` and
+    :meth:`resume` -- serialize with an in-process lock and an
+    exclusive operating-system file lock, so equivalent repositories
+    in different threads and processes take one commit at a time. The
+    current document is always re-read and re-authenticated *inside*
+    the lock; optimistic concurrency on the caller-supplied
+    ``expected`` digest therefore means that concurrent commits based
+    on the same old digest have at most one winner, and every loser
+    re-checks inside the lock and raises :class:`RuntimeError` without
+    writing. A request retried after its commit completed -- same
+    ``request_id`` and the same inputs, including in another process
+    after a restart -- returns the original result without appending a
+    second continuation; the same id with different inputs raises
+    :class:`ValueError`.
+
+    Commits are crash-safe: bytes go to a same-directory temporary
+    file that is flushed and fsync-ed, atomically replaced onto the
+    repository path and followed by a directory sync. An interrupted
+    temporary file is never read as the repository (it can never mask
+    a corrupt main file); once the main file authenticates under the
+    lock, leftover temporary files are cleaned before a new commit.
+    Neither success nor failure changes any ledger, event graph,
+    business audit or idempotency state -- only the repository file.
+    """
+
+    _FORMAT = (
+        "branching-city-twin/proof-audit-checkpoint-repository"
+    )
+    _VERSION = 1
+    _SUPPORTED_VERSIONS = (1,)
+    _DOCUMENT_KEYS = (
+        "format",
+        "version",
+        "checkpoint",
+        "digest",
+        "requests",
+        "checksum",
+    )
+    _REQUEST_KEYS = (
+        "id",
+        "kind",
+        "input_digest",
+        "result_checkpoint",
+        "result_digest",
+    )
+    _KIND_SAVE = "save"
+    _KIND_RESUME = "resume"
+    _KINDS = (_KIND_SAVE, _KIND_RESUME)
+    _LOCK_SUFFIX = ".lock"
+    _TMP_PREFIX = ".proof-audit-checkpoint-"
+    _TMP_SUFFIX = ".tmp"
+    _LOCK_POLL = 0.05
+
+    def __init__(self, path: Any, timeout: Any) -> None:
+        """Create a repository handle bound to ``path`` with the lock
+        wait bound ``timeout``.
+
+        ``path`` must be a non-empty :class:`str` naming the repository
+        file (its parent directory must exist); a non-:class:`str`
+        raises :class:`TypeError`, an empty string raises
+        :class:`ValueError` and a missing or inaccessible location
+        raises :class:`OSError`. ``timeout`` is ``None`` (wait
+        indefinitely) or a non-``bool`` finite non-negative
+        :class:`int`/:class:`float` number of seconds: any other type
+        raises :class:`TypeError`, a negative value, NaN or either
+        infinity raises :class:`ValueError`, and an elapsed lock wait
+        raises :class:`TimeoutError` from the guarded operation.
+        """
+        if not isinstance(path, str):
+            raise TypeError(
+                f"path must be a str, got {type(path).__name__}"
+            )
+        if not path:
+            raise ValueError("path must be a non-empty str")
+        BranchStore._validate_chain_timeout(timeout)
+        real_path = os.path.realpath(path)
+        directory = os.path.dirname(real_path)
+        # Surface a missing or inaccessible location at construction;
+        # the same fault would otherwise only appear on the first lock.
+        parent_stat = os.stat(directory)
+        if not stat.S_ISDIR(parent_stat.st_mode):
+            raise NotADirectoryError(
+                errno.ENOTDIR, "not a directory", directory
+            )
+        self._path = real_path
+        self._directory = directory
+        self._lock_path = real_path + self._LOCK_SUFFIX
+        # Bind the temp prefix to this repository file name: two
+        # repositories on different files in one directory hold
+        # different locks, so neither must ever clean the other's
+        # in-flight temporary file.
+        self._tmp_prefix = (
+            self._TMP_PREFIX + os.path.basename(real_path) + "-"
+        )
+        self._timeout = timeout
+        # flock coordinates processes; this lock coordinates threads
+        # in one process (flock is owned per open file description).
+        self._thread_lock = threading.Lock()
+
+    # -- public operations ------------------------------------------------
+
+    def load(self) -> tuple[str, str]:
+        """Return ``(checkpoint, digest)`` -- the current authenticated
+        checkpoint string and its SHA-256 digest.
+
+        The repository file is read and authenticated under the
+        locks; if no repository exists at ``path`` yet,
+        :class:`KeyError` is raised. A malformed, tampered or
+        internally inconsistent document raises :class:`ValueError`;
+        lock or read failures raise :class:`OSError`. The query is
+        read-only: no temporary or lock file content is read and no
+        repository byte is changed.
+        """
+        with self._guarded():
+            document = self._read_document()
+            if document is None:
+                raise KeyError(self._path)
+            return document["checkpoint"], document["digest"]
+    def save(
+        self,
+        expected: Any,
+        checkpoint: Any,
+        request_id: Any,
+    ) -> str:
+        """Persist ``checkpoint`` under the request id ``request_id``.
+
+        ``expected`` is ``None`` for the very first commit (only
+        accepted while no repository exists) and afterwards the
+        current digest returned by an earlier :meth:`load`,
+        :meth:`save` or :meth:`resume`; another type raises
+        :class:`TypeError`, a malformed digest raises
+        :class:`ValueError`, and a missing/mismatched current digest
+        raises :class:`RuntimeError`. ``checkpoint`` and
+        ``request_id`` must be non-empty :class:`str`; a wrong type
+        raises :class:`TypeError` and an empty string or a checkpoint
+        that fails authentication raises :class:`ValueError`.
+
+        Returns the new checkpoint digest. The same ``request_id``
+        retried with the same checkpoint after a completed commit --
+        including in another process after a restart -- returns the
+        original digest without writing again; the same id with a
+        different checkpoint raises :class:`ValueError`.
+        """
+        expected_value = self._validate_expected(expected)
+        self._require_checkpoint(checkpoint)
+        self._require_identifier(request_id, "request_id")
+        input_digest = self._input_digest(
+            self._KIND_SAVE, {"checkpoint": checkpoint}
+        )
+        with self._guarded():
+            document = self._load_and_prepare()
+            record = self._replay_if_recorded(
+                document,
+                request_id,
+                self._KIND_SAVE,
+                input_digest,
+            )
+            if record is not None:
+                return str(record["result_digest"])
+            self._require_expected_matches(document, expected_value)
+            digest = self._checkpoint_digest(checkpoint)
+            requests = self._request_list(document)
+            requests.append(
+                {
+                    "id": request_id,
+                    "kind": self._KIND_SAVE,
+                    "input_digest": input_digest,
+                    "result_checkpoint": checkpoint,
+                    "result_digest": digest,
+                }
+            )
+            self._commit(checkpoint, requests)
+            return digest
+
+    def resume(
+        self,
+        expected: Any,
+        proofs: Any,
+        request_id: Any,
+    ) -> tuple[dict[str, Any], str, str]:
+        """Continue the repository's checkpoint audit with ``proofs``
+        and persist the sealed checkpoint, returning
+        ``(audit, checkpoint, digest)``.
+
+        The continuation contract is exactly
+        :meth:`BranchStore.resume_proof_audit`'s: ``proofs`` must be a
+        :class:`tuple` of :class:`str` proof strings (a wrong
+        container or element type raises :class:`TypeError`), an
+        empty/non-canonical/non-authenticating proof or a disagreeing
+        transaction identity set raises :class:`ValueError`, and a
+        non-empty continuation of a ``"failed"`` checkpoint raises
+        :class:`RuntimeError`. ``expected`` follows the optimistic-
+        concurrency rules of :meth:`save`; a resume additionally
+        requires an existing repository, so it raises
+        :class:`RuntimeError` when none exists yet. ``request_id``
+        must be a non-empty :class:`str`.
+
+        A retry under the same ``request_id`` and the same proof
+        tuple -- even after a restart -- replays the original result:
+        the audit the sealed checkpoint answers to an empty
+        continuation, that checkpoint and its digest, with no second
+        continuation appended. The same id with different proofs
+        raises :class:`ValueError`.
+        """
+        expected_value = self._validate_expected(expected)
+        proofs_tuple = self._validate_proofs(proofs)
+        self._require_identifier(request_id, "request_id")
+        input_digest = self._input_digest(
+            self._KIND_RESUME, {"proofs": list(proofs_tuple)}
+        )
+        with self._guarded():
+            document = self._load_and_prepare()
+            record = self._replay_if_recorded(
+                document,
+                request_id,
+                self._KIND_RESUME,
+                input_digest,
+            )
+            if record is not None:
+                result_checkpoint = str(record["result_checkpoint"])
+                replay = BranchStore.resume_proof_audit(
+                    result_checkpoint, ()
+                )
+                return (
+                    replay["audit"],
+                    result_checkpoint,
+                    str(record["result_digest"]),
+                )
+            self._require_expected_matches(document, expected_value)
+            if document is None:
+                raise RuntimeError(
+                    "no checkpoint repository exists yet; save a "
+                    "checkpoint before resuming an audit"
+                )
+            current_checkpoint = str(document["checkpoint"])
+            result = BranchStore.resume_proof_audit(
+                current_checkpoint, proofs_tuple
+            )
+            new_checkpoint = result["checkpoint"]
+            digest = self._checkpoint_digest(new_checkpoint)
+            requests = self._request_list(document)
+            requests.append(
+                {
+                    "id": request_id,
+                    "kind": self._KIND_RESUME,
+                    "input_digest": input_digest,
+                    "result_checkpoint": new_checkpoint,
+                    "result_digest": digest,
+                }
+            )
+            self._commit(new_checkpoint, requests)
+            return result["audit"], new_checkpoint, digest
+
+    # -- locking ----------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _guarded(self) -> Any:
+        """Hold the in-process lock and the cross-process file lock for
+        one repository operation. Lock acquisition honors the
+        repository timeout and raises :class:`TimeoutError`; opening
+        the coordination file or a locking failure raises
+        :class:`OSError`."""
+        with self._thread_lock:
+            fd = os.open(
+                self._lock_path, os.O_RDWR | os.O_CREAT, 0o644
+            )
+            try:
+                self._acquire_lock(fd, self._timeout)
+                try:
+                    yield
+                finally:
+                    self._release_lock(fd)
+            finally:
+                os.close(fd)
+
+    def _acquire_lock(self, fd: int, timeout: Any) -> None:
+        """Acquire the exclusive repository lock, polling until granted
+        or until ``timeout`` elapses into :class:`TimeoutError`."""
+        if timeout is None:
+            deadline: float | None = None
+        else:
+            try:
+                seconds = float(timeout)
+            except OverflowError:
+                seconds = math.inf
+            deadline = time.monotonic() + seconds
+        while True:
+            if self._try_lock(fd):
+                return
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "timed out waiting for the proof audit "
+                        "checkpoint repository lock"
+                    )
+                time.sleep(min(self._LOCK_POLL, remaining))
+            else:
+                time.sleep(self._LOCK_POLL)
+
+    @staticmethod
+    def _try_lock(fd: int) -> bool:
+        """One non-blocking exclusive-lock attempt; ``False`` when the
+        lock is held, an :class:`OSError` on a locking fault."""
+        if os.name == "nt":
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EDEADLK):
+                    return False
+                raise
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    @staticmethod
+    def _release_lock(fd: int) -> None:
+        """Release the exclusive repository lock."""
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+    # -- argument validation ---------------------------------------------
+
+    @classmethod
+    def _validate_expected(cls, expected: Any) -> Any:
+        """Validate the optimistic-concurrency digest: ``None`` or a
+        64-character lowercase hex string."""
+        if expected is None:
+            return None
+        if not isinstance(expected, str):
+            raise TypeError(
+                "expected must be None or a str, got "
+                f"{type(expected).__name__}"
+            )
+        if (
+            len(expected) != 64
+            or set(expected) - BranchStore._HEX_DIGITS
+        ):
+            raise ValueError(
+                "expected must be None or a digest of 64 lowercase "
+                "hexadecimal characters"
+            )
+        return expected
+
+    @classmethod
+    def _require_checkpoint(cls, checkpoint: Any) -> None:
+        """Validate and authenticate a checkpoint argument: a non-empty
+        :class:`str` that passes the checkpoint verifier."""
+        if not isinstance(checkpoint, str):
+            raise TypeError(
+                "checkpoint must be a str, got "
+                f"{type(checkpoint).__name__}"
+            )
+        if not checkpoint:
+            raise ValueError("checkpoint must be a non-empty str")
+        # Full authentication before the lock, so no commit machinery
+        # runs for an unauthenticatable checkpoint.
+        BranchStore._parse_proof_audit_checkpoint(checkpoint)
+
+    @staticmethod
+    def _require_identifier(value: Any, name: str) -> None:
+        """Validate a non-empty :class:`str` request identifier."""
+        if not isinstance(value, str):
+            raise TypeError(
+                f"{name} must be a str, got {type(value).__name__}"
+            )
+        if not value:
+            raise ValueError(f"{name} must be a non-empty str")
+
+    @staticmethod
+    def _validate_proofs(proofs: Any) -> tuple[str, ...]:
+        """Apply the plain-element part of the resume continuation
+        contract: a :class:`tuple` of :class:`str`; content is
+        authenticated later by ``resume_proof_audit``."""
+        if not isinstance(proofs, tuple):
+            raise TypeError(
+                "proofs must be a tuple, got "
+                f"{type(proofs).__name__}"
+            )
+        for position, proof in enumerate(proofs):
+            if not isinstance(proof, str):
+                raise TypeError(
+                    f"proof at index {position} must be a str, got "
+                    f"{type(proof).__name__}"
+                )
+        return proofs
+
+    @staticmethod
+    def _checkpoint_digest(checkpoint: str) -> str:
+        return hashlib.sha256(checkpoint.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _input_digest(cls, kind: str, payload: dict[str, Any]) -> str:
+        """Authenticating digest of one operation's inputs. The kind is
+        bound in, so a request id cannot silently move from a save to a
+        resume even if the payload bytes happened to coincide."""
+        body = dict(payload)
+        body["kind"] = kind
+        ordered = {"kind": body.pop("kind")}
+        for key in sorted(body):
+            ordered[key] = body[key]
+        return hashlib.sha256(
+            BranchStore._canonical_json(ordered).encode("utf-8")
+        ).hexdigest()
+
+    # -- repository document ---------------------------------------------
+
+    def _read_main_raw(self) -> bytes | None:
+        """Read the repository file's raw bytes, or ``None`` when it
+        does not exist yet. Permission and read faults propagate as
+        :class:`OSError`."""
+        try:
+            fd = os.open(self._path, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        try:
+            handle = os.fdopen(fd, "rb")
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+        with handle:
+            return handle.read()
+
+    def _read_document(self) -> dict[str, Any] | None:
+        """Read and fully authenticate the main repository document
+        under the lock, or ``None`` when it does not exist. Temporary
+        files are never consulted, so they cannot mask a missing or
+        corrupt main file."""
+        raw = self._read_main_raw()
+        if raw is None:
+            return None
+        return self._parse_document(raw)
+
+    def _load_and_prepare(self) -> dict[str, Any] | None:
+        """Authenticate the main file and, once it proves authentic (or
+        is absent, so nothing can be masked), remove temporary files
+        abandoned by interrupted earlier writers. A corrupt main file
+        raises before any cleanup runs."""
+        document = self._read_document()
+        self._cleanup_stale_temps()
+        return document
+
+    def _cleanup_stale_temps(self) -> None:
+        """Remove abandoned commit temporary files. Only ever called
+        while the exclusive lock is held, so a temp file here belongs
+        to a writer that died mid-commit. A list or removal fault
+        raises :class:`OSError`."""
+        for name in os.listdir(self._directory):
+            if name.startswith(self._tmp_prefix) and name.endswith(
+                self._TMP_SUFFIX
+            ):
+                os.remove(os.path.join(self._directory, name))
+
+    @staticmethod
+    def _request_list(
+        document: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        if document is None:
+            return []
+        return [dict(record) for record in document["requests"]]
+
+    @classmethod
+    def _parse_document(cls, raw: bytes) -> dict[str, Any]:
+        """Strictly parse and authenticate one repository document:
+        UTF-8 compact canonical JSON, exact structure and version, a
+        checksum over every other field, an authenticated checkpoint
+        whose digest agrees, and request records whose result
+        checkpoints authenticate and digests agree with unique request
+        ids. Any defect raises :class:`ValueError`; no partial view is
+        produced."""
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"checkpoint repository is not UTF-8: {exc}"
+            ) from exc
+        if text.startswith("\ufeff"):
+            raise ValueError(
+                "checkpoint repository must be UTF-8 without a BOM"
+            )
+        try:
+            document = json.loads(
+                text,
+                object_pairs_hook=BranchStore._reject_duplicate_json_keys,
+                parse_constant=BranchStore._reject_json_constant,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"checkpoint repository is not valid JSON: {exc}"
+            ) from exc
+        if BranchStore._canonical_json(document) != text:
+            raise ValueError(
+                "checkpoint repository is not canonical compact JSON"
+            )
+        if not isinstance(document, dict) or set(document) != set(
+            cls._DOCUMENT_KEYS
+        ):
+            raise ValueError(
+                "checkpoint repository has bad top-level keys"
+            )
+        if document["format"] != cls._FORMAT:
+            raise ValueError(
+                "checkpoint repository has an unknown format"
+            )
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in cls._SUPPORTED_VERSIONS
+        ):
+            raise ValueError(
+                "checkpoint repository has an unsupported version"
+            )
+        checksum = document["checksum"]
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or set(checksum) - BranchStore._HEX_DIGITS
+        ):
+            raise ValueError(
+                "checkpoint repository checksum is malformed"
+            )
+        body = {
+            key: value
+            for key, value in document.items()
+            if key != "checksum"
+        }
+        if not hmac.compare_digest(
+            checksum,
+            hashlib.sha256(
+                BranchStore._canonical_json(body).encode("utf-8")
+            ).hexdigest(),
+        ):
+            raise ValueError(
+                "checkpoint repository checksum does not verify"
+            )
+        checkpoint = document["checkpoint"]
+        if not isinstance(checkpoint, str) or not checkpoint:
+            raise ValueError(
+                "checkpoint repository must hold a non-empty "
+                "checkpoint string"
+            )
+        digest = document["digest"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or set(digest) - BranchStore._HEX_DIGITS
+        ):
+            raise ValueError(
+                "checkpoint repository digest is malformed"
+            )
+        if not hmac.compare_digest(
+            digest, cls._checkpoint_digest(checkpoint)
+        ):
+            raise ValueError(
+                "checkpoint repository digest does not match the "
+                "stored checkpoint"
+            )
+        # The stored checkpoint must authenticate on its own.
+        BranchStore._parse_proof_audit_checkpoint(checkpoint)
+        requests = cls._parse_requests(document["requests"])
+        if not requests:
+            raise ValueError(
+                "checkpoint repository must record the request that "
+                "produced its checkpoint"
+            )
+        # The evidence is append-only and always ends at the current
+        # state: the last record produced exactly the stored
+        # checkpoint/digest. A document that decouples the two is
+        # internally inconsistent even if both halves self-authenticate.
+        last_record = requests[-1]
+        if not hmac.compare_digest(
+            last_record["result_checkpoint"], checkpoint
+        ) or not hmac.compare_digest(
+            last_record["result_digest"], digest
+        ):
+            raise ValueError(
+                "checkpoint repository evidence does not end at the "
+                "stored checkpoint"
+            )
+        return {
+            "checkpoint": checkpoint,
+            "digest": digest,
+            "requests": requests,
+        }
+
+    @classmethod
+    def _parse_requests(cls, value: Any) -> list[dict[str, Any]]:
+        """Authenticate the request-evidence list: exact record shape,
+        unique non-empty ids, known kinds, hex digests and fully
+        authenticated result checkpoints whose digests match."""
+        if not isinstance(value, list):
+            raise ValueError(
+                "checkpoint repository request evidence must be a list"
+            )
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for position, record in enumerate(value):
+            if not isinstance(record, dict) or set(record) != set(
+                cls._REQUEST_KEYS
+            ):
+                raise ValueError(
+                    f"request record at index {position} has bad keys"
+                )
+            request_id = record["id"]
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError(
+                    f"request record at index {position} must hold a "
+                    "non-empty id"
+                )
+            if request_id in seen:
+                raise ValueError(
+                    f"request id {request_id!r} is duplicated in the "
+                    "repository evidence"
+                )
+            seen.add(request_id)
+            kind = record["kind"]
+            if kind not in cls._KINDS:
+                raise ValueError(
+                    f"request record at index {position} has an "
+                    "unknown operation kind"
+                )
+            input_digest = record["input_digest"]
+            result_digest = record["result_digest"]
+            for name, candidate in (
+                ("input_digest", input_digest),
+                ("result_digest", result_digest),
+            ):
+                if (
+                    not isinstance(candidate, str)
+                    or len(candidate) != 64
+                    or set(candidate) - BranchStore._HEX_DIGITS
+                ):
+                    raise ValueError(
+                        f"request record at index {position} has a "
+                        f"malformed {name}"
+                    )
+            result_checkpoint = record["result_checkpoint"]
+            if (
+                not isinstance(result_checkpoint, str)
+                or not result_checkpoint
+            ):
+                raise ValueError(
+                    f"request record at index {position} must hold a "
+                    "non-empty result checkpoint"
+                )
+            if not hmac.compare_digest(
+                result_digest,
+                cls._checkpoint_digest(result_checkpoint),
+            ):
+                raise ValueError(
+                    f"request record at index {position} result "
+                    "digest does not match its checkpoint"
+                )
+            # Every recorded result checkpoint must still authenticate.
+            BranchStore._parse_proof_audit_checkpoint(result_checkpoint)
+            records.append(dict(record))
+        return records
+
+    @staticmethod
+    def _require_expected_matches(
+        document: dict[str, Any] | None, expected: str | None
+    ) -> None:
+        """Enforce the optimistic-concurrency token against the document
+        re-read inside the lock."""
+        if document is None:
+            if expected is not None:
+                raise RuntimeError(
+                    "no checkpoint repository exists yet, so the "
+                    "expected digest must be None"
+                )
+            return
+        if expected is None:
+            raise RuntimeError(
+                "the checkpoint repository already exists, so the "
+                "current digest is required"
+            )
+        if not hmac.compare_digest(document["digest"], expected):
+            raise RuntimeError(
+                "expected digest does not match the current checkpoint "
+                "repository digest"
+            )
+
+    @classmethod
+    def _replay_if_recorded(
+        cls,
+        document: dict[str, Any] | None,
+        request_id: str,
+        kind: str,
+        input_digest: str,
+    ) -> dict[str, Any] | None:
+        """Return the stored evidence record for a repeated request, or
+        ``None`` for an unseen request id. The same id with a different
+        operation kind or different authenticated inputs raises
+        :class:`ValueError`."""
+        if document is None:
+            return None
+        for record in document["requests"]:
+            if record["id"] != request_id:
+                continue
+            if record["kind"] != kind:
+                raise ValueError(
+                    f"request id {request_id!r} is already recorded "
+                    "for a different operation"
+                )
+            if not hmac.compare_digest(
+                record["input_digest"], input_digest
+            ):
+                raise ValueError(
+                    f"request id {request_id!r} is already recorded "
+                    "with different inputs"
+                )
+            # The repository evidence must stay self-consistent even
+            # though the document checksum already binds it.
+            if not hmac.compare_digest(
+                record["result_digest"],
+                cls._checkpoint_digest(record["result_checkpoint"]),
+            ):
+                raise ValueError(
+                    f"request id {request_id!r} stored evidence is "
+                    "inconsistent with the repository"
+                )
+            return dict(record)
+        return None
+
+    # -- commit -----------------------------------------------------------
+
+    def _commit(
+        self, checkpoint: str, requests: list[dict[str, Any]]
+    ) -> None:
+        """Serialize, authenticate and durably atomically publish the
+        next repository document. The caller holds both locks and has
+        re-checked the current document inside them. Any write, flush,
+        replace, sync or cleanup fault raises :class:`OSError` and
+        leaves the previous repository file byte-for-byte in place
+        with no partial result visible."""
+        digest = self._checkpoint_digest(checkpoint)
+        body = {
+            "format": self._FORMAT,
+            "version": self._VERSION,
+            "checkpoint": checkpoint,
+            "digest": digest,
+            "requests": requests,
+        }
+        document = dict(body)
+        document["checksum"] = hashlib.sha256(
+            BranchStore._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        data = BranchStore._canonical_json(document).encode("utf-8")
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=self._tmp_prefix,
+            suffix=self._TMP_SUFFIX,
+            dir=self._directory,
+        )
+        replaced = False
+        try:
+            try:
+                handle = os.fdopen(fd, "wb")
+            except BaseException:
+                # fdopen failed without taking ownership of fd.
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+                raise
+            with handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            BranchStore._fsync_directory(self._directory)
+            os.replace(tmp_path, self._path)
+            replaced = True
+            BranchStore._fsync_directory(self._directory)
+        except BaseException:
+            if not replaced:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+            raise
