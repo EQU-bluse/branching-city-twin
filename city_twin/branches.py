@@ -9258,6 +9258,42 @@ class BranchStore:
     )
     _DIAGNOSTIC_LEDGER_PROOF_SEGMENT_KEYS = ("name", "document")
 
+    _PROOF_AUDIT_CHECKPOINT_FORMAT = (
+        "branching-city-twin/proof-audit-checkpoint"
+    )
+    _PROOF_AUDIT_CHECKPOINT_VERSION = 1
+    _PROOF_AUDIT_CHECKPOINT_SUPPORTED_VERSIONS = (1,)
+    _PROOF_AUDIT_CHECKPOINT_KEYS = (
+        "format",
+        "version",
+        "state",
+        "checksum",
+    )
+    _PROOF_AUDIT_CHECKPOINT_RELATIONS = (
+        "same",
+        "continued",
+        "forked",
+        "rollback",
+        "rewritten",
+        "missing_transition",
+        "spliced",
+    )
+    _PROOF_AUDIT_CHECKPOINT_FAILURES = (
+        "forked",
+        "rollback",
+        "rewritten",
+        "missing_transition",
+        "spliced",
+    )
+    _PROOF_AUDIT_CHECKPOINT_DISPOSITIONS = (
+        "idle",
+        "pending_commit",
+        "pending_rollback",
+        "committed",
+        "rolled_back",
+        "rejected",
+    )
+
     @classmethod
     def _validate_diagnostic_ledger_proof_transactions(
         cls, transactions: Any
@@ -10171,8 +10207,18 @@ class BranchStore:
                 )
             )
             offset += len(pairs)
+        view_segments: list[dict[str, Any]] = []
+        for meta in segments:
+            view_meta = dict(meta)
+            embedded_entry = embedded.get(meta["name"])
+            if embedded_entry is not None:
+                # Retain the authenticated predecessor anchor so a
+                # persisted proof view can re-verify its digest chain
+                # offline without the original proof.
+                view_meta["prev"] = embedded_entry[1]
+            view_segments.append(view_meta)
         view = {
-            "segments": [dict(meta) for meta in segments],
+            "segments": view_segments,
             "dropped": None if dropped is None else dict(dropped),
             "evidence": evidence_identities,
             "segment_entries": tuple(segment_entries),
@@ -10387,83 +10433,22 @@ class BranchStore:
             return cls._copy_diagnostic_ledger_proof_boundary(first_common)
 
         for right_index in range(1, len(authenticated)):
-            before_auth = authenticated[right_index - 1]
-            after_auth = authenticated[right_index]
-            try:
-                relation = cls._diagnostic_ledger_proof_relation(
-                    before_auth, after_auth
+            hop, terminal, pair_boundary = (
+                cls._diagnostic_ledger_proof_hop(
+                    authenticated[right_index - 1],
+                    authenticated[right_index],
+                    right_index,
                 )
-            except ValueError as exc:
-                classification = getattr(
-                    exc, "classification", "rewritten"
-                )
-                pair_boundary = (
-                    cls._copy_diagnostic_ledger_proof_boundary(
-                        exc.boundary
-                    )
-                    if hasattr(exc, "boundary")
-                    else None
-                )
-                hops.append(
-                    {
-                        "index": right_index,
-                        "relation": classification,
-                        "common": pair_boundary,
-                        "before_only":
-                            cls._copy_diagnostic_ledger_proof_segment_items(
-                                cls._diagnostic_ledger_proof_unique_segments(
-                                    before_auth["view"], pair_boundary
-                                )
-                            ),
-                        "after_only":
-                            cls._copy_diagnostic_ledger_proof_segment_items(
-                                cls._diagnostic_ledger_proof_unique_segments(
-                                    after_auth["view"], pair_boundary
-                                )
-                            ),
-                        # The hop never authenticated, so no rotation
-                        # across it was ever evidenced.
-                        "rotated": (),
-                        "reason": classification,
-                    }
-                )
+            )
+            hops.append(hop)
+            if terminal is not None:
                 return {
                     "status": "failed",
                     "common": common_with_pair(pair_boundary),
                     "hops": tuple(hops),
                     "failure": {
                         "index": right_index,
-                        "classification": classification,
-                    },
-                }
-            pair_common = cls._copy_diagnostic_ledger_proof_boundary(
-                relation["common"]
-            )
-            hop = {
-                "index": right_index,
-                "relation": relation["relation"],
-                "common": pair_common,
-                "before_only":
-                    cls._copy_diagnostic_ledger_proof_segment_items(
-                        relation["before_only"]
-                    ),
-                "after_only":
-                    cls._copy_diagnostic_ledger_proof_segment_items(
-                        relation["after_only"]
-                    ),
-                "rotated": tuple(relation["rotated"]),
-            }
-            if relation["relation"] == "forked":
-                hop["reason"] = "forked"
-            hops.append(hop)
-            if relation["relation"] == "forked":
-                return {
-                    "status": "failed",
-                    "common": common_with_pair(pair_common),
-                    "hops": tuple(hops),
-                    "failure": {
-                        "index": right_index,
-                        "classification": "forked",
+                        "classification": terminal,
                     },
                 }
         return {
@@ -10474,6 +10459,87 @@ class BranchStore:
             "hops": tuple(hops),
             "failure": None,
         }
+
+    @classmethod
+    def _diagnostic_ledger_proof_hop(
+        cls,
+        before_auth: dict[str, Any],
+        after_auth: dict[str, Any],
+        index: int,
+    ) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
+        """Classify one adjacent pair of already authenticated
+        transaction-mode proofs and build the fresh hop record the
+        sequence audit reports at cumulative ``index``. This is the
+        single engine shared by :meth:`audit_diagnostic_ledger_proof_sequence`
+        and the resumable checkpoint audit, so a given pair always
+        produces an identical hop.
+
+        Returns ``(hop, terminal, boundary)``. ``terminal`` is ``None``
+        for a ``"same"``/``"continued"`` hop, otherwise the stable
+        failure classification that terminates the audit (``"forked"``
+        or the classified relation error's ``"rollback"``,
+        ``"rewritten"``, ``"missing_transition"``/``"spliced"`` label);
+        a terminating hop carries ``reason``. ``boundary`` is the hop's
+        own detached common-boundary record (``None`` when none
+        exists)."""
+        try:
+            relation = cls._diagnostic_ledger_proof_relation(
+                before_auth, after_auth
+            )
+        except ValueError as exc:
+            classification = getattr(
+                exc, "classification", "rewritten"
+            )
+            pair_boundary = (
+                cls._copy_diagnostic_ledger_proof_boundary(
+                    exc.boundary
+                )
+                if hasattr(exc, "boundary")
+                else None
+            )
+            hop = {
+                "index": index,
+                "relation": classification,
+                "common": pair_boundary,
+                "before_only":
+                    cls._copy_diagnostic_ledger_proof_segment_items(
+                        cls._diagnostic_ledger_proof_unique_segments(
+                            before_auth["view"], pair_boundary
+                        )
+                    ),
+                "after_only":
+                    cls._copy_diagnostic_ledger_proof_segment_items(
+                        cls._diagnostic_ledger_proof_unique_segments(
+                            after_auth["view"], pair_boundary
+                        )
+                    ),
+                # The hop never authenticated, so no rotation across it
+                # was ever evidenced.
+                "rotated": (),
+                "reason": classification,
+            }
+            return hop, classification, pair_boundary
+        pair_common = cls._copy_diagnostic_ledger_proof_boundary(
+            relation["common"]
+        )
+        hop = {
+            "index": index,
+            "relation": relation["relation"],
+            "common": pair_common,
+            "before_only":
+                cls._copy_diagnostic_ledger_proof_segment_items(
+                    relation["before_only"]
+                ),
+            "after_only":
+                cls._copy_diagnostic_ledger_proof_segment_items(
+                    relation["after_only"]
+                ),
+            "rotated": tuple(relation["rotated"]),
+        }
+        if relation["relation"] == "forked":
+            hop["reason"] = "forked"
+            return hop, "forked", pair_common
+        return hop, None, pair_common
 
     @classmethod
     def _diagnostic_ledger_proof_unique_segments(
@@ -11055,6 +11121,1389 @@ class BranchStore:
                 }
             )
         return tuple(items)
+
+    # ------------------------------------------------------------------
+    # Resumable, incrementally continuing offline proof-sequence audit
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def create_proof_audit_checkpoint(cls, proofs: Any) -> str:
+        """Create a cross-process checkpoint for an offline audit of an
+        ordered sequence of exported diagnostic ledger proofs.
+
+        ``proofs`` must be a :class:`tuple` of canonical transaction-mode
+        proof strings, exactly as
+        :meth:`audit_diagnostic_ledger_proof_sequence` requires; the
+        empty tuple creates the initial checkpoint, whose ordered
+        transaction identity set stays open until the first batch of a
+        later resume. Authentication, relation judgement and exception
+        semantics are identical to the sequence audit: every proof is
+        authenticated and the shared ordered identity set is settled
+        before any relation is analysed, and individually legal proofs
+        that fork, roll back, rewrite, splice or miss a transition seal
+        a ``"failed"`` terminal checkpoint rather than raising. Nothing
+        is read from or written to any ledger, the event graph, the
+        business audit or the idempotency state.
+
+        Returns a self-contained canonical compact JSON string (no
+        trailing newline) protected by a SHA-256 checksum over every
+        other field. It records the cumulative proof count, the shared
+        ordered identity set (once known), the first proof's common
+        boundary, the last proof's *necessary authenticated view* (its
+        authenticated snapshot, retained-chain metadata with predecessor
+        links, rotated-prefix proof and evidence, and the entries needed
+        to judge the next cross-batch hop), the completed hops and the
+        terminal state -- never an unauthenticated proof body. The same
+        sequence always yields a byte-for-byte identical string."""
+        if not isinstance(proofs, tuple):
+            raise TypeError(
+                "proofs must be a tuple, got "
+                f"{type(proofs).__name__}"
+            )
+        authenticated: list[dict[str, Any]] = []
+        first_mode: dict[str, Any] | None = None
+        for position, proof in enumerate(proofs):
+            auth = cls._authenticate_diagnostic_ledger_proof_auth(
+                proof, f"proof at index {position}"
+            )
+            if first_mode is None:
+                first_mode = auth["mode"]
+            else:
+                cls._require_matching_diagnostic_ledger_proof_identities(
+                    first_mode, auth["mode"]
+                )
+            authenticated.append(auth)
+        if not authenticated:
+            state = cls._initial_proof_audit_state()
+        else:
+            state = cls._proof_audit_state_from_run(authenticated)
+        return cls._encode_proof_audit_checkpoint(state)
+
+    @classmethod
+    def resume_proof_audit(
+        cls, checkpoint: Any, proofs: Any
+    ) -> dict[str, Any]:
+        """Continue a checkpointed offline proof audit with a new batch.
+
+        Ordinary inputs are validated first, then the checkpoint is
+        authenticated, then the new proofs are authenticated strictly in
+        input order: a non-:class:`str` ``checkpoint`` or a non-
+        :class:`tuple`` proof container raises :class:`TypeError`, as
+        does a non-:class:`str` proof element; an empty checkpoint, a
+        non-canonical or duplicate-keyed document, or any version,
+        structure, checksum or internal self-consistency defect raises
+        :class:`ValueError`, and no partial result is ever returned. A
+        new proof whose ordered transaction identity set disagrees with
+        the set established so far likewise raises
+        :class:`ValueError`.
+
+        With no new proofs, a fresh audit result equal to the sealed
+        state and the checkpoint's exact bytes are returned read-only;
+        no hop is produced. A checkpoint already sealed ``"failed"``
+        rejects any non-empty continuation with :class:`RuntimeError`,
+        but an empty continuation still reads the sealed result. A
+        legal continuation forms the first hop across the batch
+        boundary from the checkpoint's last proof, then one hop per
+        adjacent pair within the batch, with indices continuing along
+        the cumulative sequence. Legal forks, rollbacks, rewrites,
+        missing transitions and splices seal a ``"failed"`` terminal
+        state exactly as the one-shot audit classifies them rather than
+        raising.
+
+        Returns a fresh mapping with ``audit`` and ``checkpoint``.
+        ``audit`` is item-for-item identical to handing the previous and
+        current proofs to :meth:`audit_diagnostic_ledger_proof_sequence`
+        in one call, and ``checkpoint`` is a fresh self-contained string
+        that can resume the next batch. Nothing is read from or written
+        to any ledger or other state, and no returned level shares
+        mutable state with another."""
+        if not isinstance(checkpoint, str):
+            raise TypeError(
+                "checkpoint must be a str, got "
+                f"{type(checkpoint).__name__}"
+            )
+        if not isinstance(proofs, tuple):
+            raise TypeError(
+                "proofs must be a tuple, got "
+                f"{type(proofs).__name__}"
+            )
+        for proof in proofs:
+            if not isinstance(proof, str):
+                raise TypeError(
+                    "every proof must be a str, got "
+                    f"{type(proof).__name__}"
+                )
+        state = cls._decode_proof_audit_checkpoint(checkpoint)
+        if not proofs:
+            # Read-only retrieval of the sealed state: no new hop and
+            # the checkpoint survives byte-for-byte.
+            return {
+                "audit": cls._proof_audit_result(state),
+                "checkpoint": checkpoint,
+            }
+        if state["status"] == "failed":
+            raise RuntimeError(
+                "the proof audit checkpoint already recorded a failed "
+                "terminal state"
+            )
+        base_mode: dict[str, Any] | None
+        if state["n"] == 0:
+            base_mode = None
+        else:
+            base_mode = {
+                "mode": cls._DIAGNOSTIC_LEDGER_PROOF_FILTER_MODE_TRANSACTIONS,
+                "transactions": state["identities"],
+            }
+        new_authenticated: list[dict[str, Any]] = []
+        for position, proof in enumerate(proofs):
+            auth = cls._authenticate_diagnostic_ledger_proof_auth(
+                proof, f"proof at index {position}"
+            )
+            if base_mode is None:
+                base_mode = auth["mode"]
+            else:
+                cls._require_matching_diagnostic_ledger_proof_identities(
+                    base_mode, auth["mode"]
+                )
+            new_authenticated.append(auth)
+        advanced = cls._proof_audit_advance(state, new_authenticated)
+        return {
+            "audit": cls._proof_audit_result(advanced),
+            "checkpoint": cls._encode_proof_audit_checkpoint(advanced),
+        }
+
+    @staticmethod
+    def _initial_proof_audit_state() -> dict[str, Any]:
+        """The fresh, sealed-but-open state behind an initial checkpoint
+        created from the empty proof tuple."""
+        return {
+            "n": 0,
+            "identities": None,
+            "first_common": None,
+            "last_view": None,
+            "last_snapshot": None,
+            "last_rotated": (),
+            "hops": (),
+            "common": None,
+            "status": "empty",
+            "failure": None,
+        }
+
+    @classmethod
+    def _proof_audit_state_from_run(
+        cls, authenticated: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Build the checkpoint state for one authenticated sequence of
+        one or more proofs, classifying hops exactly as the one-shot
+        sequence audit does."""
+        first_common = cls._copy_diagnostic_ledger_proof_boundary(
+            cls._diagnostic_ledger_proof_chain_boundary(
+                authenticated[0]["view"]
+            )
+        )
+        hops: list[dict[str, Any]] = []
+        last_auth = authenticated[0]
+        for right_index in range(1, len(authenticated)):
+            hop, terminal, pair_boundary = (
+                cls._diagnostic_ledger_proof_hop(
+                    authenticated[right_index - 1],
+                    authenticated[right_index],
+                    right_index,
+                )
+            )
+            hops.append(hop)
+            last_auth = authenticated[right_index]
+            if terminal is not None:
+                return {
+                    "n": len(authenticated),
+                    "identities": authenticated[0]["mode"][
+                        "transactions"
+                    ],
+                    "first_common": first_common,
+                    "last_view": last_auth["view"],
+                    "last_snapshot": last_auth["snapshot"],
+                    "last_rotated": tuple(last_auth["rotated"]),
+                    "hops": tuple(hops),
+                    "common":
+                        cls._proof_audit_common_with_pair(
+                            first_common, pair_boundary
+                        ),
+                    "status": "failed",
+                    "failure": {
+                        "index": right_index,
+                        "classification": terminal,
+                    },
+                }
+        return {
+            "n": len(authenticated),
+            "identities": authenticated[0]["mode"]["transactions"],
+            "first_common": first_common,
+            "last_view": authenticated[-1]["view"],
+            "last_snapshot": authenticated[-1]["snapshot"],
+            "last_rotated": tuple(authenticated[-1]["rotated"]),
+            "hops": tuple(hops),
+            "common": cls._copy_diagnostic_ledger_proof_boundary(
+                first_common
+            ),
+            "status": "continuous",
+            "failure": None,
+        }
+
+    @classmethod
+    def _proof_audit_advance(
+        cls,
+        state: dict[str, Any],
+        new_authenticated: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Extend a non-failed state with an authenticated non-empty
+        batch, forming the cross-batch hop first (when history exists)
+        and then the within-batch hops, with cumulative indices."""
+        n = state["n"]
+        identities = (
+            new_authenticated[0]["mode"]["transactions"]
+            if n == 0
+            else state["identities"]
+        )
+        hops = list(state["hops"])
+        if n == 0:
+            sequence = list(new_authenticated)
+            first_common = cls._copy_diagnostic_ledger_proof_boundary(
+                cls._diagnostic_ledger_proof_chain_boundary(
+                    sequence[0]["view"]
+                )
+            )
+        else:
+            last_proof = {
+                "view": state["last_view"],
+                "snapshot": state["last_snapshot"],
+                "rotated": state["last_rotated"],
+            }
+            sequence = [last_proof] + list(new_authenticated)
+            first_common = cls._copy_diagnostic_ledger_proof_boundary(
+                state["first_common"]
+            )
+        last_auth = sequence[0]
+        for right_index in range(1, len(sequence)):
+            cumulative_index = (
+                right_index if n == 0 else n - 1 + right_index
+            )
+            hop, terminal, pair_boundary = (
+                cls._diagnostic_ledger_proof_hop(
+                    sequence[right_index - 1],
+                    sequence[right_index],
+                    cumulative_index,
+                )
+            )
+            hops.append(hop)
+            last_auth = sequence[right_index]
+            if terminal is not None:
+                return {
+                    "n": n + len(new_authenticated),
+                    "identities": identities,
+                    "first_common": first_common,
+                    "last_view": last_auth["view"],
+                    "last_snapshot": last_auth["snapshot"],
+                    "last_rotated": tuple(last_auth["rotated"]),
+                    "hops": tuple(hops),
+                    "common":
+                        cls._proof_audit_common_with_pair(
+                            first_common, pair_boundary
+                        ),
+                    "status": "failed",
+                    "failure": {
+                        "index": cumulative_index,
+                        "classification": terminal,
+                    },
+                }
+        return {
+            "n": n + len(new_authenticated),
+            "identities": identities,
+            "first_common": first_common,
+            "last_view": sequence[-1]["view"],
+            "last_snapshot": sequence[-1]["snapshot"],
+            "last_rotated": tuple(sequence[-1]["rotated"]),
+            "hops": tuple(hops),
+            "common": cls._copy_diagnostic_ledger_proof_boundary(
+                first_common
+            ),
+            "status": "continuous",
+            "failure": None,
+        }
+
+    @staticmethod
+    def _proof_audit_common_with_pair(
+        first_common: dict[str, Any] | None,
+        pair_boundary: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """The last boundary every proof up to a failing hop jointly
+        authenticated, mirroring the sequence audit: the failing pair's
+        boundary when it lies before the first proof's tail, otherwise
+        that first boundary; ``None`` when the first proof authenticated
+        the empty ledger or the pair shares no boundary."""
+        if first_common is None or pair_boundary is None:
+            return None
+        if pair_boundary["index"] < first_common["index"]:
+            return (
+                BranchStore._copy_diagnostic_ledger_proof_boundary(
+                    pair_boundary
+                )
+            )
+        return BranchStore._copy_diagnostic_ledger_proof_boundary(
+            first_common
+        )
+
+    @classmethod
+    def _proof_audit_result(cls, state: dict[str, Any]) -> dict[str, Any]:
+        """A fresh, deeply detached audit mapping shaped exactly like
+        :meth:`audit_diagnostic_ledger_proof_sequence` output."""
+        hops: list[dict[str, Any]] = []
+        for hop in state["hops"]:
+            detached = {
+                "index": hop["index"],
+                "relation": hop["relation"],
+                "common":
+                    cls._copy_diagnostic_ledger_proof_boundary(
+                        hop["common"]
+                    ),
+                "before_only":
+                    cls._copy_diagnostic_ledger_proof_segment_items(
+                        hop["before_only"]
+                    ),
+                "after_only":
+                    cls._copy_diagnostic_ledger_proof_segment_items(
+                        hop["after_only"]
+                    ),
+                "rotated": tuple(hop["rotated"]),
+            }
+            if "reason" in hop:
+                detached["reason"] = hop["reason"]
+            hops.append(detached)
+        return {
+            "status": state["status"],
+            "common": cls._copy_diagnostic_ledger_proof_boundary(
+                state["common"]
+            ),
+            "hops": tuple(hops),
+            "failure": (
+                None
+                if state["failure"] is None
+                else dict(state["failure"])
+            ),
+        }
+
+    # ----- checkpoint serialization -------------------------------
+
+    @classmethod
+    def _encode_proof_audit_checkpoint(
+        cls, state: dict[str, Any]
+    ) -> str:
+        """Serialize a checkpoint state to canonical compact JSON with a
+        SHA-256 checksum over every other document field."""
+        body_state = {
+            "v": cls._PROOF_AUDIT_CHECKPOINT_VERSION,
+            "n": state["n"],
+            "ids": (
+                None
+                if state["identities"] is None
+                else list(state["identities"])
+            ),
+            "b0": cls._proof_audit_boundary_json(state["first_common"]),
+            "bn": cls._proof_audit_boundary_json(state["common"]),
+            "last": cls._proof_audit_last_json(state),
+            "hops": [
+                cls._proof_audit_hop_json(hop) for hop in state["hops"]
+            ],
+            "status": state["status"],
+            "failure": (
+                None
+                if state["failure"] is None
+                else {
+                    "index": state["failure"]["index"],
+                    "classification": state["failure"]["classification"],
+                }
+            ),
+        }
+        body = {
+            "format": cls._PROOF_AUDIT_CHECKPOINT_FORMAT,
+            "version": cls._PROOF_AUDIT_CHECKPOINT_VERSION,
+            "state": body_state,
+        }
+        checksum = hashlib.sha256(
+            cls._canonical_json(body).encode("utf-8")
+        ).hexdigest()
+        document = dict(body)
+        document["checksum"] = checksum
+        return cls._canonical_json(document)
+
+    @staticmethod
+    def _proof_audit_boundary_json(
+        boundary: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if boundary is None:
+            return None
+        return {
+            "index": boundary["index"],
+            "digest": boundary["digest"],
+            "entries": boundary["entries"],
+        }
+
+    @classmethod
+    def _proof_audit_last_json(
+        cls, state: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The last proof's necessary authenticated view: snapshot,
+        retained-chain metadata with predecessor links and entries, the
+        rotated-prefix proof and evidence, and the rotated identities."""
+        view = state["last_view"]
+        if view is None:
+            return None
+        snapshot = state["last_snapshot"]
+        segments = []
+        for offset, meta in enumerate(view["segments"]):
+            entries: list[dict[str, Any]] = []
+            segment_entries = view["segment_entries"][offset]
+            for entry in segment_entries:
+                entries.append(
+                    {
+                        "at": entry["at"],
+                        "summary": dict(entry["summary"]),
+                        "records": list(entry["records"]),
+                    }
+                )
+            segments.append(
+                {
+                    "name": meta["name"],
+                    "index": meta["index"],
+                    "prev": meta["prev"],
+                    "digest": meta["digest"],
+                    "entries": meta["entries"],
+                    "first_at": meta["first_at"],
+                    "last_at": meta["last_at"],
+                    "body": entries,
+                }
+            )
+        dropped = view["dropped"]
+        return {
+            "snapshot": {
+                "digest": snapshot["digest"],
+                "bytes": snapshot["bytes"],
+                "segments": snapshot["segments"],
+                "entries": snapshot["entries"],
+                "dropped": (
+                    None
+                    if dropped is None
+                    else {
+                        "digest": dropped["digest"],
+                        "entries": dropped["entries"],
+                        "first_at": dropped["first_at"],
+                        "last_at": dropped["last_at"],
+                    }
+                ),
+                "evidence": snapshot["evidence"],
+            },
+            "segments": segments,
+            "evidence": list(view["evidence"]),
+            "rotated": list(state["last_rotated"]),
+        }
+
+    @classmethod
+    def _proof_audit_hop_json(cls, hop: dict[str, Any]) -> dict[str, Any]:
+        result = {
+            "index": hop["index"],
+            "relation": hop["relation"],
+            "common": cls._proof_audit_boundary_json(hop["common"]),
+            "before_only": [
+                cls._proof_audit_item_json(item)
+                for item in hop["before_only"]
+            ],
+            "after_only": [
+                cls._proof_audit_item_json(item)
+                for item in hop["after_only"]
+            ],
+            "rotated": list(hop["rotated"]),
+        }
+        if "reason" in hop:
+            result["reason"] = hop["reason"]
+        return result
+
+    @staticmethod
+    def _proof_audit_item_json(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "index": item["index"],
+            "digest": item["digest"],
+            "entries": [
+                {
+                    "at": entry["at"],
+                    "summary": dict(entry["summary"]),
+                    "records": list(entry["records"]),
+                }
+                for entry in item["entries"]
+            ],
+        }
+
+    # ----- checkpoint parsing -------------------------------------
+
+    @classmethod
+    def _decode_proof_audit_checkpoint(cls, checkpoint: str) -> dict[str, Any]:
+        """Authenticate one checkpoint string and rebuild its validated
+        state, raising :class:`ValueError` for an empty, non-canonical,
+        duplicate-keyed, malformed, bad-version, bad-checksum or
+        internally inconsistent document."""
+        if not checkpoint:
+            raise ValueError("checkpoint must be a non-empty str")
+        if checkpoint.startswith("\ufeff"):
+            raise ValueError("checkpoint must be UTF-8 without a BOM")
+        if checkpoint.endswith("\n") or checkpoint.endswith("\r"):
+            raise ValueError("checkpoint must not have a trailing newline")
+        try:
+            document = json.loads(
+                checkpoint,
+                object_pairs_hook=cls._reject_duplicate_json_keys,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"checkpoint is not valid JSON: {exc}"
+            ) from exc
+        if cls._canonical_json(document) != checkpoint:
+            raise ValueError("checkpoint is not canonical compact JSON")
+        if not isinstance(document, dict) or set(document) != set(
+            cls._PROOF_AUDIT_CHECKPOINT_KEYS
+        ):
+            raise ValueError("checkpoint has bad top-level keys")
+        if document["format"] != cls._PROOF_AUDIT_CHECKPOINT_FORMAT:
+            raise ValueError("checkpoint has an unknown format")
+        version = document["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in cls._PROOF_AUDIT_CHECKPOINT_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("checkpoint has an unsupported version")
+        checksum = document["checksum"]
+        if (
+            not isinstance(checksum, str)
+            or len(checksum) != 64
+            or set(checksum) - cls._HEX_DIGITS
+        ):
+            raise ValueError("checkpoint checksum is malformed")
+        body = document["state"]
+        if not isinstance(body, dict):
+            raise ValueError("checkpoint state must be an object")
+        covered = {
+            "format": document["format"],
+            "version": document["version"],
+            "state": body,
+        }
+        expected = hashlib.sha256(
+            cls._canonical_json(covered).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(checksum, expected):
+            raise ValueError("checkpoint checksum does not verify")
+        return cls._parse_proof_audit_state(body)
+
+    @staticmethod
+    def _proof_audit_require_int(value: Any, what: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"checkpoint {what} is malformed")
+        return value
+
+    @classmethod
+    def _proof_audit_require_digest(cls, value: Any, what: str) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or set(value) - cls._HEX_DIGITS
+        ):
+            raise ValueError(f"checkpoint {what} is malformed")
+        return value
+
+    @classmethod
+    def _proof_audit_parse_boundary(
+        cls, raw: Any
+    ) -> dict[str, Any] | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or set(raw) != {
+            "index",
+            "digest",
+            "entries",
+        }:
+            raise ValueError("checkpoint boundary is malformed")
+        index = cls._proof_audit_require_int(raw["index"], "boundary index")
+        if index < 1:
+            raise ValueError("checkpoint boundary index is malformed")
+        digest = cls._proof_audit_require_digest(
+            raw["digest"], "boundary digest"
+        )
+        entries = cls._proof_audit_require_int(
+            raw["entries"], "boundary entries"
+        )
+        if entries < 1:
+            raise ValueError("checkpoint boundary entries is malformed")
+        return {"index": index, "digest": digest, "entries": entries}
+
+    @classmethod
+    def _proof_audit_parse_summary(cls, raw: Any) -> dict[str, Any]:
+        keys = {
+            "transaction",
+            "first",
+            "last",
+            "count",
+            "terminal",
+            "reason",
+        }
+        if not isinstance(raw, dict) or set(raw) != keys:
+            raise ValueError("checkpoint entry summary is malformed")
+        cls._proof_audit_require_digest(
+            raw["transaction"], "entry transaction"
+        )
+        if raw["first"] not in cls._PROOF_AUDIT_CHECKPOINT_DISPOSITIONS:
+            raise ValueError("checkpoint entry disposition is malformed")
+        if raw["last"] not in cls._PROOF_AUDIT_CHECKPOINT_DISPOSITIONS:
+            raise ValueError("checkpoint entry disposition is malformed")
+        count = cls._proof_audit_require_int(
+            raw["count"], "entry record count"
+        )
+        if count < 1:
+            raise ValueError("checkpoint entry record count is malformed")
+        if not isinstance(raw["terminal"], bool):
+            raise ValueError("checkpoint entry terminal flag is malformed")
+        if not isinstance(raw["reason"], str):
+            raise ValueError("checkpoint entry reason is malformed")
+        return {
+            "transaction": raw["transaction"],
+            "first": raw["first"],
+            "last": raw["last"],
+            "count": count,
+            "terminal": raw["terminal"],
+            "reason": raw["reason"],
+        }
+
+    @classmethod
+    def _proof_audit_parse_entry(cls, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {
+            "at",
+            "summary",
+            "records",
+        }:
+            raise ValueError("checkpoint entry is malformed")
+        at = cls._proof_audit_require_int(raw["at"], "entry time")
+        records_raw = raw["records"]
+        if not isinstance(records_raw, list) or not records_raw:
+            raise ValueError("checkpoint entry records are malformed")
+        for record in records_raw:
+            if not isinstance(record, str) or not record:
+                raise ValueError("checkpoint entry records are malformed")
+        summary = cls._proof_audit_parse_summary(raw["summary"])
+        if len(records_raw) != summary["count"]:
+            raise ValueError(
+                "checkpoint entry record count does not match its summary"
+            )
+        return {
+            "at": at,
+            "summary": summary,
+            "records": tuple(records_raw),
+        }
+
+    @classmethod
+    def _proof_audit_parse_item(cls, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {
+            "index",
+            "digest",
+            "entries",
+        }:
+            raise ValueError("checkpoint segment item is malformed")
+        index = cls._proof_audit_require_int(raw["index"], "segment index")
+        if index < 1:
+            raise ValueError("checkpoint segment index is malformed")
+        cls._proof_audit_require_digest(raw["digest"], "segment digest")
+        entries_raw = raw["entries"]
+        if not isinstance(entries_raw, list) or not entries_raw:
+            raise ValueError("checkpoint segment entries are malformed")
+        entries = tuple(
+            cls._proof_audit_parse_entry(entry) for entry in entries_raw
+        )
+        return {
+            "index": index,
+            "digest": raw["digest"],
+            "entries": entries,
+        }
+
+    @classmethod
+    def _proof_audit_parse_hop(cls, raw: Any, index: int) -> dict[str, Any]:
+        keys = {
+            "index",
+            "relation",
+            "common",
+            "before_only",
+            "after_only",
+            "rotated",
+        }
+        if not isinstance(raw, dict) or not keys <= set(raw):
+            raise ValueError("checkpoint hop is malformed")
+        hop_index = cls._proof_audit_require_int(raw["index"], "hop index")
+        if hop_index != index:
+            raise ValueError("checkpoint hop indices are not continuous")
+        relation = raw["relation"]
+        if relation not in cls._PROOF_AUDIT_CHECKPOINT_RELATIONS:
+            raise ValueError("checkpoint hop relation is malformed")
+        failing = relation in cls._PROOF_AUDIT_CHECKPOINT_FAILURES
+        expected_keys = keys | ({"reason"} if failing else set())
+        if set(raw) != expected_keys:
+            raise ValueError("checkpoint hop is malformed")
+        if failing and raw["reason"] != relation:
+            raise ValueError("checkpoint hop reason is malformed")
+        if not isinstance(raw["before_only"], list) or not isinstance(
+            raw["after_only"], list
+        ):
+            raise ValueError("checkpoint hop sides are malformed")
+        before_only = tuple(
+            cls._proof_audit_parse_item(item)
+            for item in raw["before_only"]
+        )
+        after_only = tuple(
+            cls._proof_audit_parse_item(item)
+            for item in raw["after_only"]
+        )
+        rotated_raw = raw["rotated"]
+        if not isinstance(rotated_raw, list):
+            raise ValueError("checkpoint hop rotated identities malformed")
+        identities: set[str] = set()
+        rotated: list[str] = []
+        for identity in rotated_raw:
+            # Rotated identities are members of the requested filter
+            # set, so they follow the filter's non-empty-str rule.
+            if not isinstance(identity, str) or not identity:
+                raise ValueError(
+                    "checkpoint hop rotated identities malformed"
+                )
+            if identity in identities:
+                raise ValueError(
+                    "checkpoint hop rotates one identity more than once"
+                )
+            identities.add(identity)
+            rotated.append(identity)
+        hop = {
+            "index": hop_index,
+            "relation": relation,
+            "common": cls._proof_audit_parse_boundary(raw["common"]),
+            "before_only": before_only,
+            "after_only": after_only,
+            "rotated": tuple(rotated),
+        }
+        if failing:
+            hop["reason"] = relation
+        return hop
+
+    @classmethod
+    def _proof_audit_parse_last(cls, raw: Any) -> dict[str, Any]:
+        """Rebuild and re-authenticate the last proof's necessary view,
+        re-verifying the retained segment digest chain and every embedded
+        diagnostic chain offline exactly as proof authentication would."""
+        if not isinstance(raw, dict) or set(raw) != {
+            "snapshot",
+            "segments",
+            "evidence",
+            "rotated",
+        }:
+            raise ValueError("checkpoint last-proof view is malformed")
+        snapshot_raw = raw["snapshot"]
+        if not isinstance(snapshot_raw, dict) or set(snapshot_raw) != {
+            "digest",
+            "bytes",
+            "segments",
+            "entries",
+            "dropped",
+            "evidence",
+        }:
+            raise ValueError("checkpoint snapshot is malformed")
+        snapshot_digest = cls._proof_audit_require_digest(
+            snapshot_raw["digest"], "snapshot digest"
+        )
+        snapshot_bytes = cls._proof_audit_require_int(
+            snapshot_raw["bytes"], "snapshot bytes"
+        )
+        snapshot_segments = cls._proof_audit_require_int(
+            snapshot_raw["segments"], "snapshot segment count"
+        )
+        snapshot_entries = cls._proof_audit_require_int(
+            snapshot_raw["entries"], "snapshot entry count"
+        )
+        dropped_raw = snapshot_raw["dropped"]
+        if dropped_raw is not None:
+            if not isinstance(dropped_raw, dict) or set(
+                dropped_raw
+            ) != {"digest", "entries", "first_at", "last_at"}:
+                raise ValueError("checkpoint dropped proof is malformed")
+            cls._proof_audit_require_digest(
+                dropped_raw["digest"], "dropped prefix digest"
+            )
+        evidence_ref = snapshot_raw["evidence"]
+        if evidence_ref is not None:
+            cls._proof_audit_require_digest(
+                evidence_ref, "snapshot evidence digest"
+            )
+        if (dropped_raw is None) != (evidence_ref is None):
+            raise ValueError(
+                "checkpoint snapshot dropped proof and evidence disagree"
+            )
+        segments_raw = raw["segments"]
+        if not isinstance(segments_raw, list):
+            raise ValueError("checkpoint segments must be a list")
+        segments: list[dict[str, Any]] = []
+        segment_entries: list[tuple[dict[str, Any], ...]] = []
+        all_pairs: list[tuple[int, tuple[str, ...]]] = []
+        previous_index: int | None = None
+        previous_digest = (
+            cls._DIAGNOSTIC_LEDGER_GENESIS_PREV
+            if dropped_raw is None
+            else dropped_raw["digest"]
+        )
+        total_entries = 0
+        cross_previous_at: int | None = None
+        for segment_raw in segments_raw:
+            if not isinstance(segment_raw, dict) or set(segment_raw) != {
+                "name",
+                "index",
+                "prev",
+                "digest",
+                "entries",
+                "first_at",
+                "last_at",
+                "body",
+            }:
+                raise ValueError("checkpoint segment is malformed")
+            index = cls._proof_audit_require_int(
+                segment_raw["index"], "segment index"
+            )
+            if index < 1:
+                raise ValueError("checkpoint segment index is malformed")
+            name = segment_raw["name"]
+            if (
+                not isinstance(name, str)
+                or cls._diagnostic_ledger_segment_index(name) != index
+            ):
+                raise ValueError("checkpoint segment name is malformed")
+            if (
+                previous_index is not None
+                and index != previous_index + 1
+            ):
+                raise ValueError("checkpoint segments are not contiguous")
+            prev = cls._proof_audit_require_digest(
+                segment_raw["prev"], "segment predecessor"
+            )
+            if prev != previous_digest:
+                raise ValueError("checkpoint segment chain is broken")
+            digest = cls._proof_audit_require_digest(
+                segment_raw["digest"], "segment digest"
+            )
+            entry_count = cls._proof_audit_require_int(
+                segment_raw["entries"], "segment entry count"
+            )
+            if entry_count < 1:
+                raise ValueError(
+                    "checkpoint segment entry count is malformed"
+                )
+            first_at = cls._proof_audit_require_int(
+                segment_raw["first_at"], "segment time"
+            )
+            last_at = cls._proof_audit_require_int(
+                segment_raw["last_at"], "segment time"
+            )
+            if first_at > last_at:
+                raise ValueError(
+                    "checkpoint segment time bounds are reversed"
+                )
+            body_raw = segment_raw["body"]
+            if not isinstance(body_raw, list) or len(body_raw) != entry_count:
+                raise ValueError(
+                    "checkpoint segment body does not match its count"
+                )
+            pairs: list[tuple[int, tuple[str, ...]]] = []
+            entries: list[dict[str, Any]] = []
+            previous_at: int | None = None
+            for body_entry in body_raw:
+                entry = cls._proof_audit_parse_entry(body_entry)
+                if previous_at is not None and entry["at"] < previous_at:
+                    raise ValueError(
+                        "checkpoint segment entries are not in time order"
+                    )
+                pairs.append((entry["at"], entry["records"]))
+                entries.append(entry)
+                all_pairs.append((entry["at"], entry["records"]))
+                previous_at = entry["at"]
+            if pairs[0][0] != first_at or pairs[-1][0] != last_at:
+                raise ValueError(
+                    "checkpoint segment time bounds do not match its body"
+                )
+            if (
+                cross_previous_at is not None
+                and pairs[0][0] < cross_previous_at
+            ):
+                raise ValueError(
+                    "checkpoint segments are not in time order"
+                )
+            cross_previous_at = pairs[-1][0]
+            segment_bytes = cls._diagnostic_ledger_segment_document(
+                index, prev, pairs
+            )
+            rebuilt_digest = hashlib.sha256(segment_bytes).hexdigest()
+            if not hmac.compare_digest(rebuilt_digest, digest):
+                raise ValueError(
+                    "checkpoint segment digest does not match its body"
+                )
+            total_entries += entry_count
+            segments.append(
+                {
+                    "name": name,
+                    "index": index,
+                    "prev": prev,
+                    "digest": digest,
+                    "entries": entry_count,
+                    "first_at": first_at,
+                    "last_at": last_at,
+                }
+            )
+            segment_entries.append(tuple(entries))
+            previous_index = index
+            previous_digest = digest
+        if not segments:
+            if dropped_raw is not None:
+                raise ValueError(
+                    "checkpoint rotated-prefix boundary cannot be located "
+                    "without retained segments"
+                )
+        else:
+            start_index = segments[0]["index"]
+            if dropped_raw is None and start_index != 1:
+                raise ValueError(
+                    "checkpoint retained chain does not start at genesis"
+                )
+            if dropped_raw is not None and start_index < 2:
+                raise ValueError(
+                    "checkpoint rotated-prefix proof covers no segment"
+                )
+        if total_entries != snapshot_entries:
+            raise ValueError(
+                "checkpoint snapshot entry count does not match segments"
+            )
+        if len(segments) != snapshot_segments:
+            raise ValueError(
+                "checkpoint snapshot segment count does not match"
+            )
+        evidence_raw = raw["evidence"]
+        if not isinstance(evidence_raw, list):
+            raise ValueError("checkpoint prefix evidence must be a list")
+        evidence_identities: list[str] = []
+        evidence_seen: set[str] = set()
+        for identity in evidence_raw:
+            cls._proof_audit_require_digest(
+                identity, "prefix evidence identity"
+            )
+            if identity in evidence_seen:
+                raise ValueError(
+                    "checkpoint prefix evidence repeats an identity"
+                )
+            evidence_seen.add(identity)
+            evidence_identities.append(identity)
+        if dropped_raw is None:
+            if evidence_identities:
+                raise ValueError(
+                    "checkpoint carries prefix evidence without a dropped "
+                    "prefix"
+                )
+            dropped = None
+        else:
+            dropped_entries = cls._proof_audit_require_int(
+                dropped_raw["entries"], "dropped entry count"
+            )
+            if dropped_entries < 1:
+                raise ValueError("checkpoint dropped entry count malformed")
+            dropped_first = cls._proof_audit_require_int(
+                dropped_raw["first_at"], "dropped time"
+            )
+            dropped_last = cls._proof_audit_require_int(
+                dropped_raw["last_at"], "dropped time"
+            )
+            if dropped_first > dropped_last:
+                raise ValueError(
+                    "checkpoint dropped time bounds are reversed"
+                )
+            if len(evidence_identities) != dropped_entries:
+                raise ValueError(
+                    "checkpoint prefix evidence does not match the dropped "
+                    "entry count"
+                )
+            dropped = {
+                "digest": dropped_raw["digest"],
+                "entries": dropped_entries,
+                "first_at": dropped_first,
+                "last_at": dropped_last,
+            }
+        rotated_raw = raw["rotated"]
+        if not isinstance(rotated_raw, list):
+            raise ValueError("checkpoint rotated identities malformed")
+        rotated_seen: set[str] = set()
+        rotated: list[str] = []
+        for identity in rotated_raw:
+            if not isinstance(identity, str) or not identity:
+                raise ValueError("checkpoint rotated identities malformed")
+            if identity in rotated_seen:
+                raise ValueError(
+                    "checkpoint rotated identities repeat"
+                )
+            rotated_seen.add(identity)
+            rotated.append(identity)
+        # Re-authenticate every embedded diagnostic chain exactly as the
+        # proof pipeline would: one transaction identity per chain, no
+        # identity retained twice across the whole retained history.
+        try:
+            summaries = cls._authenticate_recovery_diagnostic_chains(
+                tuple(chain for _at, chain in all_pairs)
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"checkpoint embedded chains do not authenticate: {exc}"
+            ) from exc
+        # Canonical (time, transaction) ordering across all embedded
+        # bodies, exactly as the proof pipeline requires.
+        keys = [
+            (at, summaries[position]["transaction"])
+            for position, (at, _chain) in enumerate(all_pairs)
+        ]
+        if keys != sorted(keys):
+            raise ValueError(
+                "checkpoint entries are not in canonical order"
+            )
+        retained_identities: set[str] = set()
+        for summary in summaries:
+            if summary["transaction"] in retained_identities:
+                raise ValueError(
+                    "checkpoint one transaction is retained more than once"
+                )
+            retained_identities.add(summary["transaction"])
+        offset = 0
+        rebuilt_segment_entries: list[
+            tuple[dict[str, Any], ...]
+        ] = []
+        for entries in segment_entries:
+            rebuilt: list[dict[str, Any]] = []
+            for entry in entries:
+                summary = summaries[offset]
+                if summary != entry["summary"]:
+                    raise ValueError(
+                        "checkpoint entry summary does not authenticate "
+                        "its records"
+                    )
+                rebuilt.append(
+                    {
+                        "at": entry["at"],
+                        "summary": dict(summary),
+                        "records": entry["records"],
+                    }
+                )
+                offset += 1
+            rebuilt_segment_entries.append(tuple(rebuilt))
+        if offset != len(summaries):
+            raise ValueError("checkpoint entry summaries are inconsistent")
+        # Bind the stored snapshot cryptographically to the view by
+        # rebuilding the exact evidence and manifest documents and
+        # recomputing the snapshot summary, digest and byte count.
+        if dropped is None:
+            rebuilt_evidence_digest = None
+        else:
+            evidence_bytes = cls._diagnostic_ledger_evidence_document(
+                list(evidence_identities), dropped
+            )
+            rebuilt_evidence_digest = hashlib.sha256(
+                evidence_bytes
+            ).hexdigest()
+            if not hmac.compare_digest(
+                rebuilt_evidence_digest, evidence_ref
+            ):
+                raise ValueError(
+                    "checkpoint snapshot evidence digest does not match "
+                    "the prefix evidence"
+                )
+        manifest_raw = cls._diagnostic_ledger_manifest_document(
+            segments, dropped, rebuilt_evidence_digest
+        )
+        rebuilt_snapshot = cls._diagnostic_ledger_proof_snapshot(
+            manifest_raw,
+            json.loads(manifest_raw.decode("utf-8")),
+            segments,
+            rebuilt_evidence_digest,
+        )
+        snapshot = {
+            "digest": snapshot_digest,
+            "bytes": snapshot_bytes,
+            "segments": snapshot_segments,
+            "entries": snapshot_entries,
+            "dropped": None if dropped is None else dict(dropped),
+            "evidence": evidence_ref,
+        }
+        if snapshot != rebuilt_snapshot:
+            raise ValueError(
+                "checkpoint snapshot does not authenticate its manifest"
+            )
+        view = {
+            "segments": segments,
+            "dropped": dropped,
+            "evidence": tuple(evidence_identities),
+            "segment_entries": tuple(rebuilt_segment_entries),
+        }
+        return {
+            "snapshot": snapshot,
+            "view": view,
+            "rotated": tuple(rotated),
+        }
+
+    @classmethod
+    def _proof_audit_check_final_hop(
+        cls, view: dict[str, Any], hop: dict[str, Any]
+    ) -> None:
+        """Verify a sealed final hop's right-hand unique segments are
+        exactly the segments the persisted last-proof view carries past
+        the hop's own common boundary, binding the hop record to the
+        last evidence. Raises :class:`ValueError` on disagreement."""
+        expected_after = (
+            cls._copy_diagnostic_ledger_proof_segment_items(
+                cls._diagnostic_ledger_proof_unique_segments(
+                    view, hop["common"]
+                )
+            )
+        )
+        if hop["after_only"] != expected_after:
+            raise ValueError(
+                "checkpoint final hop does not match the last proof"
+            )
+
+    @classmethod
+    def _parse_proof_audit_state(cls, body: Any) -> dict[str, Any]:
+        """Validate every cross-field invariant of a checksum-verified
+        checkpoint state and rebuild it."""
+        keys = {
+            "v",
+            "n",
+            "ids",
+            "b0",
+            "bn",
+            "last",
+            "hops",
+            "status",
+            "failure",
+        }
+        if not isinstance(body, dict) or set(body) != keys:
+            raise ValueError("checkpoint state has bad keys")
+        version = body["v"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version
+            not in cls._PROOF_AUDIT_CHECKPOINT_SUPPORTED_VERSIONS
+        ):
+            raise ValueError("checkpoint has an unsupported state version")
+        n = cls._proof_audit_require_int(body["n"], "proof count")
+        ids_raw = body["ids"]
+        identities: tuple[str, ...] | None
+        if ids_raw is None:
+            identities = None
+        else:
+            if not isinstance(ids_raw, list) or not ids_raw:
+                raise ValueError(
+                    "checkpoint transaction identities are malformed"
+                )
+            id_seen: set[str] = set()
+            identities_list: list[str] = []
+            for identity in ids_raw:
+                # The requested ordered identity set follows the proof
+                # filter rules: any distinct non-empty str (an identity
+                # absent from the ledger need not be a digest).
+                if not isinstance(identity, str) or not identity:
+                    raise ValueError(
+                        "checkpoint transaction identities are malformed"
+                    )
+                if identity in id_seen:
+                    raise ValueError(
+                        "checkpoint transaction identities repeat"
+                    )
+                id_seen.add(identity)
+                identities_list.append(identity)
+            identities = tuple(identities_list)
+        if n == 0:
+            if identities is not None:
+                raise ValueError(
+                    "checkpoint initial state must not carry identities"
+                )
+        elif identities is None:
+            raise ValueError(
+                "checkpoint with proofs must carry the identity set"
+            )
+        first_common = cls._proof_audit_parse_boundary(body["b0"])
+        common = cls._proof_audit_parse_boundary(body["bn"])
+        last_raw = body["last"]
+        if n == 0:
+            if last_raw is not None:
+                raise ValueError(
+                    "checkpoint initial state must not carry a last proof"
+                )
+            last: dict[str, Any] | None = None
+        else:
+            if last_raw is None:
+                raise ValueError(
+                    "checkpoint with proofs must carry the last-proof view"
+                )
+            last = cls._proof_audit_parse_last(last_raw)
+        hops_raw = body["hops"]
+        if not isinstance(hops_raw, list):
+            raise ValueError("checkpoint hops must be a list")
+        hops: list[dict[str, Any]] = []
+        expected_index = 1
+        for raw in hops_raw:
+            hop = cls._proof_audit_parse_hop(raw, expected_index)
+            hops.append(hop)
+            expected_index += 1
+        status = body["status"]
+        if status not in ("empty", "continuous", "failed"):
+            raise ValueError("checkpoint status is malformed")
+        failure_raw = body["failure"]
+        failure: dict[str, Any] | None
+        if failure_raw is None:
+            failure = None
+        else:
+            if not isinstance(failure_raw, dict) or set(
+                failure_raw
+            ) != {"index", "classification"}:
+                raise ValueError("checkpoint failure is malformed")
+            failure_index = cls._proof_audit_require_int(
+                failure_raw["index"], "failure index"
+            )
+            classification = failure_raw["classification"]
+            if (
+                classification
+                not in cls._PROOF_AUDIT_CHECKPOINT_FAILURES
+            ):
+                raise ValueError(
+                    "checkpoint failure classification is malformed"
+                )
+            failure = {
+                "index": failure_index,
+                "classification": classification,
+            }
+        # Cross-field self-consistency.
+        if n == 0:
+            if status != "empty" or hops or failure is not None:
+                raise ValueError(
+                    "checkpoint initial state is not self-consistent"
+                )
+            if first_common is not None or common is not None:
+                raise ValueError(
+                    "checkpoint initial state is not self-consistent"
+                )
+            return cls._initial_proof_audit_state()
+        if status not in ("continuous", "failed"):
+            raise ValueError("checkpoint status is not self-consistent")
+        expected_hops = n - 1
+        if len(hops) > expected_hops:
+            raise ValueError(
+                "checkpoint hop count does not match its proof count"
+            )
+        # The last proof view must agree with the cumulative state.
+        assert last is not None and identities is not None
+        view = last["view"]
+        tail_boundary = (
+            cls._diagnostic_ledger_proof_chain_boundary(view)
+        )
+        tail_boundary = cls._copy_diagnostic_ledger_proof_boundary(
+            tail_boundary
+        )
+        rotated_set = set(last["rotated"])
+        if not rotated_set <= set(identities):
+            raise ValueError(
+                "checkpoint rotated identities are outside the identity set"
+            )
+        evidence_set = set(view["evidence"])
+        retained_set: set[str] = set()
+        for segment in view["segment_entries"]:
+            for entry in segment:
+                retained_set.add(entry["summary"]["transaction"])
+        if evidence_set & retained_set:
+            raise ValueError(
+                "checkpoint prefix evidence repeats a retained identity"
+            )
+        if status == "continuous":
+            if failure is not None or len(hops) != expected_hops:
+                raise ValueError(
+                    "checkpoint continuous state is not self-consistent"
+                )
+            for hop in hops:
+                if hop["relation"] not in ("same", "continued"):
+                    raise ValueError(
+                        "checkpoint continuous state carries a failing hop"
+                    )
+            if not hops:
+                # A single proof: the first boundary is its own tail.
+                if first_common != tail_boundary:
+                    raise ValueError(
+                        "checkpoint first boundary does not match the "
+                        "last proof"
+                    )
+            else:
+                cls._proof_audit_check_final_hop(view, hops[-1])
+            if common != first_common:
+                raise ValueError(
+                    "checkpoint common boundary is not self-consistent"
+                )
+        else:
+            # A failed audit seals at the first failing hop: proofs
+            # beyond it were authenticated but never analysed, so the
+            # hop count may be below n - 1 and the last view is the
+            # failing hop's right-hand proof.
+            if failure is None or not hops or n < 2:
+                raise ValueError(
+                    "checkpoint failed state is not self-consistent"
+                )
+            for hop in hops[:-1]:
+                if hop["relation"] not in ("same", "continued"):
+                    raise ValueError(
+                        "checkpoint hops after a terminal failure"
+                    )
+            terminal_hop = hops[-1]
+            if terminal_hop["relation"] != failure["classification"]:
+                raise ValueError(
+                    "checkpoint failure does not match its terminal hop"
+                )
+            if failure["index"] != terminal_hop["index"]:
+                raise ValueError(
+                    "checkpoint failure index does not match its hop"
+                )
+            if failure["index"] != len(hops) or failure["index"] > n - 1:
+                raise ValueError(
+                    "checkpoint failure index is not self-consistent"
+                )
+            # The terminal hop's after-side must be exactly the unique
+            # segments the sealed last proof carries past its boundary.
+            cls._proof_audit_check_final_hop(view, terminal_hop)
+            recomputed_common = cls._proof_audit_common_with_pair(
+                first_common, terminal_hop["common"]
+            )
+            if common != recomputed_common:
+                raise ValueError(
+                    "checkpoint common boundary is not self-consistent"
+                )
+        return {
+            "n": n,
+            "identities": identities,
+            "first_common": first_common,
+            "last_view": view,
+            "last_snapshot": last["snapshot"],
+            "last_rotated": last["rotated"],
+            "hops": tuple(hops),
+            "common": common,
+            "status": status,
+            "failure": failure,
+        }
 
     @classmethod
     def _publish_caches_recovery_locked(
