@@ -19783,6 +19783,154 @@ class BranchStore:
             "churn",
         )
 
+    def lifetime_churn_streaks(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Split identity lifetime churn into consecutive-change streaks.
+
+        Shares every public input and token semantic of
+        :meth:`lifetime_churn`, appending one further cap,
+        ``streak_limit``, validated immediately after ``churn_limit`` and
+        still before any state is queried; it must be a non-``bool``
+        :class:`int` (else :class:`TypeError`) of at least one (else
+        :class:`ValueError`). The ordinary inputs keep exactly
+        :meth:`lifetime_churn`'s validation order, exception types,
+        resource caps and frozen-view state lookups; ``churn_limit``
+        itself is checked but never limits this query, since only
+        identities with at least one change produce records here. Every
+        window and adjacent segment is computed on the one frozen view
+        captured by :meth:`_capture_frontier_view`, with the same
+        per-window node/change/lifetime caps, per-segment diff cap, total
+        diff cap and single-read token reserve/refund semantics; the
+        event graph, branch heads, audit and idempotency records and
+        snapshots are never modified.
+
+        The result is a fresh dict whose keys are ordered
+        ``streaks, totals``. For each node, edge or gap identity, its
+        segment changes are walked in segment order: every maximal run of
+        adjacent segments on which the identity changes becomes one
+        streak, so a segment without a change for that identity cuts it,
+        a single changing segment is a streak on its own, and an identity
+        present in the first window without changing anywhere produces no
+        record. An identity removed on one segment and re-added on the
+        very next segment is still one uninterrupted streak.
+
+        Each streak record is a fresh dict whose keys are ordered
+        ``type, identity, from, to, segments, added, removed, changed,
+        changes``: ``from`` is the run's first segment's left window
+        position, ``to`` its last segment's right window position,
+        ``segments`` the consecutive segment count, the three counters
+        count the run's classifications, and ``changes`` keeps, in
+        segment order, one fresh ``from, to, kind, before, after`` dict
+        per segment with :meth:`lifetime_churn`'s evidence semantics (the
+        missing side is ``None``).
+
+        Records sort by ``added + removed + changed`` descending; ties
+        keep ``from`` then ``to`` ascending, then the node, edge, gap
+        type order and the identities' deterministic encounter order as
+        the segments run (node before edge before gap within a segment).
+        ``totals`` is a fresh dict with keys ordered ``streaks,
+        identities, added, removed, changed``: ``streaks`` is the record
+        count, ``identities`` the number of distinct identities that
+        produce one, and the other three sum the record counters. Empty
+        ``windows``, empty ``causes`` or a batch with no change return an
+        empty ``streaks`` tuple and five zero totals. When the complete
+        streak count exceeds ``streak_limit`` a :class:`ValueError` is
+        raised and no partial result is returned. Objects at every level
+        are freshly built and share nothing with each other or internal
+        state.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The windows batch, the slice inputs and every existing cap are
+        # checked exactly as in lifetime_churn; streak_limit follows
+        # churn_limit and still precedes every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+        return self._run_lifetime_window_batch(
+            validated,
+            index_windows,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+            lifetime_limit_value,
+            diff_limit_value,
+            total_diff_limit_value,
+            churn_limit_value,
+            token,
+            "streaks",
+            streak_limit_value,
+        )
+
     def _run_lifetime_window_batch(
         self,
         validated: dict[str, object],
@@ -19798,18 +19946,21 @@ class BranchStore:
         churn_limit_value: int | None,
         token: str | None,
         result_kind: str,
+        streak_limit_value: int | None = None,
     ) -> dict[str, object]:
         """Build every window and adjacent segment on one frozen view.
 
-        Shared by :meth:`lifetime_evolution` and
-        :meth:`lifetime_churn` so both run the same state checks, caps
-        and token reserve/refund semantics over one identical window
-        batch. ``result_kind`` selects the assembled shape:
-        ``"evolution"`` returns the ``windows``/``segments`` dict and
-        ignores ``churn_limit_value``; ``"churn"`` returns the
-        aggregated ``identities``/``totals`` dict, enforcing
-        ``churn_limit_value`` only after every full record set is
-        known.
+        Shared by :meth:`lifetime_evolution`, :meth:`lifetime_churn`
+        and :meth:`lifetime_churn_streaks` so all three run the same
+        state checks, caps and token reserve/refund semantics over one
+        identical window batch. ``result_kind`` selects the assembled
+        shape: ``"evolution"`` returns the ``windows``/``segments`` dict
+        and ignores both record caps; ``"churn"`` returns the aggregated
+        ``identities``/``totals`` dict, enforcing ``churn_limit_value``
+        only after every full record set is known; ``"streaks"`` returns
+        the ``streaks``/``totals`` dict, validating ``churn_limit_value``
+        as an input but enforcing only ``streak_limit_value`` after every
+        full streak is known.
         """
         # Token checks come after every ordinary parameter. Without a token
         # the query runs on live state exactly as before; with one, the read
@@ -19875,6 +20026,10 @@ class BranchStore:
             if result_kind == "churn":
                 result = view._build_lifetime_churn_result(
                     window_records, segment_changes, churn_limit_value
+                )
+            elif result_kind == "streaks":
+                result = view._build_lifetime_churn_streaks(
+                    segment_changes, streak_limit_value
                 )
             else:
                 result = {
@@ -20072,6 +20227,172 @@ class BranchStore:
             "identities": tuple(records),
             "totals": {
                 "identities": len(records),
+                "added": total_added,
+                "removed": total_removed,
+                "changed": total_changed,
+            },
+        }
+
+    @staticmethod
+    def _build_lifetime_churn_streaks(
+        segment_changes: list[tuple[dict[str, object], ...]],
+        streak_limit_value: int | None,
+    ) -> dict[str, object]:
+        """Split every identity's segment changes into adjacent runs.
+
+        Used only by :meth:`lifetime_churn_streaks`. Segment positions
+        run in order; for each node, edge or gap identity, a change on a
+        segment adjacent to the previous change extends the current
+        streak, while a segment with no change for that identity closes
+        it and the next change opens a new one. A single changing segment
+        is a streak on its own; an identity that exists in the first
+        window but never changes is never seen here and produces no
+        record. A removal followed by a re-add on the very next segment
+        stays in the same streak, since both segments carry a change.
+
+        Each streak copies its evidence afresh and keeps keys ordered
+        ``type, identity, from, to, segments, added, removed, changed,
+        changes``. Streaks are visited per identity in the deterministic
+        order the identities are first encountered as the segments run,
+        then sorted by the change total descending, then ``from`` and
+        ``to`` ascending, then the node, edge, gap grouping and first
+        encounter order. The complete set is built before the
+        ``streak_limit`` cap is enforced, so an over-limit query raises
+        :class:`ValueError` without returning partial streaks.
+        """
+        type_order = {"node": 0, "edge": 1, "gap": 2}
+
+        # key -> encounter ordinal, assigned the first segment the
+        # identity changes on; segments are walked in order and changes
+        # keep their per-segment node, edge, gap ordering, so the
+        # ordinal is the deterministic identity order the records tie on.
+        encounter: dict[tuple[str, object], int] = {}
+        next_encounter = 0
+        # key -> open run accumulator, replaced when a segment is skipped.
+        open_run: dict[
+            tuple[str, object], dict[str, object]
+        ] = {}
+        finished: list[dict[str, object]] = []
+
+        def close_run(key: tuple[str, object]) -> None:
+            run = open_run.pop(key)
+            run["encounter"] = encounter[key]
+            finished.append(run)
+
+        for position, changes in enumerate(segment_changes):
+            changed_keys: set[tuple[str, object]] = set()
+            for change in changes:
+                type_name = change["kind"].split("_", 1)[0]
+                key = (type_name, change["identity"])
+                changed_keys.add(key)
+                if key not in encounter:
+                    encounter[key] = next_encounter
+                    next_encounter += 1
+                kind = change["kind"]
+                if kind.endswith("_added"):
+                    counter = "added"
+                elif kind.endswith("_removed"):
+                    counter = "removed"
+                else:
+                    counter = "changed"
+                before = change["before"]
+                after = change["after"]
+                evidence = {
+                    "from": position,
+                    "to": position + 1,
+                    "kind": kind,
+                    "before": (
+                        None
+                        if before is None
+                        else BranchStore._copy_lifetime_record(before)
+                    ),
+                    "after": (
+                        None
+                        if after is None
+                        else BranchStore._copy_lifetime_record(after)
+                    ),
+                }
+                run = open_run.get(key)
+                if run is None or run["to"] != position:
+                    # Either this is the identity's first change or the
+                    # previous segment carried none for it, so a new run
+                    # starts here; an interrupted earlier run is closed.
+                    if run is not None:
+                        close_run(key)
+                    run = {
+                        "type": type_name,
+                        "identity": BranchStore._freeze_lifetime_value(
+                            key[1]
+                        ),
+                        "from": position,
+                        "to": position + 1,
+                        "added": 0,
+                        "removed": 0,
+                        "changed": 0,
+                        "changes": [],
+                    }
+                    open_run[key] = run
+                else:
+                    run["to"] = position + 1
+                run[counter] += 1
+                run["changes"].append(evidence)
+
+            # A streak ends when an identity's open run reaches this
+            # segment's left side but the identity does not change on
+            # this segment: run["to"] == position means the run's last
+            # segment was position - 1, exactly adjacent to this gap.
+            for key, run in tuple(open_run.items()):
+                if key not in changed_keys and run["to"] == position:
+                    close_run(key)
+
+        for key in tuple(open_run):
+            close_run(key)
+
+        ordered = sorted(
+            finished,
+            key=lambda run: (
+                -(run["added"] + run["removed"] + run["changed"]),
+                run["from"],
+                run["to"],
+                type_order[run["type"]],
+                run["encounter"],
+            ),
+        )
+        if len(ordered) > streak_limit_value:
+            raise ValueError(
+                f"lifetime churn streak limit exceeded: {len(ordered)} "
+                f"streak records, limit is {streak_limit_value}"
+            )
+
+        total_added = 0
+        total_removed = 0
+        total_changed = 0
+        records: list[dict[str, object]] = []
+        for run in ordered:
+            added_count = run["added"]
+            removed_count = run["removed"]
+            changed_count = run["changed"]
+            total_added += added_count
+            total_removed += removed_count
+            total_changed += changed_count
+            records.append(
+                {
+                    "type": run["type"],
+                    "identity": run["identity"],
+                    "from": run["from"],
+                    "to": run["to"],
+                    "segments": run["to"] - run["from"],
+                    "added": added_count,
+                    "removed": removed_count,
+                    "changed": changed_count,
+                    "changes": tuple(run["changes"]),
+                }
+            )
+        return {
+            "streaks": tuple(records),
+            "totals": {
+                "streaks": len(records),
+                "identities": len(encounter),
                 "added": total_added,
                 "removed": total_removed,
                 "changed": total_changed,
