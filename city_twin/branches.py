@@ -19644,6 +19644,7 @@ class BranchStore:
             diff_limit_value,
             total_diff_limit_value,
             None,
+            None,
             token,
             "evolution",
         )
@@ -19779,8 +19780,154 @@ class BranchStore:
             diff_limit_value,
             total_diff_limit_value,
             churn_limit_value,
+            None,
             token,
             "churn",
+        )
+
+    def lifetime_churn_streaks(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Locate the high-disturbance runs of identity lifetime churn.
+
+        Shares every public input, parameter order and token semantic of
+        :meth:`lifetime_churn`, appending one further cap,
+        ``streak_limit``, validated last -- after ``churn_limit`` and
+        still before any state is queried; it must be a non-``bool``
+        :class:`int` (else :class:`TypeError`) of at least one (else
+        :class:`ValueError`). Every window and adjacent segment is
+        computed on the one frozen view captured by
+        :meth:`_capture_frontier_view`, with exactly the same state
+        checks, per-window node/change/lifetime caps, per-segment diff
+        cap, total diff cap and single-read token reserve/refund
+        semantics as :meth:`lifetime_churn`; ``churn_limit`` is accepted
+        and validated identically but does not bound a streaks query. The
+        event graph, branch heads, audit and idempotency records and
+        snapshots are never modified, and a tokenized success consumes
+        exactly one read while any failure refunds it.
+
+        The result is a fresh dict whose keys are ordered
+        ``streaks, totals``. A node, edge or gap identity that has an
+        ``added``, ``removed`` or ``changed`` record on consecutive
+        adjacent segments forms one streak: a segment without a change
+        for that identity cuts it, a single changed segment is a streak
+        on its own, and an identity present but unchanged in the first
+        window produces no record. An identity removed on one segment and
+        re-added on the next keeps one continuous streak. Each record is a
+        fresh dict whose keys are ordered ``type, identity, from, to,
+        segments, added, removed, changed, changes``: ``from`` is the
+        first segment's left window position, ``to`` the last segment's
+        right window position, ``segments`` counts the consecutive
+        changed segments, the three counters count that streak's
+        additions, removals and changes, and ``changes`` keeps, in segment
+        order, one fresh ``from, to, kind, before, after`` evidence dict
+        per changed segment with the existing lifetime-diff semantics
+        (the missing side is ``None``).
+
+        Records sort by their total change count
+        (``added + removed + changed``) descending; ties keep ``from``
+        then ``to`` ascending, then the node, edge, gap type grouping and
+        the identities' deterministic encounter order. ``totals`` is a
+        fresh dict with keys ordered ``streaks, identities, added,
+        removed, changed``: ``streaks`` is the record count,
+        ``identities`` the number of distinct identities that produce one,
+        and the three counters sum every record. Empty ``windows``, empty
+        ``causes`` or a batch with no changes return an empty ``streaks``
+        tuple and five zero totals. When the final streak count exceeds
+        ``streak_limit`` a :class:`ValueError` is raised and no partial
+        result is returned. Objects at every level are freshly built and
+        share nothing with each other or internal state.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The windows batch, the slice inputs and every existing cap --
+        # including churn_limit -- are checked exactly as in
+        # lifetime_churn; streak_limit is validated last and still
+        # precedes every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+        return self._run_lifetime_window_batch(
+            validated,
+            index_windows,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+            lifetime_limit_value,
+            diff_limit_value,
+            total_diff_limit_value,
+            churn_limit_value,
+            streak_limit_value,
+            token,
+            "streaks",
         )
 
     def _run_lifetime_window_batch(
@@ -19796,20 +19943,23 @@ class BranchStore:
         diff_limit_value: int,
         total_diff_limit_value: int,
         churn_limit_value: int | None,
+        streak_limit_value: int | None,
         token: str | None,
         result_kind: str,
     ) -> dict[str, object]:
         """Build every window and adjacent segment on one frozen view.
 
-        Shared by :meth:`lifetime_evolution` and
-        :meth:`lifetime_churn` so both run the same state checks, caps
-        and token reserve/refund semantics over one identical window
+        Shared by :meth:`lifetime_evolution`, :meth:`lifetime_churn` and
+        :meth:`lifetime_churn_streaks` so all run the same state checks,
+        caps and token reserve/refund semantics over one identical window
         batch. ``result_kind`` selects the assembled shape:
         ``"evolution"`` returns the ``windows``/``segments`` dict and
-        ignores ``churn_limit_value``; ``"churn"`` returns the
-        aggregated ``identities``/``totals`` dict, enforcing
-        ``churn_limit_value`` only after every full record set is
-        known.
+        ignores both extra limits; ``"churn"`` returns the aggregated
+        ``identities``/``totals`` dict, enforcing
+        ``churn_limit_value`` only after every full record set is known;
+        ``"streaks"`` returns the ``streaks``/``totals`` dict built from
+        the same changes, enforcing ``streak_limit_value`` only once every
+        complete streak is known.
         """
         # Token checks come after every ordinary parameter. Without a token
         # the query runs on live state exactly as before; with one, the read
@@ -19875,6 +20025,10 @@ class BranchStore:
             if result_kind == "churn":
                 result = view._build_lifetime_churn_result(
                     window_records, segment_changes, churn_limit_value
+                )
+            elif result_kind == "streaks":
+                result = view._build_lifetime_churn_streaks_result(
+                    segment_changes, streak_limit_value
                 )
             else:
                 result = {
@@ -20072,6 +20226,149 @@ class BranchStore:
             "identities": tuple(records),
             "totals": {
                 "identities": len(records),
+                "added": total_added,
+                "removed": total_removed,
+                "changed": total_changed,
+            },
+        }
+
+    @staticmethod
+    def _build_lifetime_churn_streaks_result(
+        segment_changes: list[tuple[dict[str, object], ...]],
+        streak_limit_value: int | None,
+    ) -> dict[str, object]:
+        """Group each identity's churn into consecutive-segment streaks.
+
+        Used only by :meth:`lifetime_churn_streaks`. Every node, edge and
+        gap identity touched by an adjacent segment is followed across the
+        segments in order; one change (added, removed or changed) on each
+        of consecutive segments extends the same streak, while a segment
+        without a change for that identity cuts it. A single changed
+        segment is a streak on its own, so an identity present but
+        unchanged in the first window never appears; being removed on one
+        segment and re-added on the next stays one continuous streak.
+
+        Identities keep the deterministic encounter order in which the
+        segments' changes first name them. Each streak gets one fresh
+        record with ordered keys ``type, identity, from, to, segments,
+        added, removed, changed, changes``; ``from``/``to`` are the left
+        window position of the streak's first segment and the right
+        window position of its last, and ``changes`` keeps one isolated
+        ``from, to, kind, before, after`` entry per segment. Records sort
+        by total change count descending, then ``from`` and ``to``
+        ascending, then the node, edge, gap grouping and identity
+        encounter order. The complete set is built before the
+        ``streak_limit`` cap is enforced, so an over-limit query raises
+        :class:`ValueError` without returning partial records.
+        """
+        type_order = {"node": 0, "edge": 1, "gap": 2}
+        # Key -> ordered list of (segment position, change) it appears in.
+        per_identity: dict[
+            tuple[str, object], list[tuple[int, dict[str, object]]]
+        ] = {}
+        encounter: dict[tuple[str, object], int] = {}
+        next_encounter = 0
+        for position, changes in enumerate(segment_changes):
+            for change in changes:
+                type_name = change["kind"].split("_", 1)[0]
+                key = (type_name, change["identity"])
+                if key not in encounter:
+                    encounter[key] = next_encounter
+                    next_encounter += 1
+                per_identity.setdefault(key, []).append((position, change))
+
+        records: list[dict[str, object]] = []
+        for key, entries in per_identity.items():
+            type_name, identity = key
+            run: list[tuple[int, dict[str, object]]] = []
+
+            def flush(run_entries: list[tuple[int, dict[str, object]]]) -> None:
+                added_count = 0
+                removed_count = 0
+                changed_count = 0
+                evidence: list[dict[str, object]] = []
+                for run_position, change in run_entries:
+                    kind = change["kind"]
+                    if kind.endswith("_added"):
+                        added_count += 1
+                    elif kind.endswith("_removed"):
+                        removed_count += 1
+                    else:
+                        changed_count += 1
+                    before = change["before"]
+                    after = change["after"]
+                    evidence.append(
+                        {
+                            "from": run_position,
+                            "to": run_position + 1,
+                            "kind": kind,
+                            "before": (
+                                None
+                                if before is None
+                                else BranchStore._copy_lifetime_record(before)
+                            ),
+                            "after": (
+                                None
+                                if after is None
+                                else BranchStore._copy_lifetime_record(after)
+                            ),
+                        }
+                    )
+                records.append(
+                    {
+                        "type": type_name,
+                        "identity": BranchStore._freeze_lifetime_value(
+                            identity
+                        ),
+                        "from": run_entries[0][0],
+                        "to": run_entries[-1][0] + 1,
+                        "segments": len(run_entries),
+                        "added": added_count,
+                        "removed": removed_count,
+                        "changed": changed_count,
+                        "changes": tuple(evidence),
+                    }
+                )
+
+            for entry in entries:
+                if run and entry[0] != run[-1][0] + 1:
+                    flush(run)
+                    run = []
+                run.append(entry)
+            if run:
+                flush(run)
+
+        records.sort(
+            key=lambda record: (
+                -(
+                    record["added"]
+                    + record["removed"]
+                    + record["changed"]
+                ),
+                record["from"],
+                record["to"],
+                type_order[record["type"]],
+                encounter[(record["type"], record["identity"])],
+            )
+        )
+        if len(records) > streak_limit_value:
+            raise ValueError(
+                f"lifetime churn streak limit exceeded: {len(records)} "
+                f"streak records, limit is {streak_limit_value}"
+            )
+
+        total_added = 0
+        total_removed = 0
+        total_changed = 0
+        for record in records:
+            total_added += record["added"]
+            total_removed += record["removed"]
+            total_changed += record["changed"]
+        return {
+            "streaks": tuple(records),
+            "totals": {
+                "streaks": len(records),
+                "identities": len(per_identity),
                 "added": total_added,
                 "removed": total_removed,
                 "changed": total_changed,
