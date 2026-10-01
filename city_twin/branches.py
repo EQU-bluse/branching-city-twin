@@ -19720,6 +19720,305 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Summarize identity churn across every window and adjacent segment.
+
+        The read-only churn companion of :meth:`lifetime_evolution`: it is
+        called with every argument of that query in the same order and with
+        the same token semantics, appending only ``churn_limit`` after
+        ``total_diff_limit``. The same per-window lifetimes and adjacent
+        change segments are computed on the one frozen historical view
+        captured by :meth:`_capture_frontier_view`; they are then folded
+        per identity instead of being returned window by window. Nothing in
+        the event graph, branch heads, audit or idempotency records, or any
+        snapshot is modified, and a tokenized call reserves exactly one
+        read -- the aggregation spends no allowance of its own.
+
+        Validation runs in exactly :meth:`lifetime_evolution`'s order, with
+        ``churn_limit`` validated as a non-``bool`` positive :class:`int`
+        (:class:`TypeError` for a :class:`bool` or non-:class:`int`,
+        :class:`ValueError` below one) immediately after
+        ``total_diff_limit`` and before any state lookup. Unknown branches,
+        historical nodes or cause events still raise :class:`KeyError`;
+        range, duplicate-index and every existing resource cap still raise
+        :class:`ValueError` in the same order, including the per-window
+        node, change and lifetime caps and the per-segment and total diff
+        caps. Only once the full identity set is assembled is
+        ``churn_limit`` enforced: too many identity records raises
+        :class:`ValueError` with no partial result.
+
+        The result is a fresh dict whose keys are ordered ``identities,
+        totals``. ``identities`` covers every node, edge and gap that
+        appears in any window or changes in any segment; each record is a
+        fresh tuple ordered ``type, identity, present, added, removed,
+        changed, changes``. ``present`` lists the zero-based window
+        positions where the identity exists; ``added``, ``removed`` and
+        ``changed`` count the matching segment changes; and ``changes`` is
+        a segment-ordered tuple of fresh ``from, to, kind, before, after``
+        tuples reusing the existing lifecycle diff's classification and
+        both sides' evidence, with ``from``/``to`` the two window
+        positions. An identity seen only in changes has an empty
+        ``present`` and is ordered by the ``to`` of its first change.
+        Records sort by the sum of the three counters descending, ties by
+        the first presence position ascending, and any residual tie keeps
+        the existing node/edge/gap and identity order. ``totals`` is the
+        fresh tuple ``identities, added, removed, changed`` with the record
+        count and the corresponding counter totals. Empty ``windows`` or
+        ``causes`` complete every check and return an empty tuple with four
+        zeros; identical adjacent windows create no change. Every level is
+        freshly built and shares no mutable object with any other level or
+        internal state, so repeated calls return item-wise equal results.
+        """
+        # Ordinary inputs, windows, slice inputs and every existing cap are
+        # validated in exactly lifetime_evolution's order; churn_limit is
+        # the only addition, validated right after total_diff_limit and
+        # still before any state is queried.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # Exactly like lifetime_evolution: a token, when given, reserves one
+        # read before any state check and is refunded on failure, so only a
+        # fully successful churn query consumes the one frozen view.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            prepared = view._capture_frontier_view(validated)
+
+            window_records: list[tuple[dict[str, object], ...]] = []
+            for position, index_values in enumerate(index_windows):
+                snapshots, segments = view._cascade_slice_timeline_data(
+                    prepared,
+                    index_values,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                )
+                lifetimes = view._build_slice_lifetimes(snapshots, segments)
+                if len(lifetimes) > lifetime_limit_value:
+                    raise ValueError(
+                        f"lifetime churn lifetime limit exceeded: "
+                        f"{len(lifetimes)} lifetime records on window at "
+                        f"position {position}, limit is "
+                        f"{lifetime_limit_value}"
+                    )
+                window_records.append(lifetimes)
+
+            # The full per-segment change sets, with every existing diff cap
+            # enforced, are assembled before any churn aggregation or the
+            # churn cap runs, so an over-cap batch returns nothing partial.
+            segment_changes: list[tuple[dict[str, object], ...]] = []
+            total_changes = 0
+            for position in range(len(window_records) - 1):
+                changes = view._build_lifetime_changes(
+                    window_records[position], window_records[position + 1]
+                )
+                if len(changes) > diff_limit_value:
+                    raise ValueError(
+                        f"lifetime churn diff limit exceeded: "
+                        f"{len(changes)} change records on segment between "
+                        f"windows at positions {position} and {position + 1}, "
+                        f"limit is {diff_limit_value}"
+                    )
+                total_changes += len(changes)
+                segment_changes.append(changes)
+            if total_changes > total_diff_limit_value:
+                raise ValueError(
+                    f"lifetime churn total diff limit exceeded: "
+                    f"{total_changes} change records over "
+                    f"{len(segment_changes)} segment(s), limit is "
+                    f"{total_diff_limit_value}"
+                )
+
+            identities = view._build_lifetime_churn_records(
+                window_records, segment_changes
+            )
+            if len(identities) > churn_limit_value:
+                raise ValueError(
+                    f"lifetime churn limit exceeded: "
+                    f"{len(identities)} identity records, limit is "
+                    f"{churn_limit_value}"
+                )
+
+            added_total = sum(record[3] for record in identities)
+            removed_total = sum(record[4] for record in identities)
+            changed_total = sum(record[5] for record in identities)
+            result = {
+                "identities": identities,
+                "totals": (
+                    len(identities),
+                    added_total,
+                    removed_total,
+                    changed_total,
+                ),
+            }
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
+    @staticmethod
+    def _build_lifetime_churn_records(
+        window_records: list[tuple[dict[str, object], ...]],
+        segment_changes: list[tuple[dict[str, object], ...]],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Fold window lifetimes and segment changes into churn records.
+
+        Each node, edge or gap seen in any window or changed in any segment
+        gets one bucket keyed by its lifetime identity. Window scans fill
+        ``present`` positions in window order; segment scans count added,
+        removed and changed changes and append isolated
+        ``from, to, kind, before, after`` tuples in segment order. Buckets
+        are created in node, edge, gap order and, per type, in the existing
+        identity order -- window first-appearance order for present
+        identities and the segment change order for change-only identities
+        -- so a stable sort by descending counter sum and ascending first
+        position keeps that deterministic order on every residual tie.
+        """
+        buckets: dict[str, dict[object, dict[str, object]]] = {
+            "node": {},
+            "edge": {},
+            "gap": {},
+        }
+
+        def bucket_for(type_name: str, identity: object) -> dict[str, object]:
+            typed_buckets = buckets[type_name]
+            entry = typed_buckets.get(identity)
+            if entry is None:
+                entry = {
+                    "present": [],
+                    "added": 0,
+                    "removed": 0,
+                    "changed": 0,
+                    "changes": [],
+                    "first_change_to": None,
+                }
+                typed_buckets[identity] = entry
+            return entry
+
+        for position, lifetimes in enumerate(window_records):
+            for record in lifetimes:
+                entry = bucket_for(record["type"], record["identity"])
+                entry["present"].append(position)
+
+        for segment_position, changes in enumerate(segment_changes):
+            to_position = segment_position + 1
+            for change in changes:
+                type_name, kind_suffix = change["kind"].split("_", 1)
+                entry = bucket_for(type_name, change["identity"])
+                if not entry["changes"]:
+                    entry["first_change_to"] = to_position
+                entry[kind_suffix] += 1
+                entry["changes"].append(
+                    (
+                        segment_position,
+                        to_position,
+                        change["kind"],
+                        BranchStore._freeze_lifetime_value(change["before"]),
+                        BranchStore._freeze_lifetime_value(change["after"]),
+                    )
+                )
+
+        ordered: list[tuple[object, ...]] = []
+        for type_name in ("node", "edge", "gap"):
+            for identity, entry in buckets[type_name].items():
+                present = tuple(entry["present"])
+                first_position = (
+                    present[0]
+                    if present
+                    else entry["first_change_to"]
+                )
+                ordered.append(
+                    (
+                        type_name,
+                        BranchStore._freeze_lifetime_value(identity),
+                        present,
+                        entry["added"],
+                        entry["removed"],
+                        entry["changed"],
+                        tuple(entry["changes"]),
+                        first_position,
+                    )
+                )
+
+        # Stable sort: residual ties keep the node/edge/gap and identity
+        # order of the insertion-ordered buckets.
+        ordered.sort(
+            key=lambda record: (
+                -(record[3] + record[4] + record[5]),
+                record[7],
+            )
+        )
+        return tuple(record[:7] for record in ordered)
+
     @staticmethod
     def _freeze_lifetime_value(value: object) -> object:
         """Return an isolated tuple/dict-only copy of a lifetime value."""
