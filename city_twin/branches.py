@@ -19645,6 +19645,8 @@ class BranchStore:
             total_diff_limit_value,
             None,
             None,
+            None,
+            None,
             token,
             "evolution",
         )
@@ -19780,6 +19782,8 @@ class BranchStore:
             diff_limit_value,
             total_diff_limit_value,
             churn_limit_value,
+            None,
+            None,
             None,
             token,
             "churn",
@@ -19926,8 +19930,170 @@ class BranchStore:
             total_diff_limit_value,
             churn_limit_value,
             streak_limit_value,
+            None,
+            None,
             token,
             "streaks",
+        )
+
+    def lifetime_churn_waves(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Locate the multi-identity instability waves of lifetime churn.
+
+        Shares every public input, parameter order and token semantic of
+        :meth:`lifetime_churn_streaks`, appending two further parameters,
+        ``min_identities`` and ``wave_limit``, validated in that order
+        after ``streak_limit`` and still before any state is queried;
+        each must be a non-``bool`` :class:`int` (else
+        :class:`TypeError`) of at least one (else :class:`ValueError`).
+        Every window and adjacent segment is computed on the one frozen
+        view captured by :meth:`_capture_frontier_view`, with exactly the
+        same state checks, per-window node/change/lifetime caps,
+        per-segment diff cap, total diff cap and single-read token
+        reserve/refund semantics as :meth:`lifetime_churn_streaks`;
+        ``churn_limit`` and ``streak_limit`` are accepted and validated
+        identically but do not bound a waves query. The event graph,
+        branch heads, audit and idempotency records and snapshots are
+        never modified, and a tokenized success consumes exactly one
+        read while any failure refunds it.
+
+        The result is a fresh dict whose keys are ordered
+        ``waves, totals``. A wave is a maximal run of consecutive
+        adjacent segments on each of which at least ``min_identities``
+        distinct node, edge or gap identities carry an ``added``,
+        ``removed`` or ``changed`` record; a segment below the threshold
+        cuts the run, and the next qualifying segment starts a new wave.
+        Each wave record is a fresh dict whose keys are ordered ``from,
+        to, segments, identities, added, removed, changed, members,
+        changes``: ``from`` is the first segment's left window position,
+        ``to`` the last segment's right window position, ``segments``
+        counts the run's segments, ``identities`` counts the distinct
+        identities churning anywhere in the wave, and the three counters
+        sum every change record of the wave's segments. ``members`` keeps
+        one fresh dict per distinct identity with keys ordered ``type,
+        identity, segments, added, removed, changed`` -- ``segments``
+        counting the wave's segments the identity churns on -- sorted by
+        segment count descending, then total change count descending,
+        then the identity's first segment in the wave ascending, then
+        the node, edge, gap type grouping and the wave's deterministic
+        encounter order. ``changes`` keeps, in segment order and each
+        segment's original change order, one isolated ``from, to, kind,
+        before, after`` evidence dict per change record with the
+        existing lifetime-diff semantics (the missing side is ``None``).
+
+        Waves sort by ``from`` then ``to`` ascending. ``totals`` is a
+        fresh dict with keys ordered ``waves, identities, added,
+        removed, changed``: ``waves`` is the record count, ``identities``
+        the number of distinct identities across every wave, and the
+        three counters sum every wave. Empty ``windows``, empty
+        ``causes`` or a batch with no qualifying segment return an empty
+        ``waves`` tuple and five zero totals. The complete wave set is
+        built before the ``wave_limit`` cap is enforced, so an
+        over-limit query raises :class:`ValueError` without truncating
+        or returning partial records. Objects at every level are freshly
+        built and share nothing with each other or internal state.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The windows batch, the slice inputs and every existing cap --
+        # including churn_limit and streak_limit -- are checked exactly
+        # as in lifetime_churn_streaks; min_identities and wave_limit
+        # follow in that order and still precede every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+        return self._run_lifetime_window_batch(
+            validated,
+            index_windows,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+            lifetime_limit_value,
+            diff_limit_value,
+            total_diff_limit_value,
+            churn_limit_value,
+            streak_limit_value,
+            min_identities_value,
+            wave_limit_value,
+            token,
+            "waves",
         )
 
     def _run_lifetime_window_batch(
@@ -19944,22 +20110,29 @@ class BranchStore:
         total_diff_limit_value: int,
         churn_limit_value: int | None,
         streak_limit_value: int | None,
+        min_identities_value: int | None,
+        wave_limit_value: int | None,
         token: str | None,
         result_kind: str,
     ) -> dict[str, object]:
         """Build every window and adjacent segment on one frozen view.
 
-        Shared by :meth:`lifetime_evolution`, :meth:`lifetime_churn` and
-        :meth:`lifetime_churn_streaks` so all run the same state checks,
-        caps and token reserve/refund semantics over one identical window
-        batch. ``result_kind`` selects the assembled shape:
-        ``"evolution"`` returns the ``windows``/``segments`` dict and
-        ignores both extra limits; ``"churn"`` returns the aggregated
-        ``identities``/``totals`` dict, enforcing
-        ``churn_limit_value`` only after every full record set is known;
-        ``"streaks"`` returns the ``streaks``/``totals`` dict built from
-        the same changes, enforcing ``streak_limit_value`` only once every
-        complete streak is known.
+        Shared by :meth:`lifetime_evolution`, :meth:`lifetime_churn`,
+        :meth:`lifetime_churn_streaks` and :meth:`lifetime_churn_waves`
+        so all run the same state checks, caps and token reserve/refund
+        semantics over one identical window batch. ``result_kind``
+        selects the assembled shape: ``"evolution"`` returns the
+        ``windows``/``segments`` dict and ignores every extra limit;
+        ``"churn"`` returns the aggregated ``identities``/``totals``
+        dict, enforcing ``churn_limit_value`` only after every full
+        record set is known; ``"streaks"`` returns the
+        ``streaks``/``totals`` dict built from the same changes,
+        enforcing ``streak_limit_value`` only once every complete streak
+        is known; ``"waves"`` returns the ``waves``/``totals`` dict of
+        the consecutive-segment runs where at least
+        ``min_identities_value`` distinct identities churn per segment,
+        enforcing ``wave_limit_value`` only once every complete wave is
+        known.
         """
         # Token checks come after every ordinary parameter. Without a token
         # the query runs on live state exactly as before; with one, the read
@@ -20029,6 +20202,10 @@ class BranchStore:
             elif result_kind == "streaks":
                 result = view._build_lifetime_churn_streaks_result(
                     segment_changes, streak_limit_value
+                )
+            elif result_kind == "waves":
+                result = view._build_lifetime_churn_waves_result(
+                    segment_changes, min_identities_value, wave_limit_value
                 )
             else:
                 result = {
@@ -20369,6 +20546,175 @@ class BranchStore:
             "totals": {
                 "streaks": len(records),
                 "identities": len(per_identity),
+                "added": total_added,
+                "removed": total_removed,
+                "changed": total_changed,
+            },
+        }
+
+    @staticmethod
+    def _build_lifetime_churn_waves_result(
+        segment_changes: list[tuple[dict[str, object], ...]],
+        min_identities_value: int,
+        wave_limit_value: int | None,
+    ) -> dict[str, object]:
+        """Group multi-identity churn into consecutive-segment waves.
+
+        Used only by :meth:`lifetime_churn_waves`. A segment qualifies
+        when at least ``min_identities_value`` distinct node, edge or
+        gap identities carry an ``added``, ``removed`` or ``changed``
+        record on it -- one identity appearing several times on the same
+        segment still counts once toward the threshold, while every
+        change record feeds the counters. Each maximal run of
+        consecutive qualifying segments forms one wave; a segment below
+        the threshold cuts the run and the next qualifying segment
+        starts a new wave.
+
+        Every wave gets one fresh record with ordered keys ``from, to,
+        segments, identities, added, removed, changed, members,
+        changes``; ``from``/``to`` are the left window position of the
+        run's first segment and the right window position of its last,
+        ``members`` keeps one fresh ``type, identity, segments, added,
+        removed, changed`` record per distinct identity sorted by
+        segment count and total change count descending, then the
+        identity's first segment in the wave ascending, then the node,
+        edge, gap grouping and the wave's deterministic encounter order,
+        and ``changes`` keeps one isolated ``from, to, kind, before,
+        after`` entry per change record in segment and original change
+        order. Waves sort by ``from`` then ``to`` ascending. The
+        complete set is built before the ``wave_limit`` cap is enforced,
+        so an over-limit query raises :class:`ValueError` without
+        truncating or returning partial records.
+        """
+        type_order = {"node": 0, "edge": 1, "gap": 2}
+
+        # A segment qualifies when its distinct churning identities
+        # reach min_identities_value; qualifying runs of consecutive
+        # segments become the waves.
+        runs: list[list[int]] = []
+        run: list[int] = []
+        for position, changes in enumerate(segment_changes):
+            distinct: dict[tuple[str, object], None] = {}
+            for change in changes:
+                type_name = change["kind"].split("_", 1)[0]
+                distinct[(type_name, change["identity"])] = None
+            if len(distinct) >= min_identities_value:
+                run.append(position)
+            elif run:
+                runs.append(run)
+                run = []
+        if run:
+            runs.append(run)
+
+        waves: list[dict[str, object]] = []
+        all_identities: dict[tuple[str, object], None] = {}
+        total_added = 0
+        total_removed = 0
+        total_changed = 0
+        for run_positions in runs:
+            encounter: dict[tuple[str, object], int] = {}
+            first_segment: dict[tuple[str, object], int] = {}
+            member_segments: dict[tuple[str, object], set[int]] = {}
+            member_added: dict[tuple[str, object], int] = {}
+            member_removed: dict[tuple[str, object], int] = {}
+            member_changed: dict[tuple[str, object], int] = {}
+            evidence: list[dict[str, object]] = []
+            for position in run_positions:
+                for change in segment_changes[position]:
+                    type_name = change["kind"].split("_", 1)[0]
+                    key = (type_name, change["identity"])
+                    if key not in encounter:
+                        encounter[key] = len(encounter)
+                        first_segment[key] = position
+                        member_segments[key] = set()
+                        member_added[key] = 0
+                        member_removed[key] = 0
+                        member_changed[key] = 0
+                        all_identities[key] = None
+                    member_segments[key].add(position)
+                    kind = change["kind"]
+                    if kind.endswith("_added"):
+                        member_added[key] += 1
+                    elif kind.endswith("_removed"):
+                        member_removed[key] += 1
+                    else:
+                        member_changed[key] += 1
+                    before = change["before"]
+                    after = change["after"]
+                    evidence.append(
+                        {
+                            "from": position,
+                            "to": position + 1,
+                            "kind": kind,
+                            "before": (
+                                None
+                                if before is None
+                                else BranchStore._copy_lifetime_record(before)
+                            ),
+                            "after": (
+                                None
+                                if after is None
+                                else BranchStore._copy_lifetime_record(after)
+                            ),
+                        }
+                    )
+
+            ordered_keys = sorted(
+                encounter,
+                key=lambda key: (
+                    -len(member_segments[key]),
+                    -(
+                        member_added[key]
+                        + member_removed[key]
+                        + member_changed[key]
+                    ),
+                    first_segment[key],
+                    type_order[key[0]],
+                    encounter[key],
+                ),
+            )
+            members = tuple(
+                {
+                    "type": key[0],
+                    "identity": BranchStore._freeze_lifetime_value(key[1]),
+                    "segments": len(member_segments[key]),
+                    "added": member_added[key],
+                    "removed": member_removed[key],
+                    "changed": member_changed[key],
+                }
+                for key in ordered_keys
+            )
+            wave_added = sum(member_added.values())
+            wave_removed = sum(member_removed.values())
+            wave_changed = sum(member_changed.values())
+            total_added += wave_added
+            total_removed += wave_removed
+            total_changed += wave_changed
+            waves.append(
+                {
+                    "from": run_positions[0],
+                    "to": run_positions[-1] + 1,
+                    "segments": len(run_positions),
+                    "identities": len(members),
+                    "added": wave_added,
+                    "removed": wave_removed,
+                    "changed": wave_changed,
+                    "members": members,
+                    "changes": tuple(evidence),
+                }
+            )
+
+        waves.sort(key=lambda wave: (wave["from"], wave["to"]))
+        if len(waves) > wave_limit_value:
+            raise ValueError(
+                f"lifetime churn wave limit exceeded: {len(waves)} "
+                f"wave records, limit is {wave_limit_value}"
+            )
+        return {
+            "waves": tuple(waves),
+            "totals": {
+                "waves": len(waves),
+                "identities": len(all_identities),
                 "added": total_added,
                 "removed": total_removed,
                 "changed": total_changed,

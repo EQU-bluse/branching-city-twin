@@ -35,6 +35,7 @@ tests/test_impact_budget.py
 tests/test_journal.py
 tests/test_ledger_rotation_memory.py
 tests/test_lifetime_churn.py
+tests/test_lifetime_churn_streaks.py
 tests/test_lifetime_evolution.py
 tests/test_proof_audit_checkpoints.py
 tests/test_rank_impacts.py
