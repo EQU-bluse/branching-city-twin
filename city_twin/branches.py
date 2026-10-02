@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import hashlib
 import heapq
 import hmac
@@ -21355,6 +21356,519 @@ class BranchStore:
             ):
                 totals[name] += scorecard[name]
         return {"scorecards": tuple(scorecards), "totals": totals}
+
+    def lifetime_churn_forecast_drift(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoff: int,
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Compare forecast quality before and after a split cutoff.
+
+        Reuses every public input, parameter order, validation order,
+        wave division, cutoff training, outcome classification,
+        scorecard aggregation and token semantic of
+        :meth:`lifetime_churn_forecast_scorecards`, appending
+        ``split_cutoff``, ``min_rate_drop`` and ``drift_limit`` in that
+        order after ``scorecard_limit`` (still before any state lookup)
+        and keeping the same optional trailing ``token``.
+        ``split_cutoff`` must be a non-``bool`` :class:`int` (else
+        :class:`TypeError`) lying between the first and last requested
+        cutoff, inclusive (else :class:`ValueError`); cutoffs below it
+        form the baseline period and the rest the recent period.
+        ``min_rate_drop`` must be a two-element tuple of non-``bool``
+        :class:`int` values (a non-tuple container or a
+        ``bool``/non-:class:`int` element raises :class:`TypeError`)
+        whose numerator is non-negative, whose denominator is positive
+        and whose numerator does not exceed the denominator (else
+        :class:`ValueError`). ``drift_limit`` must be a non-``bool``
+        :class:`int` of at least one (else :class:`TypeError` then
+        :class:`ValueError`). An empty ``cutoffs`` tuple, a
+        ``split_cutoff`` outside the cutoff span and a split leaving
+        either period without a cutoff all raise :class:`ValueError`.
+
+        The same one frozen view captured by
+        :meth:`_capture_frontier_view` answers the whole query, and the
+        per-cutoff outcomes are exactly those a
+        :meth:`lifetime_churn_forecast_backtests` call with the same
+        arguments would score, including the cross-cutoff
+        ``backtest_limit`` cap. Each period's outcomes are aggregated
+        into scorecards with the exact semantics of
+        :meth:`lifetime_churn_forecast_scorecards` -- grouping,
+        ``min_resolved`` filtering and the ``scorecard_limit`` cap
+        included -- and only objects whose scorecard reaches
+        ``min_resolved`` in both periods are compared.
+
+        Each drift record is a fresh dict with keys ordered ``type,
+        identity, baseline, recent, exact_drop, window_drop,
+        mean_offset_shift``: ``baseline`` and ``recent`` are the
+        object's two period scorecards with every scorecard field in
+        the scorecard order, ``exact_drop`` and ``window_drop`` are the
+        baseline rate minus the recent rate as reduced ``(numerator,
+        denominator)`` integer tuples, and ``mean_offset_shift`` is the
+        recent mean offset minus the baseline mean offset, also reduced,
+        or ``None`` when either period has no observed outcome. Only
+        objects whose ``window_drop`` reaches ``min_rate_drop`` are
+        kept; rate comparisons cross-multiply the integer parts, never
+        dividing. Kept records sort by descending ``window_drop``, then
+        descending ``exact_drop``, then descending recent
+        ``max_abs_offset``, with ties settled by the object's first
+        appearance across the complete backtest's outcomes.
+
+        The result is a fresh dict whose keys are ordered ``drifts,
+        totals``: ``totals`` is a fresh dict with keys ordered
+        ``identities, baseline_predictions, recent_predictions,
+        baseline_resolved, recent_resolved`` and sums only the kept
+        records, so a query with no qualifying object returns an empty
+        ``drifts`` tuple and five zero totals. The complete drift set
+        is built before ``drift_limit`` -- checked against the kept
+        record count -- is enforced, so an over-limit query raises
+        :class:`ValueError` without truncating or returning partial
+        records. The query is strictly read-only, shares no object with
+        internal state, and a tokenized success consumes exactly one
+        read while any failure refunds it.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every existing cap and the scorecards caps are checked exactly
+        # as in lifetime_churn_forecast_scorecards; split_cutoff,
+        # min_rate_drop and drift_limit follow in that order, still
+        # before every state lookup. The split needs only the requested
+        # cutoffs, so the empty-cutoff, range and empty-period checks
+        # also settle here.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoff_value = BranchStore._validate_drift_split_cutoff(
+            split_cutoff
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        BranchStore._validate_drift_split(cutoffs_value, split_cutoff_value)
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # The same frozen view and cutoff scoring as a backtests query
+        # answer both periods, so a drift record never observes a
+        # different state than the backtest it summarizes.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            result = view._build_lifetime_churn_forecast_drift_result(
+                results,
+                split_cutoff_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
+    @staticmethod
+    def _validate_drift_split_cutoff(split_cutoff: Any) -> int:
+        """Validate the drift split cutoff's type.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`, before any
+        state lookup: ``split_cutoff`` must be a non-``bool``
+        :class:`int` (else :class:`TypeError`). Range against the
+        requested cutoffs is settled by
+        :meth:`_validate_drift_split`.
+        """
+        if isinstance(split_cutoff, bool) or not isinstance(
+            split_cutoff, int
+        ):
+            raise TypeError(
+                f"split_cutoff must be an int, got "
+                f"{type(split_cutoff).__name__}"
+            )
+        return split_cutoff
+
+    @staticmethod
+    def _validate_min_rate_drop(min_rate_drop: Any) -> tuple[int, int]:
+        """Validate the minimum window-rate drop threshold.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`, before any
+        state lookup: ``min_rate_drop`` must be a tuple (else
+        :class:`TypeError`) of exactly two non-``bool`` :class:`int`
+        values (a ``bool`` or non-:class:`int` element raises
+        :class:`TypeError`); a wrong element count, a negative
+        numerator, a non-positive denominator or a numerator exceeding
+        the denominator raises :class:`ValueError`.
+        """
+        if not isinstance(min_rate_drop, tuple):
+            raise TypeError(
+                f"min_rate_drop must be a tuple, got "
+                f"{type(min_rate_drop).__name__}"
+            )
+        if len(min_rate_drop) != 2:
+            raise ValueError(
+                f"min_rate_drop must have exactly 2 elements, got "
+                f"{len(min_rate_drop)}"
+            )
+        numerator, denominator = min_rate_drop
+        for position, part in enumerate(min_rate_drop):
+            name = f"min_rate_drop[{position}]"
+            if isinstance(part, bool) or not isinstance(part, int):
+                raise TypeError(
+                    f"{name} must be an int, got {type(part).__name__}"
+                )
+        if numerator < 0:
+            raise ValueError(
+                "min_rate_drop numerator must be non-negative"
+            )
+        if denominator < 1:
+            raise ValueError(
+                "min_rate_drop denominator must be positive"
+            )
+        if numerator > denominator:
+            raise ValueError(
+                "min_rate_drop numerator must not exceed the denominator"
+            )
+        return (numerator, denominator)
+
+    @staticmethod
+    def _validate_drift_split(
+        cutoffs: tuple[int, ...], split_cutoff: int
+    ) -> None:
+        """Validate the split against the requested cutoffs.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`, before any
+        state lookup: an empty ``cutoffs`` tuple, a ``split_cutoff``
+        outside the first-to-last cutoff span and a split leaving
+        either the baseline period (cutoffs below the split) or the
+        recent period (the rest) without a cutoff all raise
+        :class:`ValueError`.
+        """
+        if not cutoffs:
+            raise ValueError(
+                "cutoffs must not be empty for a lifetime churn "
+                "forecast drift query"
+            )
+        if split_cutoff < cutoffs[0] or split_cutoff > cutoffs[-1]:
+            raise ValueError(
+                f"split_cutoff {split_cutoff} is out of range for "
+                f"cutoffs spanning {cutoffs[0]} to {cutoffs[-1]}"
+            )
+        baseline = [cutoff for cutoff in cutoffs if cutoff < split_cutoff]
+        recent = [cutoff for cutoff in cutoffs if cutoff >= split_cutoff]
+        if not baseline or not recent:
+            raise ValueError(
+                f"split_cutoff {split_cutoff} leaves an empty baseline "
+                f"or recent period"
+            )
+
+    @staticmethod
+    def _subtract_lifetime_rates(
+        left: tuple[int, int], right: tuple[int, int]
+    ) -> tuple[int, int]:
+        """Return ``left - right`` as a reduced integer ratio tuple."""
+        numerator = left[0] * right[1] - right[0] * left[1]
+        denominator = left[1] * right[1]
+        divisor = math.gcd(numerator, denominator)
+        return (numerator // divisor, denominator // divisor)
+
+    @staticmethod
+    def _compare_lifetime_drift_records(
+        left: dict[str, object], right: dict[str, object]
+    ) -> int:
+        """Order two drift records by the drift sort keys.
+
+        Used only by
+        :meth:`_build_lifetime_churn_forecast_drift_result`: descending
+        ``window_drop``, then descending ``exact_drop`` -- both compared
+        by cross-multiplying the integer parts, never dividing -- then
+        descending recent ``max_abs_offset`` with ``None`` sorting
+        below every observed offset. Ties return zero so the stable
+        sort keeps the complete backtest's first-appearance order.
+        """
+        for name in ("window_drop", "exact_drop"):
+            left_numerator, left_denominator = left[name]
+            right_numerator, right_denominator = right[name]
+            left_cross = left_numerator * right_denominator
+            right_cross = right_numerator * left_denominator
+            if left_cross != right_cross:
+                return -1 if left_cross > right_cross else 1
+        left_abs = left["recent"]["max_abs_offset"]
+        right_abs = right["recent"]["max_abs_offset"]
+        left_key = -1 if left_abs is None else left_abs
+        right_key = -1 if right_abs is None else right_abs
+        if left_key != right_key:
+            return -1 if left_key > right_key else 1
+        return 0
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_result(
+        backtest_results: list[dict[str, object]],
+        split_cutoff: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+    ) -> dict[str, object]:
+        """Aggregate one backtest into per-identity drift records.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`. The
+        per-cutoff results are the complete, in-order output of
+        :meth:`_compute_lifetime_backtest_cutoffs`; cutoffs below
+        ``split_cutoff`` form the baseline period and the rest the
+        recent period. Each period's outcomes are aggregated exactly as
+        :meth:`_build_lifetime_churn_forecast_scorecards_result` does,
+        including its ``min_resolved`` filter and ``scorecard_limit``
+        cap, and only objects kept in both periods are compared. The
+        kept records are those whose ``window_drop`` reaches
+        ``min_rate_drop`` by integer cross-multiplication; they sort by
+        descending ``window_drop``, descending ``exact_drop`` and
+        descending recent ``max_abs_offset``, with the complete
+        backtest's first-appearance order settling ties. The
+        ``drift_limit`` cap is checked only once every record is built,
+        so an over-limit query raises :class:`ValueError` without
+        truncating. Every object is built fresh and shares nothing with
+        the cutoff results.
+        """
+        baseline_results = [
+            cutoff_result
+            for cutoff_result in backtest_results
+            if cutoff_result["cutoff"] < split_cutoff
+        ]
+        recent_results = [
+            cutoff_result
+            for cutoff_result in backtest_results
+            if cutoff_result["cutoff"] >= split_cutoff
+        ]
+        baseline_scorecards = (
+            BranchStore._build_lifetime_churn_forecast_scorecards_result(
+                baseline_results, min_resolved, scorecard_limit
+            )["scorecards"]
+        )
+        recent_scorecards = (
+            BranchStore._build_lifetime_churn_forecast_scorecards_result(
+                recent_results, min_resolved, scorecard_limit
+            )["scorecards"]
+        )
+        baseline_by_key = {
+            (scorecard["type"], scorecard["identity"]): scorecard
+            for scorecard in baseline_scorecards
+        }
+        recent_by_key = {
+            (scorecard["type"], scorecard["identity"]): scorecard
+            for scorecard in recent_scorecards
+        }
+
+        # The tie-break order is the object's first appearance across
+        # the complete backtest, not either period's.
+        encounter: list[tuple[str, object]] = []
+        seen: set[tuple[str, object]] = set()
+        for cutoff_result in backtest_results:
+            for outcome in cutoff_result["outcomes"]:
+                key = (outcome["type"], outcome["identity"])
+                if key not in seen:
+                    seen.add(key)
+                    encounter.append(key)
+
+        drifts: list[dict[str, object]] = []
+        for key in encounter:
+            baseline = baseline_by_key.get(key)
+            recent = recent_by_key.get(key)
+            if baseline is None or recent is None:
+                continue
+            exact_drop = BranchStore._subtract_lifetime_rates(
+                baseline["exact_rate"], recent["exact_rate"]
+            )
+            window_drop = BranchStore._subtract_lifetime_rates(
+                baseline["window_rate"], recent["window_rate"]
+            )
+            if (
+                window_drop[0] * min_rate_drop[1]
+                < min_rate_drop[0] * window_drop[1]
+            ):
+                continue
+            if (
+                baseline["mean_offset"] is None
+                or recent["mean_offset"] is None
+            ):
+                mean_offset_shift: tuple[int, int] | None = None
+            else:
+                mean_offset_shift = BranchStore._subtract_lifetime_rates(
+                    recent["mean_offset"], baseline["mean_offset"]
+                )
+            drifts.append(
+                {
+                    "type": key[0],
+                    "identity": BranchStore._freeze_lifetime_value(key[1]),
+                    "baseline": baseline,
+                    "recent": recent,
+                    "exact_drop": exact_drop,
+                    "window_drop": window_drop,
+                    "mean_offset_shift": mean_offset_shift,
+                }
+            )
+
+        drifts.sort(
+            key=functools.cmp_to_key(
+                BranchStore._compare_lifetime_drift_records
+            )
+        )
+
+        if len(drifts) > drift_limit:
+            raise ValueError(
+                f"lifetime churn drift limit exceeded: "
+                f"{len(drifts)} drift records, limit is {drift_limit}"
+            )
+
+        totals = {
+            "identities": 0,
+            "baseline_predictions": 0,
+            "recent_predictions": 0,
+            "baseline_resolved": 0,
+            "recent_resolved": 0,
+        }
+        for record in drifts:
+            totals["identities"] += 1
+            totals["baseline_predictions"] += record["baseline"][
+                "predictions"
+            ]
+            totals["recent_predictions"] += record["recent"]["predictions"]
+            totals["baseline_resolved"] += record["baseline"]["resolved"]
+            totals["recent_resolved"] += record["recent"]["resolved"]
+        return {"drifts": tuple(drifts), "totals": totals}
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:
