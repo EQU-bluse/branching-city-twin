@@ -38,6 +38,7 @@ tests/test_lifetime_churn.py
 tests/test_lifetime_churn_forecast_backtests.py
 tests/test_lifetime_churn_forecast_drift.py
 tests/test_lifetime_churn_forecast_drift_scan.py
+tests/test_lifetime_churn_forecast_drift_waves.py
 tests/test_lifetime_churn_forecast_scorecards.py
 tests/test_lifetime_churn_forecasts.py
 tests/test_lifetime_churn_periodicities.py
