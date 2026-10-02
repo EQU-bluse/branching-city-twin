@@ -22906,6 +22906,315 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_wave_periodicities(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        min_splits: int,
+        streak_result_limit: int,
+        min_active_identities: int,
+        wave_result_limit: int,
+        min_wave_occurrences: int,
+        recurrence_result_limit: int,
+        max_wave_jitter: int,
+        periodicity_result_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Find drift-wave recurrences whose cadence stays steady.
+
+        Reuses every public input, parameter order, validation order,
+        frozen-view, backtest, scan, streak, wave and cap semantic of
+        :meth:`lifetime_churn_forecast_drift_wave_recurrences`,
+        appending ``max_wave_jitter`` and
+        ``periodicity_result_limit`` in that order after
+        ``recurrence_result_limit`` (still before the split membership
+        check and any state lookup), keeping the same optional trailing
+        ``token``. ``max_wave_jitter`` must be a non-``bool``
+        :class:`int` of at least zero and ``periodicity_result_limit``
+        a non-``bool`` :class:`int` of at least one (a ``bool`` or
+        non-:class:`int` raises :class:`TypeError`, an out-of-range
+        value raises :class:`ValueError`); ``min_wave_occurrences`` and
+        ``recurrence_result_limit`` are accepted and validated
+        identically but do not bound a periodicities query.
+
+        The wave stage runs exactly as in
+        :meth:`lifetime_churn_forecast_drift_wave_recurrences` -- one
+        frozen view, one complete backtest, one scan per requested
+        split, the streak stage and the wave grouping, with
+        ``drift_limit``, ``scan_limit``, ``streak_result_limit`` and
+        ``wave_result_limit`` still bounding their own stages -- and
+        the kept waves are then re-read per identity exactly as for a
+        recurrences query. An identity taking part in fewer than three
+        waves keeps no record, however many points it covers; for
+        every other identity the participating wave numbers are read
+        in ascending order and the adjacent-number differences are its
+        intervals, and it keeps a record only when the largest interval
+        minus the smallest is at most ``max_wave_jitter``.
+
+        The result is a fresh dict whose keys are ordered
+        ``periodicities, totals``. Each record is a fresh dict whose
+        keys are ordered ``identity, waves, first_wave, last_wave,
+        span, points, peak_active, appearances, intervals, period,
+        jitter``: the first eight fields keep the exact semantics of
+        the corresponding
+        :meth:`lifetime_churn_forecast_drift_wave_recurrences` record
+        (waves numbered from zero, one appearance dict per
+        participating wave in ascending wave order), ``intervals``
+        keeps, in that same order, one fresh entry per adjacent-wave
+        serial difference, ``period`` is the integer median of the
+        sorted intervals (the smaller of the two middle values when
+        the count is even) and ``jitter`` is the largest interval
+        minus the smallest. Records sort by ``jitter`` ascending, then
+        ``waves`` descending, then ``points`` descending, then
+        ``first_wave`` ascending, then the identities'
+        first-encounter order across the waves. ``totals`` is a fresh
+        dict with keys ordered ``periodicities, waves, points,
+        first_wave, last_wave, mean_period``: the record count, the
+        summed participating-wave and point counts, the earliest and
+        latest participating wave numbers and the floor of the mean
+        record ``period`` (six zeros when no record is kept). An empty
+        ``split_cutoffs`` tuple, a batch with no qualifying wave, an
+        identity set recurring fewer than three times or one with no
+        steady-enough cadence return an empty ``periodicities`` tuple
+        and six zero totals. ``periodicity_result_limit`` bounds the
+        final record count only, checked against the complete
+        candidate set so an over-limit query raises
+        :class:`ValueError` without truncating. Every object is built
+        fresh and shares nothing with the wave records or internal
+        state; a tokenized success consumes exactly one read while any
+        failure refunds it, and a tokenless call observes the same
+        single frozen view.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every cap is checked exactly as in
+        # lifetime_churn_forecast_drift_wave_recurrences;
+        # max_wave_jitter (which may be zero) and
+        # periodicity_result_limit follow recurrence_result_limit in
+        # that order, still before the split membership check and
+        # every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        min_splits_value = BranchStore._require_record_limit(
+            min_splits, "min_splits"
+        )
+        streak_result_limit_value = BranchStore._require_record_limit(
+            streak_result_limit, "streak_result_limit"
+        )
+        min_active_identities_value = BranchStore._require_record_limit(
+            min_active_identities, "min_active_identities"
+        )
+        wave_result_limit_value = BranchStore._require_record_limit(
+            wave_result_limit, "wave_result_limit"
+        )
+        # Accepted and validated exactly as for the recurrences query,
+        # but neither bounds a periodicities query.
+        BranchStore._require_record_limit(
+            min_wave_occurrences, "min_wave_occurrences"
+        )
+        BranchStore._require_record_limit(
+            recurrence_result_limit, "recurrence_result_limit"
+        )
+        max_wave_jitter_value = BranchStore._require_non_negative_limit(
+            max_wave_jitter, "max_wave_jitter"
+        )
+        periodicity_result_limit_value = BranchStore._require_record_limit(
+            periodicity_result_limit, "periodicity_result_limit"
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # The same frozen view and cutoff scoring answer every split:
+        # one complete backtest is shared by the whole scan, so two
+        # split points can never observe different states.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            scan = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+            streaks = (
+                BranchStore._build_lifetime_churn_forecast_drift_streaks_result(
+                    scan["scans"],
+                    min_splits_value,
+                    streak_result_limit_value,
+                )
+            )
+            waves = (
+                BranchStore._build_lifetime_churn_forecast_drift_waves_result(
+                    scan["scans"],
+                    streaks["streaks"],
+                    min_active_identities_value,
+                    wave_result_limit_value,
+                )
+            )
+            result = (
+                BranchStore
+                ._build_lifetime_churn_forecast_drift_wave_periodicities_result(
+                    waves["waves"],
+                    max_wave_jitter_value,
+                    periodicity_result_limit_value,
+                )
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
     @staticmethod
     def _validate_drift_scan_split_cutoffs(
         split_cutoffs: Any,
@@ -23365,6 +23674,157 @@ class BranchStore:
                 record["last_wave"] for record in records
             )
         return {"recurrences": tuple(records), "totals": totals}
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_wave_periodicities_result(
+        waves: tuple[dict[str, object], ...],
+        max_wave_jitter: int,
+        periodicity_result_limit: int,
+    ) -> dict[str, object]:
+        """Keep the drift-wave recurrences whose cadence stays steady.
+
+        Used only by
+        :meth:`lifetime_churn_forecast_drift_wave_periodicities`. The
+        waves are the complete, already-bounded ``waves`` tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_waves_result`, so
+        each wave's position in the tuple is its zero-based wave
+        number. Participation is read exactly as in
+        :meth:`_build_lifetime_churn_forecast_drift_wave_recurrences_result`
+        -- an identity listed in a wave's point identities takes part
+        in that wave once, however many of the wave's points list it
+        -- and every identity taking part in at least three waves
+        yields the adjacent-wave serial differences of its ascending
+        participating wave numbers; only identities whose largest
+        interval minus its smallest is at most ``max_wave_jitter``
+        keep a record.
+
+        Each kept record reproduces every recurrences field in the
+        same order -- ``identity, waves, first_wave, last_wave, span,
+        points, peak_active, appearances`` -- and appends
+        ``intervals, period, jitter``: ``intervals`` keeps the
+        adjacent-wave gaps in appearance order, ``period`` is the
+        integer median of the sorted intervals (the smaller of the
+        two middle values for an even count) and ``jitter`` is the
+        largest interval minus the smallest. Records sort by jitter
+        ascending, then participating-wave count and summed point
+        count descending, then ``first_wave`` ascending, then the
+        identities' first-encounter order across the waves. The
+        complete set is built before ``periodicity_result_limit`` is
+        enforced, so an over-limit query raises :class:`ValueError`
+        without truncating. Every record, appearance and interval is
+        built fresh and shares no mutable object with the wave
+        records.
+        """
+        encounter: dict[object, int] = {}
+        appearances: dict[object, list[dict[str, object]]] = {}
+        peaks: dict[object, int] = {}
+        for serial, wave in enumerate(waves):
+            per_wave: dict[object, dict[str, object]] = {}
+            for point in wave["points"]:
+                active_count = point["active_count"]
+                for identity in point["identities"]:
+                    if identity not in encounter:
+                        encounter[identity] = len(encounter)
+                    entry = per_wave.get(identity)
+                    if entry is None:
+                        entry = {
+                            "wave": serial,
+                            "start_split": wave["start_split"],
+                            "end_split": wave["end_split"],
+                            "points": 0,
+                            "first_split": point["split_cutoff"],
+                            "last_split": point["split_cutoff"],
+                        }
+                        per_wave[identity] = entry
+                    entry["points"] += 1
+                    entry["last_split"] = point["split_cutoff"]
+                    if active_count > peaks.get(identity, 0):
+                        peaks[identity] = active_count
+            for identity, entry in per_wave.items():
+                appearances.setdefault(identity, []).append(entry)
+
+        records: list[dict[str, object]] = []
+        for identity, wave_appearances in appearances.items():
+            # Three appearances are the minimum that yields two
+            # intervals and a meaningful cadence.
+            if len(wave_appearances) < 3:
+                continue
+            intervals = tuple(
+                later["wave"] - earlier["wave"]
+                for earlier, later in zip(
+                    wave_appearances, wave_appearances[1:]
+                )
+            )
+            jitter = max(intervals) - min(intervals)
+            if jitter > max_wave_jitter:
+                continue
+            ordered_intervals = sorted(intervals)
+            middle = len(ordered_intervals) // 2
+            if len(ordered_intervals) % 2 == 0:
+                # An even interval count takes the smaller middle value.
+                period = ordered_intervals[middle - 1]
+            else:
+                period = ordered_intervals[middle]
+            first_wave = wave_appearances[0]["wave"]
+            last_wave = wave_appearances[-1]["wave"]
+            records.append(
+                {
+                    "identity": BranchStore._freeze_lifetime_value(identity),
+                    "waves": len(wave_appearances),
+                    "first_wave": first_wave,
+                    "last_wave": last_wave,
+                    "span": last_wave - first_wave + 1,
+                    "points": sum(
+                        appearance["points"]
+                        for appearance in wave_appearances
+                    ),
+                    "peak_active": peaks[identity],
+                    "appearances": tuple(wave_appearances),
+                    "intervals": intervals,
+                    "period": period,
+                    "jitter": jitter,
+                }
+            )
+
+        records.sort(
+            key=lambda record: (
+                record["jitter"],
+                -record["waves"],
+                -record["points"],
+                record["first_wave"],
+                encounter[record["identity"]],
+            )
+        )
+        if len(records) > periodicity_result_limit:
+            raise ValueError(
+                f"lifetime churn drift wave periodicity result limit "
+                f"exceeded: {len(records)} periodicity records, limit is "
+                f"{periodicity_result_limit}"
+            )
+
+        totals = {
+            "periodicities": 0,
+            "waves": 0,
+            "points": 0,
+            "first_wave": 0,
+            "last_wave": 0,
+            "mean_period": 0,
+        }
+        period_total = 0
+        for record in records:
+            totals["periodicities"] += 1
+            totals["waves"] += record["waves"]
+            totals["points"] += record["points"]
+            period_total += record["period"]
+        if records:
+            totals["first_wave"] = min(
+                record["first_wave"] for record in records
+            )
+            totals["last_wave"] = max(
+                record["last_wave"] for record in records
+            )
+            totals["mean_period"] = period_total // len(records)
+        return {"periodicities": tuple(records), "totals": totals}
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:
