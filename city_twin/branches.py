@@ -22355,6 +22355,272 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_waves(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        min_splits: int,
+        streak_result_limit: int,
+        min_active_identities: int,
+        wave_result_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Group requested positions with enough drifting identities.
+
+        Reuses every public input, parameter order, validation order,
+        frozen-view, backtest, scan, streak and cap semantic of
+        :meth:`lifetime_churn_forecast_drift_streaks`, appending
+        ``min_active_identities`` and ``wave_result_limit`` in that
+        order after ``streak_result_limit`` (still before the split
+        membership check and any state lookup), keeping the same
+        optional trailing ``token``. Both must be non-``bool``
+        :class:`int` values of at least one (a ``bool`` or
+        non-:class:`int` raises :class:`TypeError`, a non-positive
+        value raises :class:`ValueError`); ``wave_limit`` keeps its
+        earlier meaning and does not bound this query.
+
+        The streak stage runs exactly as in
+        :meth:`lifetime_churn_forecast_drift_streaks` -- one frozen
+        view, one complete backtest, one scan per requested split,
+        ``drift_limit`` bounding each scan, ``scan_limit`` the total
+        record count and ``streak_result_limit`` the kept streak count
+        -- and each requested position then counts the distinct
+        identities whose kept streak covers it. Maximal runs of
+        adjacent requested positions whose active count reaches
+        ``min_active_identities`` form the waves: positions never
+        requested do not break adjacency, and a requested position
+        below the threshold ends the run. An empty ``split_cutoffs``
+        tuple, no kept streak or no position ever reaching the
+        threshold yields an empty ``waves`` tuple and five zero totals.
+
+        The result is a fresh dict whose keys are ordered ``waves,
+        totals``. Waves order by their starting requested position and
+        each wave is a fresh dict whose keys are ordered
+        ``start_split, end_split, length, peak_identities, points``:
+        ``start_split`` and ``end_split`` are the first and last
+        requested split cutoffs of the run, ``length`` counts its
+        requested positions, ``peak_identities`` is the largest active
+        count across them and ``points`` keeps, in split order, one
+        fresh ``split_cutoff, active_count, identities`` dict per
+        position, whose identities follow that position's drift record
+        order without duplicates. ``totals`` is a fresh dict with keys
+        ordered ``splits, identities, waves, points, peak_active``: the
+        distinct split cutoffs the kept waves cover, the distinct
+        identities they involve, the kept wave count, the summed point
+        count and the largest active count across every point.
+        ``wave_result_limit`` bounds the final wave count only, so an
+        over-limit query raises :class:`ValueError` without truncating.
+        Every object is built fresh and shares nothing with the scan
+        records or internal state; a tokenized success consumes exactly
+        one read while any failure refunds it.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every cap is checked exactly as in
+        # lifetime_churn_forecast_drift_streaks; min_active_identities
+        # and wave_result_limit follow streak_result_limit in that
+        # order, still before the split membership check and every
+        # state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        min_splits_value = BranchStore._require_record_limit(
+            min_splits, "min_splits"
+        )
+        streak_result_limit_value = BranchStore._require_record_limit(
+            streak_result_limit, "streak_result_limit"
+        )
+        min_active_identities_value = BranchStore._require_record_limit(
+            min_active_identities, "min_active_identities"
+        )
+        wave_result_limit_value = BranchStore._require_record_limit(
+            wave_result_limit, "wave_result_limit"
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # The same frozen view and cutoff scoring answer every split:
+        # one complete backtest is shared by the whole scan, so two
+        # split points can never observe different states.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            scan = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+            streaks = (
+                BranchStore._build_lifetime_churn_forecast_drift_streaks_result(
+                    scan["scans"],
+                    min_splits_value,
+                    streak_result_limit_value,
+                )
+            )
+            result = (
+                BranchStore._build_lifetime_churn_forecast_drift_waves_result(
+                    scan["scans"],
+                    streaks["streaks"],
+                    min_active_identities_value,
+                    wave_result_limit_value,
+                )
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
     @staticmethod
     def _validate_drift_scan_split_cutoffs(
         split_cutoffs: Any,
@@ -22584,6 +22850,124 @@ class BranchStore:
         totals["splits"] = len(split_seen)
         totals["identities"] = len(identity_seen)
         return {"streaks": tuple(streaks), "totals": totals}
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_waves_result(
+        scans: tuple[dict[str, object], ...],
+        streaks: tuple[dict[str, object], ...],
+        min_active_identities: int,
+        wave_result_limit: int,
+    ) -> dict[str, object]:
+        """Group positions where enough kept streaks stay active.
+
+        Used only by :meth:`lifetime_churn_forecast_drift_waves`. The
+        scans are the complete, in-order ``scans`` tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_scan_result` and
+        the streaks the complete, already-bounded ``streaks`` tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_streaks_result`.
+        Each requested position counts the distinct identities whose
+        kept streak covers it, listed in that position's drift record
+        order, and maximal runs of adjacent requested positions
+        reaching ``min_active_identities`` active identities form the
+        waves -- a requested position below the threshold ends the run.
+        ``wave_result_limit`` bounds the final wave count, raising
+        :class:`ValueError` rather than truncating. Every record and
+        point dict is built fresh and shares no mutable object with the
+        scan records or the streak records.
+        """
+        position_of = {
+            scan["split_cutoff"]: index for index, scan in enumerate(scans)
+        }
+        coverage: list[set[object]] = [set() for _ in scans]
+        for streak in streaks:
+            identity = streak["identity"]
+            for point in streak["points"]:
+                coverage[position_of[point["split_cutoff"]]].add(identity)
+
+        waves: list[dict[str, object]] = []
+        current: list[dict[str, object]] = []
+        for index, scan in enumerate(scans):
+            active = coverage[index]
+            identities: list[object] = []
+            seen: set[object] = set()
+            for record in scan["drifts"]:
+                identity = record["identity"]
+                if identity in seen or identity not in active:
+                    continue
+                seen.add(identity)
+                identities.append(identity)
+            if len(identities) >= min_active_identities:
+                current.append(
+                    {
+                        "split_cutoff": scan["split_cutoff"],
+                        "active_count": len(identities),
+                        "identities": tuple(
+                            BranchStore._freeze_lifetime_value(identity)
+                            for identity in identities
+                        ),
+                    }
+                )
+                continue
+            if current:
+                waves.append(
+                    BranchStore._build_lifetime_churn_forecast_drift_wave(
+                        current
+                    )
+                )
+                current = []
+        if current:
+            waves.append(
+                BranchStore._build_lifetime_churn_forecast_drift_wave(current)
+            )
+
+        if len(waves) > wave_result_limit:
+            raise ValueError(
+                f"lifetime churn drift wave result limit exceeded: "
+                f"{len(waves)} waves, limit is {wave_result_limit}"
+            )
+
+        split_seen: set[object] = set()
+        identity_seen: set[object] = set()
+        totals = {
+            "splits": 0,
+            "identities": 0,
+            "waves": 0,
+            "points": 0,
+            "peak_active": 0,
+        }
+        for wave in waves:
+            totals["waves"] += 1
+            for point in wave["points"]:
+                split_seen.add(point["split_cutoff"])
+                totals["points"] += 1
+                if point["active_count"] > totals["peak_active"]:
+                    totals["peak_active"] = point["active_count"]
+                for identity in point["identities"]:
+                    identity_seen.add(identity)
+        totals["splits"] = len(split_seen)
+        totals["identities"] = len(identity_seen)
+        return {"waves": tuple(waves), "totals": totals}
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_wave(
+        points: list[dict[str, object]],
+    ) -> dict[str, object]:
+        """Assemble one maximal active run into a fresh wave dict.
+
+        Used only by
+        :meth:`_build_lifetime_churn_forecast_drift_waves_result`. The
+        points are the run's already-built point dicts in requested
+        split order; the wave keeps them as one fresh tuple.
+        """
+        return {
+            "start_split": points[0]["split_cutoff"],
+            "end_split": points[-1]["split_cutoff"],
+            "length": len(points),
+            "peak_identities": max(
+                point["active_count"] for point in points
+            ),
+            "points": tuple(points),
+        }
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:
