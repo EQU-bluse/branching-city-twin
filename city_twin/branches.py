@@ -21602,6 +21602,245 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_scan(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Scan forecast quality drift across several split cutoffs.
+
+        Reuses every public input, parameter order, validation order,
+        wave division, cutoff training, outcome classification,
+        scorecard aggregation and token semantic of
+        :meth:`lifetime_churn_forecast_drift`, replacing its single
+        ``split_cutoff`` with ``split_cutoffs`` and appending
+        ``min_rate_drop``, ``drift_limit`` and ``scan_limit`` in that
+        order after ``scorecard_limit`` (still before any state lookup)
+        and keeping the same optional trailing ``token``.
+        ``split_cutoffs`` must be a tuple (else :class:`TypeError`) of
+        non-``bool`` :class:`int` values (a ``bool``/non-:class:`int`
+        element raises :class:`TypeError`), strictly increasing (a
+        duplicate or out-of-order element raises :class:`ValueError`);
+        every element must be one of the requested ``cutoffs`` and must
+        leave at least one cutoff on each side of its split (else
+        :class:`ValueError`). An empty ``split_cutoffs`` tuple is legal
+        and returns an empty ``scans`` tuple with six zero totals.
+        ``min_rate_drop`` and ``drift_limit`` keep the exact validation
+        of :meth:`lifetime_churn_forecast_drift`; ``scan_limit`` must
+        be a non-``bool`` :class:`int` of at least one (else
+        :class:`TypeError` then :class:`ValueError`).
+
+        The whole query is answered by one complete backtest computed
+        on the same one frozen view captured by
+        :meth:`_capture_frontier_view`, exactly as a
+        :meth:`lifetime_churn_forecast_drift` call with the same
+        arguments would compute it, and every split cutoff is evaluated
+        against that single frozen result -- the backtest is never
+        recomputed per split. Each split's drift records are built,
+        filtered by ``min_rate_drop`` and sorted with the exact
+        semantics of :meth:`lifetime_churn_forecast_drift`, and
+        ``drift_limit`` bounds each split's complete record set
+        separately, raising :class:`ValueError` rather than truncating.
+
+        The result is a fresh dict whose keys are ordered ``scans,
+        totals``: ``scans`` holds one fresh ``split_cutoff, drifts,
+        totals`` dict per requested split cutoff, in ``split_cutoffs``
+        order, where ``drifts`` and the five-counter ``totals`` are
+        exactly what a single-split drift query at that cutoff would
+        return. ``scan_limit`` bounds the total drift record count
+        across every scan and is checked only once all scans are
+        complete, so an over-limit query raises :class:`ValueError`
+        without truncating or returning partial records. The top-level
+        ``totals`` is a fresh dict with keys ordered ``splits,
+        drift_records, baseline_predictions, recent_predictions,
+        baseline_resolved, recent_resolved`` and sums every scan. The
+        query is strictly read-only, the returned object shares nothing
+        with internal state and no two scan items share an object, and
+        a tokenized success consumes exactly one read while any failure
+        refunds it.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every existing cap and the drift caps are checked exactly as
+        # in lifetime_churn_forecast_drift; split_cutoffs, min_rate_drop,
+        # drift_limit and scan_limit follow in that order, still before
+        # every state lookup. The splits need only the requested
+        # cutoffs, so the membership and empty-period checks also
+        # settle here.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # One frozen view and one complete backtest answer every split,
+        # so no scan ever observes a different state than the backtest
+        # it summarizes.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            result = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
     @staticmethod
     def _validate_drift_split_cutoff(split_cutoff: Any) -> int:
         """Validate the drift split cutoff's type.
@@ -21869,6 +22108,146 @@ class BranchStore:
             totals["baseline_resolved"] += record["baseline"]["resolved"]
             totals["recent_resolved"] += record["recent"]["resolved"]
         return {"drifts": tuple(drifts), "totals": totals}
+
+    @staticmethod
+    def _validate_drift_scan_split_cutoffs(split_cutoffs: Any) -> tuple[int, ...]:
+        """Validate the drift scan split cutoffs' types and ordering.
+
+        Used only by :meth:`lifetime_churn_forecast_drift_scan`, before
+        any state lookup: ``split_cutoffs`` must be a tuple (else
+        :class:`TypeError`) of non-``bool`` :class:`int` values (a
+        ``bool`` or non-:class:`int` element raises :class:`TypeError`);
+        a duplicate or non-strictly-increasing element raises
+        :class:`ValueError`. Membership and empty-period checks against
+        the requested cutoffs are settled by
+        :meth:`_validate_drift_scan_splits`. An empty tuple is legal.
+        """
+        if not isinstance(split_cutoffs, tuple):
+            raise TypeError(
+                f"split_cutoffs must be a tuple, got "
+                f"{type(split_cutoffs).__name__}"
+            )
+        validated: list[int] = []
+        previous: int | None = None
+        for position, split_cutoff in enumerate(split_cutoffs):
+            name = f"split_cutoffs[{position}]"
+            if isinstance(split_cutoff, bool) or not isinstance(
+                split_cutoff, int
+            ):
+                raise TypeError(
+                    f"{name} must be an int, got "
+                    f"{type(split_cutoff).__name__}"
+                )
+            if previous is not None and split_cutoff <= previous:
+                raise ValueError(
+                    "split_cutoffs must be strictly increasing"
+                )
+            previous = split_cutoff
+            validated.append(split_cutoff)
+        return tuple(validated)
+
+    @staticmethod
+    def _validate_drift_scan_splits(
+        cutoffs: tuple[int, ...], split_cutoffs: tuple[int, ...]
+    ) -> None:
+        """Validate every split against the requested cutoffs.
+
+        Used only by :meth:`lifetime_churn_forecast_drift_scan`, before
+        any state lookup: each split cutoff must be one of the
+        requested ``cutoffs`` and must leave at least one cutoff in
+        both the baseline period (cutoffs below the split) and the
+        recent period (the rest), else :class:`ValueError`. An empty
+        ``split_cutoffs`` tuple is legal and checks nothing.
+        """
+        for split_cutoff in split_cutoffs:
+            if split_cutoff not in cutoffs:
+                raise ValueError(
+                    f"split_cutoff {split_cutoff} is not one of the "
+                    f"requested cutoffs"
+                )
+            baseline = [
+                cutoff for cutoff in cutoffs if cutoff < split_cutoff
+            ]
+            recent = [
+                cutoff for cutoff in cutoffs if cutoff >= split_cutoff
+            ]
+            if not baseline or not recent:
+                raise ValueError(
+                    f"split_cutoff {split_cutoff} leaves an empty "
+                    f"baseline or recent period"
+                )
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_scan_result(
+        backtest_results: list[dict[str, object]],
+        split_cutoffs: tuple[int, ...],
+        min_resolved: int,
+        scorecard_limit: int,
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+    ) -> dict[str, object]:
+        """Aggregate one backtest into per-split drift scan records.
+
+        Used only by :meth:`lifetime_churn_forecast_drift_scan`. The
+        per-cutoff results are the complete, in-order output of
+        :meth:`_compute_lifetime_backtest_cutoffs`; every split cutoff
+        in ``split_cutoffs`` order is evaluated against this one frozen
+        result exactly as
+        :meth:`_build_lifetime_churn_forecast_drift_result` does,
+        including its ``min_resolved`` filter, ``scorecard_limit`` cap,
+        ``min_rate_drop`` threshold, sort order and per-split
+        ``drift_limit`` cap. The ``scan_limit`` cap bounds the total
+        drift record count across every scan and is checked only once
+        all scans are complete, so an over-limit query raises
+        :class:`ValueError` without truncating. Every object is built
+        fresh per split, so no two scan items share an object and
+        nothing is shared with the cutoff results.
+        """
+        scans: list[dict[str, object]] = []
+        totals = {
+            "splits": 0,
+            "drift_records": 0,
+            "baseline_predictions": 0,
+            "recent_predictions": 0,
+            "baseline_resolved": 0,
+            "recent_resolved": 0,
+        }
+        for split_cutoff in split_cutoffs:
+            drift_result = (
+                BranchStore._build_lifetime_churn_forecast_drift_result(
+                    backtest_results,
+                    split_cutoff,
+                    min_resolved,
+                    scorecard_limit,
+                    min_rate_drop,
+                    drift_limit,
+                )
+            )
+            scans.append(
+                {
+                    "split_cutoff": split_cutoff,
+                    "drifts": drift_result["drifts"],
+                    "totals": drift_result["totals"],
+                }
+            )
+            totals["splits"] += 1
+            totals["drift_records"] += len(drift_result["drifts"])
+            for name in (
+                "baseline_predictions",
+                "recent_predictions",
+                "baseline_resolved",
+                "recent_resolved",
+            ):
+                totals[name] += drift_result["totals"][name]
+
+        if totals["drift_records"] > scan_limit:
+            raise ValueError(
+                f"lifetime churn drift scan limit exceeded: "
+                f"{totals['drift_records']} drift records, limit is "
+                f"{scan_limit}"
+            )
+        return {"scans": tuple(scans), "totals": totals}
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:

@@ -36,6 +36,7 @@ tests/test_journal.py
 tests/test_ledger_rotation_memory.py
 tests/test_lifetime_churn.py
 tests/test_lifetime_churn_forecast_backtests.py
+tests/test_lifetime_churn_forecast_drift.py
 tests/test_lifetime_churn_forecast_scorecards.py
 tests/test_lifetime_churn_forecasts.py
 tests/test_lifetime_churn_periodicities.py
