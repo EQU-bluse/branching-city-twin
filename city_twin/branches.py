@@ -22107,6 +22107,254 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_streaks(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        min_splits: int,
+        streak_result_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Connect one identity's drift across adjacent split cutoffs.
+
+        Reuses every public input, parameter order, validation order,
+        frozen-view, backtest, threshold, sort and cap semantic of
+        :meth:`lifetime_churn_forecast_drift_scan`, appending
+        ``min_splits`` and ``streak_result_limit`` in that order after
+        ``scan_limit`` (still before the split membership check and any
+        state lookup), keeping the same optional trailing ``token``.
+        Both must be non-``bool`` :class:`int` values of at least one
+        (a ``bool`` or non-:class:`int` raises :class:`TypeError`, a
+        non-positive value raises :class:`ValueError`); ``streak_limit``
+        keeps its earlier meaning and does not bound this query.
+
+        The batch scan runs exactly as in
+        :meth:`lifetime_churn_forecast_drift_scan` -- one frozen view,
+        one complete backtest, one scan per requested split in
+        ``split_cutoffs`` order, ``drift_limit`` bounding each scan and
+        ``scan_limit`` the total record count -- and its per-scan drift
+        records are then connected into streaks: an identity present in
+        the drift records of two adjacent requested positions belongs to
+        one interval, points that were never requested do not affect
+        continuity, and an identity absent from any requested position
+        ends its interval there. Only intervals covering at least
+        ``min_splits`` requested positions are kept; an empty
+        ``split_cutoffs`` tuple or a ``min_splits`` above the number of
+        scanned points yields an empty ``streaks`` tuple and four zero
+        totals.
+
+        The result is a fresh dict whose keys are ordered ``streaks,
+        totals``. Each streak is a fresh dict whose keys are ordered
+        ``identity, start_split, end_split, length, points``:
+        ``start_split`` and ``end_split`` are the first and last
+        requested split cutoffs of the interval, ``length`` counts its
+        requested positions and ``points`` keeps, in split order, one
+        fresh ``split_cutoff, exact_drop, window_drop,
+        mean_offset_shift`` dict per position whose values equal the
+        corresponding scan record's. Streaks order by their starting
+        requested position, then by the identity order of that
+        position's drift records. ``totals`` is a fresh dict with keys
+        ordered ``splits, identities, streaks, points``: the distinct
+        split cutoffs the kept streaks cover, the distinct identities
+        they involve, the kept streak count and the summed point count.
+        ``streak_result_limit`` bounds the final streak count only, so
+        an over-limit query raises :class:`ValueError` without
+        truncating. Every object is built fresh and shares nothing with
+        the scan records or internal state; a tokenized success consumes
+        exactly one read while any failure refunds it.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every cap is checked exactly as in
+        # lifetime_churn_forecast_drift_scan; min_splits and
+        # streak_result_limit follow scan_limit in that order, still
+        # before the split membership check and every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        min_splits_value = BranchStore._require_record_limit(
+            min_splits, "min_splits"
+        )
+        streak_result_limit_value = BranchStore._require_record_limit(
+            streak_result_limit, "streak_result_limit"
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # The same frozen view and cutoff scoring answer every split:
+        # one complete backtest is shared by the whole scan, so two
+        # split points can never observe different states.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            scan = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+            result = (
+                BranchStore._build_lifetime_churn_forecast_drift_streaks_result(
+                    scan["scans"],
+                    min_splits_value,
+                    streak_result_limit_value,
+                )
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
     @staticmethod
     def _validate_drift_scan_split_cutoffs(
         split_cutoffs: Any,
@@ -22250,6 +22498,92 @@ class BranchStore:
                 f"{totals['splits']} scan(s), limit is {scan_limit}"
             )
         return {"scans": tuple(scans), "totals": totals}
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_streaks_result(
+        scans: tuple[dict[str, object], ...],
+        min_splits: int,
+        streak_result_limit: int,
+    ) -> dict[str, object]:
+        """Connect one frozen scan batch into per-identity streaks.
+
+        Used only by :meth:`lifetime_churn_forecast_drift_streaks`. The
+        scans are the complete, in-order ``scans`` tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_scan_result`. An
+        identity present in the drift records of two adjacent requested
+        positions belongs to one interval; an identity absent from any
+        requested position ends its interval there. Only intervals of at
+        least ``min_splits`` positions are kept, ordered by their
+        starting requested position and then by the identity order of
+        that position's drift records, and ``streak_result_limit``
+        bounds the final streak count, raising :class:`ValueError`
+        rather than truncating. Every record and point dict is built
+        fresh and shares no mutable object with the scan records.
+        """
+        active: dict[object, dict[str, object]] = {}
+        started: list[dict[str, object]] = []
+        for index, scan in enumerate(scans):
+            present: set[object] = set()
+            for record in scan["drifts"]:
+                identity = record["identity"]
+                if identity in present:
+                    continue
+                present.add(identity)
+                streak = active.get(identity)
+                if streak is None:
+                    streak = {
+                        "identity": identity,
+                        "points": [],
+                    }
+                    active[identity] = streak
+                    started.append(streak)
+                streak["points"].append(
+                    {
+                        "split_cutoff": scan["split_cutoff"],
+                        "exact_drop": record["exact_drop"],
+                        "window_drop": record["window_drop"],
+                        "mean_offset_shift": record["mean_offset_shift"],
+                    }
+                )
+            for identity in list(active):
+                if identity not in present:
+                    del active[identity]
+
+        streaks: list[dict[str, object]] = []
+        for streak in started:
+            points = streak["points"]
+            if len(points) < min_splits:
+                continue
+            streaks.append(
+                {
+                    "identity": BranchStore._freeze_lifetime_value(
+                        streak["identity"]
+                    ),
+                    "start_split": points[0]["split_cutoff"],
+                    "end_split": points[-1]["split_cutoff"],
+                    "length": len(points),
+                    "points": tuple(points),
+                }
+            )
+
+        if len(streaks) > streak_result_limit:
+            raise ValueError(
+                f"lifetime churn drift streak result limit exceeded: "
+                f"{len(streaks)} streaks, limit is {streak_result_limit}"
+            )
+
+        split_seen: set[object] = set()
+        identity_seen: set[object] = set()
+        totals = {"splits": 0, "identities": 0, "streaks": 0, "points": 0}
+        for streak in streaks:
+            identity_seen.add(streak["identity"])
+            totals["streaks"] += 1
+            totals["points"] += streak["length"]
+            for point in streak["points"]:
+                split_seen.add(point["split_cutoff"])
+        totals["splits"] = len(split_seen)
+        totals["identities"] = len(identity_seen)
+        return {"streaks": tuple(streaks), "totals": totals}
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:
