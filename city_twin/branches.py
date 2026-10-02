@@ -20452,6 +20452,203 @@ class BranchStore:
             periodicity_limit_value,
         )
 
+    def lifetime_churn_forecasts(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Forecast the next waves a periodic identity may appear in.
+
+        Shares every public input, parameter order, validation order,
+        wave division, periodicity filtering and sorting and token
+        semantic of :meth:`lifetime_churn_periodicities`, appending two
+        further parameters, ``horizon`` and ``forecast_limit``,
+        validated in that order after ``periodicity_limit`` and still
+        before any state is queried; each must be a non-``bool``
+        :class:`int` (else :class:`TypeError`) of at least one (else
+        :class:`ValueError`). The same one frozen view captured by
+        :meth:`_capture_frontier_view` answers the whole query, with
+        exactly the same state checks, per-window node/change/lifetime
+        caps, per-segment diff cap, total diff cap, wave qualification
+        and ``wave_limit`` enforcement and single-read token
+        reserve/refund semantics as
+        :meth:`lifetime_churn_periodicities`; ``churn_limit``,
+        ``streak_limit``, ``min_waves``, ``recurrence_limit`` and
+        ``periodicity_limit`` are accepted and validated identically but
+        do not bound a forecasts query. Forecasts are never written back
+        to the event graph or represented as observed events, the
+        event graph, branch heads, audit and idempotency records and
+        snapshots are never modified, and a tokenized success consumes
+        exactly one read while any failure refunds it.
+
+        The result is a fresh dict whose keys are ordered
+        ``forecasts, totals``. The complete wave set and periodicity
+        set are built first with the exact semantics of
+        :meth:`lifetime_churn_periodicities`; the serial number of the
+        last wave in that wave set is the observation boundary. For
+        each periodicity record, candidate waves are produced from the
+        record's own last participating wave by repeatedly adding its
+        median ``period``; only candidate waves strictly greater than
+        the observation boundary and at most the boundary plus
+        ``horizon`` are kept. Each kept prediction is a fresh dict with
+        keys ordered ``ordinal, wave, earliest, latest``: ``ordinal`` is
+        the prediction's one-based order after the identity's last
+        appearance, ``wave`` is ``last + ordinal * period``, and
+        ``earliest``/``latest`` are ``last + ordinal * min(intervals)``
+        and ``last + ordinal * max(intervals)`` respectively. The
+        range is never truncated and a candidate never implies an
+        observed wave.
+
+        A periodicity record is kept only when at least one candidate
+        falls in range; such a record keeps every periodicity field in
+        the same order -- ``type, identity, waves, first, last, span,
+        segments, added, removed, changed, appearances, intervals,
+        period, jitter`` -- and appends a ``forecasts`` tuple in
+        ascending ordinal order. The kept records preserve the
+        periodicity sort order. ``totals`` is a fresh dict with keys
+        ordered ``identities, predictions, waves, segments, added,
+        removed, changed``: ``predictions`` sums the prediction count
+        over the kept records, ``identities`` counts the kept records,
+        and the remaining counters sum the kept records' historical
+        evidence. Empty ``windows``, empty ``causes``, a batch with no
+        periodicity or one with no candidate in range return an empty
+        ``forecasts`` tuple and seven zero totals. The complete
+        forecast set is built before the ``forecast_limit`` cap --
+        checked against the total prediction count -- is enforced, so
+        an over-limit query raises :class:`ValueError` without
+        truncating or returning partial records. Objects at every level
+        are freshly built and share nothing with each other or
+        internal state.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # The windows batch, the slice inputs and every existing cap --
+        # including max_jitter and periodicity_limit -- are checked
+        # exactly as in lifetime_churn_periodicities; horizon and
+        # forecast_limit follow in that order and still precede every
+        # state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+        return self._run_lifetime_window_batch(
+            validated,
+            index_windows,
+            causes,
+            direction,
+            depth_value,
+            node_limit_value,
+            change_limit_value,
+            lifetime_limit_value,
+            diff_limit_value,
+            total_diff_limit_value,
+            churn_limit_value,
+            streak_limit_value,
+            min_identities_value,
+            wave_limit_value,
+            token,
+            "forecasts",
+            min_waves_value,
+            recurrence_limit_value,
+            max_jitter_value,
+            periodicity_limit_value,
+            horizon_value,
+            forecast_limit_value,
+        )
+
     def _run_lifetime_window_batch(
         self,
         validated: dict[str, object],
@@ -20474,13 +20671,16 @@ class BranchStore:
         recurrence_limit_value: int | None = None,
         max_jitter_value: int | None = None,
         periodicity_limit_value: int | None = None,
+        horizon_value: int | None = None,
+        forecast_limit_value: int | None = None,
     ) -> dict[str, object]:
         """Build every window and adjacent segment on one frozen view.
 
         Shared by :meth:`lifetime_evolution`, :meth:`lifetime_churn`,
         :meth:`lifetime_churn_streaks`, :meth:`lifetime_churn_waves`,
-        :meth:`lifetime_churn_recurrences` and
-        :meth:`lifetime_churn_periodicities` so all run the same state
+        :meth:`lifetime_churn_recurrences`,
+        :meth:`lifetime_churn_periodicities` and
+        :meth:`lifetime_churn_forecasts` so all run the same state
         checks, caps and token reserve/refund semantics over one
         identical window batch. ``result_kind`` selects the assembled
         shape: ``"evolution"`` returns the ``windows``/``segments``
@@ -20498,11 +20698,16 @@ class BranchStore:
         ``recurrences``/``totals`` dict of identities taking part in at
         least ``min_waves_value`` waves, enforcing
         ``recurrence_limit_value`` only once every complete record is
-        known; and ``"periodicities"`` builds the same complete wave
-        set and then returns the ``periodicities``/``totals`` dict of
-        the recurrences whose adjacent-wave gaps differ by at most
+        known; ``"periodicities"`` builds the same complete wave set
+        and then returns the ``periodicities``/``totals`` dict of the
+        recurrences whose adjacent-wave gaps differ by at most
         ``max_jitter_value``, enforcing ``periodicity_limit_value``
-        only once every complete record is known.
+        only once every complete record is known; and ``"forecasts"``
+        builds that same complete periodicity set and then returns the
+        ``forecasts``/``totals`` dict of candidate waves beyond the
+        observation boundary within ``horizon_value``, enforcing
+        ``forecast_limit_value`` against the total prediction count
+        only once every complete prediction is known.
         """
         # Token checks come after every ordinary parameter. Without a token
         # the query runs on live state exactly as before; with one, the read
@@ -20600,6 +20805,30 @@ class BranchStore:
                     waves_result["waves"],
                     max_jitter_value,
                     periodicity_limit_value,
+                )
+            elif result_kind == "forecasts":
+                # The complete wave set -- with wave_limit enforced -- and
+                # the complete steady-cadence set are built before any
+                # prediction is assembled; periodicity_limit bounds the
+                # periodicities query only, so the full set feeds the
+                # forecast and forecast_limit is the sole cap checked
+                # after construction.
+                waves_result = view._build_lifetime_churn_waves_result(
+                    segment_changes, min_identities_value, wave_limit_value
+                )
+                periodicities_result = (
+                    view._build_lifetime_churn_periodicities_result(
+                        waves_result["waves"],
+                        max_jitter_value,
+                        None,
+                    )
+                )
+                boundary = len(waves_result["waves"]) - 1
+                result = view._build_lifetime_churn_forecasts_result(
+                    periodicities_result["periodicities"],
+                    boundary,
+                    horizon_value,
+                    forecast_limit_value,
                 )
             else:
                 result = {
@@ -21375,7 +21604,12 @@ class BranchStore:
                 encounter[(record["type"], record["identity"])],
             )
         )
-        if len(records) > periodicity_limit_value:
+        # A None cap means a caller (the forecasts query) reuses the
+        # complete periodicity set and enforces its own cap later.
+        if (
+            periodicity_limit_value is not None
+            and len(records) > periodicity_limit_value
+        ):
             raise ValueError(
                 f"lifetime churn periodicity limit exceeded: "
                 f"{len(records)} periodicity records, limit is "
@@ -21397,6 +21631,130 @@ class BranchStore:
             "periodicities": tuple(records),
             "totals": {
                 "periodicities": len(records),
+                "waves": total_waves,
+                "segments": total_segments,
+                "added": total_added,
+                "removed": total_removed,
+                "changed": total_changed,
+            },
+        }
+
+    @staticmethod
+    def _build_lifetime_churn_forecasts_result(
+        periodicity_records: tuple[dict[str, object], ...],
+        boundary: int,
+        horizon_value: int,
+        forecast_limit_value: int,
+    ) -> dict[str, object]:
+        """Project each periodicity's next waves beyond the boundary.
+
+        Used only by :meth:`lifetime_churn_forecasts`. The records are
+        already the complete, periodicity-sorted result of
+        :meth:`_build_lifetime_churn_periodicities_result`, and
+        ``boundary`` is the serial number of the last observed wave
+        (``-1`` when no wave qualified). For each record, candidate
+        waves start at the record's own ``last`` participating wave and
+        advance by its median ``period`` one ordinal at a time; a
+        candidate is kept only when strictly greater than ``boundary``
+        and at most ``boundary + horizon_value``, so the range is never
+        truncated. Each prediction is a fresh ``ordinal, wave,
+        earliest, latest`` dict: ``ordinal`` is the one-based order
+        after the record's last appearance, ``wave`` is
+        ``last + ordinal * period`` and ``earliest``/``latest`` are
+        ``last + ordinal * min(intervals)`` and
+        ``last + ordinal * max(intervals)``.
+
+        A record with no candidate in range is dropped; every kept
+        record is a fresh copy of the periodicity record with every
+        field in the same order and an appended ascending-ordinal
+        ``forecasts`` tuple, keeping the periodicity sort order. The
+        complete prediction set is built before the
+        ``forecast_limit`` cap -- measured across every prediction, not
+        every identity -- is enforced, so an over-limit query raises
+        :class:`ValueError` without returning partial records. The
+        historical ``waves, segments, added, removed, changed``
+        counters of the kept records feed ``totals`` alongside the
+        kept-identity and prediction counts; no prediction is ever
+        represented as an observed event.
+        """
+        upper = boundary + horizon_value
+        records: list[dict[str, object]] = []
+        prediction_count = 0
+        total_waves = 0
+        total_segments = 0
+        total_added = 0
+        total_removed = 0
+        total_changed = 0
+        for record in periodicity_records:
+            last = record["last"]
+            period = record["period"]
+            intervals = record["intervals"]
+            smallest = min(intervals)
+            largest = max(intervals)
+
+            predictions: list[dict[str, object]] = []
+            ordinal = 1
+            while True:
+                wave = last + ordinal * period
+                if wave > upper:
+                    break
+                if wave > boundary:
+                    predictions.append(
+                        {
+                            "ordinal": ordinal,
+                            "wave": wave,
+                            "earliest": last + ordinal * smallest,
+                            "latest": last + ordinal * largest,
+                        }
+                    )
+                ordinal += 1
+            if not predictions:
+                continue
+
+            records.append(
+                {
+                    "type": record["type"],
+                    "identity": BranchStore._freeze_lifetime_value(
+                        record["identity"]
+                    ),
+                    "waves": record["waves"],
+                    "first": record["first"],
+                    "last": last,
+                    "span": record["span"],
+                    "segments": record["segments"],
+                    "added": record["added"],
+                    "removed": record["removed"],
+                    "changed": record["changed"],
+                    "appearances": tuple(
+                        dict(appearance)
+                        for appearance in record["appearances"]
+                    ),
+                    "intervals": tuple(
+                        interval for interval in intervals
+                    ),
+                    "period": period,
+                    "jitter": record["jitter"],
+                    "forecasts": tuple(predictions),
+                }
+            )
+            prediction_count += len(predictions)
+            total_waves += record["waves"]
+            total_segments += record["segments"]
+            total_added += record["added"]
+            total_removed += record["removed"]
+            total_changed += record["changed"]
+
+        if prediction_count > forecast_limit_value:
+            raise ValueError(
+                f"lifetime churn forecast limit exceeded: "
+                f"{prediction_count} prediction records, limit is "
+                f"{forecast_limit_value}"
+            )
+        return {
+            "forecasts": tuple(records),
+            "totals": {
+                "identities": len(records),
+                "predictions": prediction_count,
                 "waves": total_waves,
                 "segments": total_segments,
                 "added": total_added,
