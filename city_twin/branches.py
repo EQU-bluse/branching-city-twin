@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import hashlib
 import heapq
 import hmac
@@ -21220,6 +21221,502 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoff: int,
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Compare scorecard quality before and after one cutoff split.
+
+        Reuses every public input, parameter order, validation order,
+        wave division, cutoff training, outcome classification,
+        scorecard aggregation and token semantic of
+        :meth:`lifetime_churn_forecast_scorecards`, appending
+        ``split_cutoff``, ``min_rate_drop`` and ``drift_limit`` in that
+        order after ``scorecard_limit`` (still before any state lookup)
+        and keeping the same optional trailing ``token``.
+
+        ``cutoffs`` must not be empty for this query (else
+        :class:`ValueError`). ``split_cutoff`` must be a non-``bool``
+        :class:`int` (else :class:`TypeError`) positioned between the
+        first and last cutoff (else :class:`ValueError`): cutoffs below
+        it form the baseline period and the rest the recent period, and
+        a split leaving either period empty raises :class:`ValueError`.
+        ``min_rate_drop`` must be a two-element tuple of non-``bool``
+        :class:`int` values (a non-tuple container, wrong length or a
+        ``bool``/non-int element raises :class:`TypeError`) whose
+        numerator is non-negative, whose denominator is positive and
+        whose numerator does not exceed the denominator (else
+        :class:`ValueError`). ``drift_limit`` must be a non-``bool``
+        :class:`int` of at least one (else :class:`TypeError` then
+        :class:`ValueError`).
+
+        The same one frozen view captured by
+        :meth:`_capture_frontier_view` answers both periods, and the
+        per-cutoff outcomes are exactly those a
+        :meth:`lifetime_churn_forecast_backtests` call with the same
+        arguments would score. The outcomes of each period are
+        aggregated exactly as :meth:`lifetime_churn_forecast_scorecards`
+        aggregates the full set, and only objects whose ``(type,
+        identity)`` reaches ``min_resolved`` in both periods are
+        compared. Each compared object becomes one fresh drift record
+        with keys ordered ``type, identity, baseline, recent,
+        exact_drop, window_drop, mean_offset_shift``: ``baseline`` and
+        ``recent`` are fresh scorecard dicts with the existing
+        scorecard fields, ``exact_drop`` and ``window_drop`` are the
+        baseline rate minus the recent rate as reduced ``(numerator,
+        denominator)`` integer tuples, and ``mean_offset_shift`` is the
+        recent mean offset minus the baseline mean offset, also
+        reduced, or ``None`` when either period has no observable
+        offset. Only objects whose ``window_drop`` reaches
+        ``min_rate_drop`` are kept; rate comparisons cross-multiply the
+        integer parts, never floats. The kept records are ordered by
+        descending ``window_drop``, then descending ``exact_drop``,
+        then descending recent ``max_abs_offset``, with ties settled by
+        the object's first appearance across the complete backtest's
+        outcomes.
+
+        The result is a fresh dict whose keys are ordered ``drifts,
+        totals``: ``totals`` is a fresh dict with keys ordered
+        ``identities, baseline_predictions, recent_predictions,
+        baseline_resolved, recent_resolved`` and sums only the kept
+        records, so a query with no qualifying object returns an empty
+        ``drifts`` tuple and five zero totals. The complete drift set
+        is built before ``drift_limit`` -- checked against the kept
+        record count -- is enforced, so an over-limit query raises
+        :class:`ValueError` without truncating or returning partial
+        records. The query is strictly read-only, shares no object with
+        internal state, and a tokenized success consumes exactly one
+        read while any failure refunds it.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every existing cap and the scorecards caps are checked exactly
+        # as in lifetime_churn_forecast_scorecards; the drift-specific
+        # checks follow in parameter order, still before every state
+        # lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        if not cutoffs_value:
+            raise ValueError(
+                "cutoffs must not be empty for lifetime churn "
+                "forecast drift"
+            )
+        split_cutoff_value = BranchStore._validate_drift_split_cutoff(
+            split_cutoff, cutoffs_value
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # The same frozen view and cutoff scoring as a backtests query
+        # answer both periods, so a drift record never observes a
+        # different state than the backtest it summarizes.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            result = view._build_lifetime_churn_forecast_drift_result(
+                results,
+                split_cutoff_value,
+                min_resolved_value,
+                min_rate_drop_value,
+                drift_limit_value,
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
+    @staticmethod
+    def _validate_drift_split_cutoff(
+        split_cutoff: Any, cutoffs: tuple[int, ...]
+    ) -> int:
+        """Validate the baseline/recent split against the cutoff tuple.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`, before any
+        state lookup and with a non-empty, already validated ``cutoffs``
+        tuple: ``split_cutoff`` must be a non-``bool`` :class:`int`
+        (else :class:`TypeError`) positioned between the first and last
+        cutoff (else :class:`ValueError`), and it must leave at least
+        one cutoff in each period (else :class:`ValueError`).
+        """
+        if isinstance(split_cutoff, bool) or not isinstance(
+            split_cutoff, int
+        ):
+            raise TypeError(
+                f"split_cutoff must be an int, got "
+                f"{type(split_cutoff).__name__}"
+            )
+        first = cutoffs[0]
+        last = cutoffs[-1]
+        if split_cutoff < first or split_cutoff > last:
+            raise ValueError(
+                f"split_cutoff {split_cutoff} is out of range for "
+                f"cutoffs from {first} to {last}"
+            )
+        if all(cutoff >= split_cutoff for cutoff in cutoffs) or all(
+            cutoff < split_cutoff for cutoff in cutoffs
+        ):
+            raise ValueError(
+                f"split_cutoff {split_cutoff} leaves an empty baseline "
+                f"or recent period"
+            )
+        return split_cutoff
+
+    @staticmethod
+    def _validate_min_rate_drop(min_rate_drop: Any) -> tuple[int, int]:
+        """Validate the window-drop threshold as a reduced-form ratio.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`, before any
+        state lookup: ``min_rate_drop`` must be a two-element tuple of
+        non-``bool`` :class:`int` values (a non-tuple container, a
+        wrong length or a ``bool``/non-int element raises
+        :class:`TypeError`) whose numerator is non-negative, whose
+        denominator is positive and whose numerator does not exceed the
+        denominator (else :class:`ValueError`).
+        """
+        if not isinstance(min_rate_drop, tuple) or len(min_rate_drop) != 2:
+            raise TypeError(
+                f"min_rate_drop must be a (numerator, denominator) "
+                f"tuple, got {type(min_rate_drop).__name__}"
+            )
+        numerator, denominator = min_rate_drop
+        for position, part in enumerate(min_rate_drop):
+            if isinstance(part, bool) or not isinstance(part, int):
+                raise TypeError(
+                    f"min_rate_drop[{position}] must be an int, got "
+                    f"{type(part).__name__}"
+                )
+        if numerator < 0:
+            raise ValueError(
+                "min_rate_drop numerator must be non-negative"
+            )
+        if denominator < 1:
+            raise ValueError(
+                "min_rate_drop denominator must be positive"
+            )
+        if numerator > denominator:
+            raise ValueError(
+                "min_rate_drop numerator must not exceed the "
+                "denominator"
+            )
+        return (numerator, denominator)
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_result(
+        backtest_results: list[dict[str, object]],
+        split_cutoff: int,
+        min_resolved: int,
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+    ) -> dict[str, object]:
+        """Aggregate one backtest's outcomes into per-identity drifts.
+
+        Used only by :meth:`lifetime_churn_forecast_drift`. The
+        per-cutoff results are the complete, in-order output of
+        :meth:`_compute_lifetime_backtest_cutoffs`; cutoffs below
+        ``split_cutoff`` form the baseline period and the rest the
+        recent period, and each period's outcomes are grouped exactly
+        as the scorecard aggregation groups the full set. Only objects
+        whose resolved count reaches ``min_resolved`` in both periods
+        are compared, and only those whose window-rate drop reaches
+        ``min_rate_drop`` are kept; every rate comparison
+        cross-multiplies the integer parts. The kept records are
+        checked against ``drift_limit`` only once all of them are
+        built, so an over-limit query raises :class:`ValueError`
+        without truncating. Every object is built fresh and shares
+        nothing with the cutoff results.
+        """
+        baseline_results = [
+            cutoff_result
+            for cutoff_result in backtest_results
+            if cutoff_result["cutoff"] < split_cutoff
+        ]
+        recent_results = [
+            cutoff_result
+            for cutoff_result in backtest_results
+            if cutoff_result["cutoff"] >= split_cutoff
+        ]
+        encounter, _full = BranchStore._group_lifetime_backtest_outcomes(
+            backtest_results
+        )
+        _baseline_order, baseline = (
+            BranchStore._group_lifetime_backtest_outcomes(baseline_results)
+        )
+        _recent_order, recent = (
+            BranchStore._group_lifetime_backtest_outcomes(recent_results)
+        )
+
+        threshold_num, threshold_den = min_rate_drop
+        drifts: list[dict[str, object]] = []
+        for key in encounter:
+            baseline_entry = baseline.get(key)
+            recent_entry = recent.get(key)
+            if baseline_entry is None or recent_entry is None:
+                continue
+            baseline_resolved = (
+                baseline_entry["predictions"] - baseline_entry["unresolved"]
+            )
+            recent_resolved = (
+                recent_entry["predictions"] - recent_entry["unresolved"]
+            )
+            if (
+                baseline_resolved < min_resolved
+                or recent_resolved < min_resolved
+            ):
+                continue
+            baseline_observed = (
+                baseline_entry["hit"]
+                + baseline_entry["early"]
+                + baseline_entry["late"]
+            )
+            recent_observed = (
+                recent_entry["hit"]
+                + recent_entry["early"]
+                + recent_entry["late"]
+            )
+            window_num = (
+                baseline_observed * recent_resolved
+                - recent_observed * baseline_resolved
+            )
+            window_den = baseline_resolved * recent_resolved
+            if window_num * threshold_den < threshold_num * window_den:
+                continue
+            exact_num = (
+                baseline_entry["hit"] * recent_resolved
+                - recent_entry["hit"] * baseline_resolved
+            )
+            window_divisor = math.gcd(window_num, window_den)
+            exact_divisor = math.gcd(exact_num, window_den)
+            if (
+                baseline_entry["offset_count"]
+                and recent_entry["offset_count"]
+            ):
+                shift_num = (
+                    recent_entry["offset_sum"]
+                    * baseline_entry["offset_count"]
+                    - baseline_entry["offset_sum"]
+                    * recent_entry["offset_count"]
+                )
+                shift_den = (
+                    recent_entry["offset_count"]
+                    * baseline_entry["offset_count"]
+                )
+                shift_divisor = math.gcd(shift_num, shift_den)
+                mean_offset_shift: tuple[int, int] | None = (
+                    shift_num // shift_divisor,
+                    shift_den // shift_divisor,
+                )
+            else:
+                mean_offset_shift = None
+            drifts.append(
+                {
+                    "type": baseline_entry["type"],
+                    "identity": BranchStore._freeze_lifetime_value(
+                        baseline_entry["identity"]
+                    ),
+                    "baseline": BranchStore._lifetime_scorecard_from_group(
+                        baseline_entry
+                    ),
+                    "recent": BranchStore._lifetime_scorecard_from_group(
+                        recent_entry
+                    ),
+                    "exact_drop": (
+                        exact_num // exact_divisor,
+                        window_den // exact_divisor,
+                    ),
+                    "window_drop": (
+                        window_num // window_divisor,
+                        window_den // window_divisor,
+                    ),
+                    "mean_offset_shift": mean_offset_shift,
+                }
+            )
+
+        def compare(
+            left: dict[str, object], right: dict[str, object]
+        ) -> int:
+            for field in ("window_drop", "exact_drop"):
+                left_num, left_den = left[field]
+                right_num, right_den = right[field]
+                left_cross = left_num * right_den
+                right_cross = right_num * left_den
+                if left_cross != right_cross:
+                    return -1 if left_cross > right_cross else 1
+            left_offset = left["recent"]["max_abs_offset"]
+            right_offset = right["recent"]["max_abs_offset"]
+            left_key = left_offset if left_offset is not None else -1
+            right_key = right_offset if right_offset is not None else -1
+            if left_key != right_key:
+                return -1 if left_key > right_key else 1
+            return 0
+
+        # The sort is stable, so fully tied records keep the object's
+        # first-appearance order across the complete backtest.
+        drifts.sort(key=functools.cmp_to_key(compare))
+
+        if len(drifts) > drift_limit:
+            raise ValueError(
+                f"lifetime churn drift limit exceeded: "
+                f"{len(drifts)} drift records, limit is "
+                f"{drift_limit}"
+            )
+
+        totals = {
+            "identities": 0,
+            "baseline_predictions": 0,
+            "recent_predictions": 0,
+            "baseline_resolved": 0,
+            "recent_resolved": 0,
+        }
+        for drift in drifts:
+            totals["identities"] += 1
+            totals["baseline_predictions"] += drift["baseline"][
+                "predictions"
+            ]
+            totals["recent_predictions"] += drift["recent"]["predictions"]
+            totals["baseline_resolved"] += drift["baseline"]["resolved"]
+            totals["recent_resolved"] += drift["recent"]["resolved"]
+        return {"drifts": tuple(drifts), "totals": totals}
+
     @staticmethod
     def _build_lifetime_churn_forecast_scorecards_result(
         backtest_results: list[dict[str, object]],
@@ -21243,84 +21740,16 @@ class BranchStore:
         object is built fresh and shares nothing with the cutoff
         results.
         """
-        grouped: dict[tuple[str, object], dict[str, object]] = {}
-        encounter: list[tuple[str, object]] = []
-        for cutoff_result in backtest_results:
-            for outcome in cutoff_result["outcomes"]:
-                key = (outcome["type"], outcome["identity"])
-                entry = grouped.get(key)
-                if entry is None:
-                    entry = {
-                        "type": outcome["type"],
-                        "identity": outcome["identity"],
-                        "predictions": 0,
-                        "hit": 0,
-                        "early": 0,
-                        "late": 0,
-                        "missed": 0,
-                        "unresolved": 0,
-                        "offset_sum": 0,
-                        "offset_count": 0,
-                        "max_abs_offset": 0,
-                    }
-                    grouped[key] = entry
-                    encounter.append(key)
-                entry["predictions"] += 1
-                entry[outcome["status"]] += 1
-                if outcome["actual"] is not None:
-                    offset = outcome["actual"] - outcome["predicted"]
-                    entry["offset_sum"] += offset
-                    entry["offset_count"] += 1
-                    entry["max_abs_offset"] = max(
-                        entry["max_abs_offset"], abs(offset)
-                    )
-
+        encounter, grouped = (
+            BranchStore._group_lifetime_backtest_outcomes(backtest_results)
+        )
         scorecards: list[dict[str, object]] = []
         for key in encounter:
             entry = grouped[key]
-            resolved = entry["predictions"] - entry["unresolved"]
-            if resolved < min_resolved:
+            if entry["predictions"] - entry["unresolved"] < min_resolved:
                 continue
-            observed = entry["hit"] + entry["early"] + entry["late"]
-            exact_divisor = math.gcd(entry["hit"], resolved)
-            window_divisor = math.gcd(observed, resolved)
-            if entry["offset_count"]:
-                offset_divisor = math.gcd(
-                    entry["offset_sum"], entry["offset_count"]
-                )
-                mean_offset: tuple[int, int] | None = (
-                    entry["offset_sum"] // offset_divisor,
-                    entry["offset_count"] // offset_divisor,
-                )
-                max_abs_offset: int | None = entry["max_abs_offset"]
-            else:
-                mean_offset = None
-                max_abs_offset = None
             scorecards.append(
-                {
-                    "type": entry["type"],
-                    "identity": BranchStore._freeze_lifetime_value(
-                        entry["identity"]
-                    ),
-                    "predictions": entry["predictions"],
-                    "resolved": resolved,
-                    "unresolved": entry["unresolved"],
-                    "hit": entry["hit"],
-                    "early": entry["early"],
-                    "late": entry["late"],
-                    "missed": entry["missed"],
-                    "observed": observed,
-                    "exact_rate": (
-                        entry["hit"] // exact_divisor,
-                        resolved // exact_divisor,
-                    ),
-                    "window_rate": (
-                        observed // window_divisor,
-                        resolved // window_divisor,
-                    ),
-                    "mean_offset": mean_offset,
-                    "max_abs_offset": max_abs_offset,
-                }
+                BranchStore._lifetime_scorecard_from_group(entry)
             )
 
         if len(scorecards) > scorecard_limit:
@@ -21355,6 +21784,107 @@ class BranchStore:
             ):
                 totals[name] += scorecard[name]
         return {"scorecards": tuple(scorecards), "totals": totals}
+
+    @staticmethod
+    def _group_lifetime_backtest_outcomes(
+        backtest_results: list[dict[str, object]],
+    ) -> tuple[
+        list[tuple[str, object]], dict[tuple[str, object], dict[str, object]]
+    ]:
+        """Group one backtest's outcomes by ``(type, identity)``.
+
+        Shared by the scorecard and drift aggregations. Outcomes are
+        scanned cutoff by cutoff in request order and every outcome
+        counts separately, however often its identity was predicted.
+        Returns the keys in first-appearance order together with the
+        per-key counter dict; the counters are internal working state
+        and are never exposed in a result.
+        """
+        grouped: dict[tuple[str, object], dict[str, object]] = {}
+        encounter: list[tuple[str, object]] = []
+        for cutoff_result in backtest_results:
+            for outcome in cutoff_result["outcomes"]:
+                key = (outcome["type"], outcome["identity"])
+                entry = grouped.get(key)
+                if entry is None:
+                    entry = {
+                        "type": outcome["type"],
+                        "identity": outcome["identity"],
+                        "predictions": 0,
+                        "hit": 0,
+                        "early": 0,
+                        "late": 0,
+                        "missed": 0,
+                        "unresolved": 0,
+                        "offset_sum": 0,
+                        "offset_count": 0,
+                        "max_abs_offset": 0,
+                    }
+                    grouped[key] = entry
+                    encounter.append(key)
+                entry["predictions"] += 1
+                entry[outcome["status"]] += 1
+                if outcome["actual"] is not None:
+                    offset = outcome["actual"] - outcome["predicted"]
+                    entry["offset_sum"] += offset
+                    entry["offset_count"] += 1
+                    entry["max_abs_offset"] = max(
+                        entry["max_abs_offset"], abs(offset)
+                    )
+        return encounter, grouped
+
+    @staticmethod
+    def _lifetime_scorecard_from_group(
+        entry: dict[str, object],
+    ) -> dict[str, object]:
+        """Build one fresh scorecard dict from a grouped outcome entry.
+
+        Shared by the scorecard and drift aggregations. The entry must
+        have at least one resolved outcome; rates and the mean offset
+        are reduced ``(numerator, denominator)`` integer tuples, and
+        with no observed outcome the offset fields are ``None``. The
+        result shares nothing with the entry.
+        """
+        resolved = entry["predictions"] - entry["unresolved"]
+        observed = entry["hit"] + entry["early"] + entry["late"]
+        exact_divisor = math.gcd(entry["hit"], resolved)
+        window_divisor = math.gcd(observed, resolved)
+        if entry["offset_count"]:
+            offset_divisor = math.gcd(
+                entry["offset_sum"], entry["offset_count"]
+            )
+            mean_offset: tuple[int, int] | None = (
+                entry["offset_sum"] // offset_divisor,
+                entry["offset_count"] // offset_divisor,
+            )
+            max_abs_offset: int | None = entry["max_abs_offset"]
+        else:
+            mean_offset = None
+            max_abs_offset = None
+        return {
+            "type": entry["type"],
+            "identity": BranchStore._freeze_lifetime_value(
+                entry["identity"]
+            ),
+            "predictions": entry["predictions"],
+            "resolved": resolved,
+            "unresolved": entry["unresolved"],
+            "hit": entry["hit"],
+            "early": entry["early"],
+            "late": entry["late"],
+            "missed": entry["missed"],
+            "observed": observed,
+            "exact_rate": (
+                entry["hit"] // exact_divisor,
+                resolved // exact_divisor,
+            ),
+            "window_rate": (
+                observed // window_divisor,
+                resolved // window_divisor,
+            ),
+            "mean_offset": mean_offset,
+            "max_abs_offset": max_abs_offset,
+        }
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:
