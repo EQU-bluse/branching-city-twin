@@ -20833,116 +20833,25 @@ class BranchStore:
         if token is not None:
             view = self._reserve_snapshot_read(token)
         try:
-            prepared = view._capture_frontier_view(validated)
-
-            window_records: list[tuple[dict[str, object], ...]] = []
-            for position, index_values in enumerate(index_windows):
-                snapshots, segments = view._cascade_slice_timeline_data(
-                    prepared,
-                    index_values,
-                    causes,
-                    direction,
-                    depth_value,
-                    node_limit_value,
-                    change_limit_value,
-                )
-                lifetimes = view._build_slice_lifetimes(snapshots, segments)
-                if len(lifetimes) > lifetime_limit_value:
-                    raise ValueError(
-                        f"lifetime backtests lifetime limit exceeded: "
-                        f"{len(lifetimes)} lifetime records on window at "
-                        f"position {position}, limit is "
-                        f"{lifetime_limit_value}"
-                    )
-                window_records.append(lifetimes)
-
-            segment_changes: list[tuple[dict[str, object], ...]] = []
-            total_changes = 0
-            for position in range(len(window_records) - 1):
-                changes = view._build_lifetime_changes(
-                    window_records[position], window_records[position + 1]
-                )
-                if len(changes) > diff_limit_value:
-                    raise ValueError(
-                        f"lifetime backtests diff limit exceeded: "
-                        f"{len(changes)} change records on segment between "
-                        f"windows at positions {position} and {position + 1}, "
-                        f"limit is {diff_limit_value}"
-                    )
-                total_changes += len(changes)
-                segment_changes.append(changes)
-            if total_changes > total_diff_limit_value:
-                raise ValueError(
-                    f"lifetime backtests total diff limit exceeded: "
-                    f"{total_changes} change records over "
-                    f"{len(segment_changes)} segment(s), limit is "
-                    f"{total_diff_limit_value}"
-                )
-
-            waves_result = view._build_lifetime_churn_waves_result(
-                segment_changes, min_identities_value, wave_limit_value
+            results, grand_totals = view._compute_lifetime_backtest_cutoffs(
+                validated,
+                index_windows,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+                lifetime_limit_value,
+                diff_limit_value,
+                total_diff_limit_value,
+                min_identities_value,
+                wave_limit_value,
+                max_jitter_value,
+                horizon_value,
+                forecast_limit_value,
+                cutoffs_value,
+                backtest_limit_value,
             )
-            wave_records = waves_result["waves"]
-            last_wave = len(wave_records) - 1
-
-            # Range validation needs the actual wave set, which only
-            # exists after the frozen view's state checks have run.
-            for cutoff_value in cutoffs_value:
-                if cutoff_value > last_wave:
-                    raise ValueError(
-                        f"cutoff wave {cutoff_value} is out of range for "
-                        f"{last_wave + 1} wave(s)"
-                    )
-
-            # Identity membership by wave serial, read from the one
-            # observation wave set, answers every cutoff's scoring.
-            members_by_wave: list[set[tuple[str, object]]] = [
-                {
-                    (member["type"], member["identity"])
-                    for member in wave["members"]
-                }
-                for wave in wave_records
-            ]
-
-            results: list[dict[str, object]] = []
-            grand_totals = BranchStore._empty_backtest_totals()
-            for cutoff_value in cutoffs_value:
-                # Training sees only complete waves with serial numbers
-                # at most the cutoff; periodicity_limit is accepted and
-                # validated but does not bound a backtest, exactly as in
-                # a forecasts query.
-                periodicities_result = (
-                    view._build_lifetime_churn_periodicities_result(
-                        wave_records[: cutoff_value + 1],
-                        max_jitter_value,
-                        None,
-                    )
-                )
-                forecasts_result = (
-                    view._build_lifetime_churn_forecasts_result(
-                        periodicities_result["periodicities"],
-                        cutoff_value,
-                        horizon_value,
-                        forecast_limit_value,
-                    )
-                )
-                cutoff_result = view._build_lifetime_churn_backtest_cutoff(
-                    cutoff_value,
-                    forecasts_result["forecasts"],
-                    members_by_wave,
-                    last_wave,
-                )
-                results.append(cutoff_result)
-                for key in grand_totals:
-                    grand_totals[key] += cutoff_result["totals"][key]
-
-            if grand_totals["predictions"] > backtest_limit_value:
-                raise ValueError(
-                    f"lifetime churn backtest limit exceeded: "
-                    f"{grand_totals['predictions']} prediction records "
-                    f"across {len(results)} cutoff(s), limit is "
-                    f"{backtest_limit_value}"
-                )
             result = {
                 "backtests": tuple(results),
                 "totals": grand_totals,
@@ -20952,6 +20861,500 @@ class BranchStore:
                 self._refund_snapshot_read(token)
             raise
         return result
+
+    def _compute_lifetime_backtest_cutoffs(
+        self,
+        validated: dict[str, object],
+        index_windows: list[list[int]],
+        causes: tuple[str, ...],
+        direction: str,
+        depth_value: int,
+        node_limit_value: int,
+        change_limit_value: int,
+        lifetime_limit_value: int,
+        diff_limit_value: int,
+        total_diff_limit_value: int,
+        min_identities_value: int,
+        wave_limit_value: int,
+        max_jitter_value: int,
+        horizon_value: int,
+        forecast_limit_value: int,
+        cutoffs_value: tuple[int, ...],
+        backtest_limit_value: int,
+    ) -> tuple[list[dict[str, object]], dict[str, int]]:
+        """Score every requested cutoff's forecasts on this one view.
+
+        Shared by :meth:`lifetime_churn_forecast_backtests` and
+        :meth:`lifetime_churn_forecast_scorecards` so both run the same
+        state checks, caps, wave construction, cutoff training and
+        outcome classification over one identical frozen view. Must be
+        called on the view that answers the query -- the live store or
+        a snapshot's frozen view -- inside the caller's token
+        reserve/refund scope. Every cap up to the wave set, each
+        cutoff's range and ``forecast_limit`` and the cross-cutoff
+        ``backtest_limit`` are enforced here, only once every outcome
+        is built. Returns the per-cutoff ``cutoff, outcomes, totals``
+        dicts in request order together with the six-counter grand
+        totals.
+        """
+        prepared = self._capture_frontier_view(validated)
+
+        window_records: list[tuple[dict[str, object], ...]] = []
+        for position, index_values in enumerate(index_windows):
+            snapshots, segments = self._cascade_slice_timeline_data(
+                prepared,
+                index_values,
+                causes,
+                direction,
+                depth_value,
+                node_limit_value,
+                change_limit_value,
+            )
+            lifetimes = self._build_slice_lifetimes(snapshots, segments)
+            if len(lifetimes) > lifetime_limit_value:
+                raise ValueError(
+                    f"lifetime backtests lifetime limit exceeded: "
+                    f"{len(lifetimes)} lifetime records on window at "
+                    f"position {position}, limit is "
+                    f"{lifetime_limit_value}"
+                )
+            window_records.append(lifetimes)
+
+        segment_changes: list[tuple[dict[str, object], ...]] = []
+        total_changes = 0
+        for position in range(len(window_records) - 1):
+            changes = self._build_lifetime_changes(
+                window_records[position], window_records[position + 1]
+            )
+            if len(changes) > diff_limit_value:
+                raise ValueError(
+                    f"lifetime backtests diff limit exceeded: "
+                    f"{len(changes)} change records on segment between "
+                    f"windows at positions {position} and {position + 1}, "
+                    f"limit is {diff_limit_value}"
+                )
+            total_changes += len(changes)
+            segment_changes.append(changes)
+        if total_changes > total_diff_limit_value:
+            raise ValueError(
+                f"lifetime backtests total diff limit exceeded: "
+                f"{total_changes} change records over "
+                f"{len(segment_changes)} segment(s), limit is "
+                f"{total_diff_limit_value}"
+            )
+
+        waves_result = self._build_lifetime_churn_waves_result(
+            segment_changes, min_identities_value, wave_limit_value
+        )
+        wave_records = waves_result["waves"]
+        last_wave = len(wave_records) - 1
+
+        # Range validation needs the actual wave set, which only
+        # exists after the frozen view's state checks have run.
+        for cutoff_value in cutoffs_value:
+            if cutoff_value > last_wave:
+                raise ValueError(
+                    f"cutoff wave {cutoff_value} is out of range for "
+                    f"{last_wave + 1} wave(s)"
+                )
+
+        # Identity membership by wave serial, read from the one
+        # observation wave set, answers every cutoff's scoring.
+        members_by_wave: list[set[tuple[str, object]]] = [
+            {
+                (member["type"], member["identity"])
+                for member in wave["members"]
+            }
+            for wave in wave_records
+        ]
+
+        results: list[dict[str, object]] = []
+        grand_totals = BranchStore._empty_backtest_totals()
+        for cutoff_value in cutoffs_value:
+            # Training sees only complete waves with serial numbers
+            # at most the cutoff; periodicity_limit is accepted and
+            # validated but does not bound a backtest, exactly as in
+            # a forecasts query.
+            periodicities_result = (
+                self._build_lifetime_churn_periodicities_result(
+                    wave_records[: cutoff_value + 1],
+                    max_jitter_value,
+                    None,
+                )
+            )
+            forecasts_result = (
+                self._build_lifetime_churn_forecasts_result(
+                    periodicities_result["periodicities"],
+                    cutoff_value,
+                    horizon_value,
+                    forecast_limit_value,
+                )
+            )
+            cutoff_result = self._build_lifetime_churn_backtest_cutoff(
+                cutoff_value,
+                forecasts_result["forecasts"],
+                members_by_wave,
+                last_wave,
+            )
+            results.append(cutoff_result)
+            for key in grand_totals:
+                grand_totals[key] += cutoff_result["totals"][key]
+
+        if grand_totals["predictions"] > backtest_limit_value:
+            raise ValueError(
+                f"lifetime churn backtest limit exceeded: "
+                f"{grand_totals['predictions']} prediction records "
+                f"across {len(results)} cutoff(s), limit is "
+                f"{backtest_limit_value}"
+            )
+        return results, grand_totals
+
+    def lifetime_churn_forecast_scorecards(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Score each predicted identity's stability across backtests.
+
+        Reuses every public input, parameter order, validation order,
+        wave division, cutoff training, outcome classification and
+        token semantic of :meth:`lifetime_churn_forecast_backtests`,
+        appending ``min_resolved`` and ``scorecard_limit`` in that
+        order after ``backtest_limit`` (still before any state lookup)
+        and keeping the same optional trailing ``token``. Each must be
+        a non-``bool`` :class:`int` of at least one (else
+        :class:`TypeError` then :class:`ValueError`).
+
+        The same one frozen view captured by
+        :meth:`_capture_frontier_view` answers the whole query, and the
+        per-cutoff outcomes are exactly those a
+        :meth:`lifetime_churn_forecast_backtests` call with the same
+        arguments would score, including the cross-cutoff
+        ``backtest_limit`` cap. The outcomes of every cutoff, in
+        request order, are then grouped by ``(type, identity)``;
+        duplicate predictions of one identity count separately. Each
+        group becomes one scorecard, and scorecards are ordered by the
+        object's first appearance across the grouped outcomes.
+
+        A scorecard is a fresh dict with keys ordered ``type,
+        identity, predictions, resolved, unresolved, hit, early, late,
+        missed, observed, exact_rate, window_rate, mean_offset,
+        max_abs_offset``: ``predictions`` counts the group's outcomes,
+        ``resolved`` counts every outcome except ``unresolved``,
+        ``observed`` is ``hit + early + late``, and only objects whose
+        ``resolved`` reaches ``min_resolved`` are kept. ``exact_rate``
+        is ``hit / resolved`` and ``window_rate`` is ``observed /
+        resolved``, each returned as a reduced ``(numerator,
+        denominator)`` integer tuple. ``mean_offset`` is the mean of
+        ``actual - predicted`` over the outcomes with an ``actual``,
+        also returned as a reduced ``(numerator, denominator)`` integer
+        tuple; when no outcome has an ``actual``, both ``mean_offset``
+        and ``max_abs_offset`` are ``None``, otherwise
+        ``max_abs_offset`` is the largest absolute offset.
+
+        The result is a fresh dict whose keys are ordered ``scorecards,
+        totals``: ``totals`` is a fresh dict with keys ordered
+        ``identities, predictions, resolved, unresolved, hit, early,
+        late, missed, observed`` and sums only the kept scorecards, so
+        a query with no qualifying object returns an empty
+        ``scorecards`` tuple and nine zero totals. The complete
+        scorecard set is built before ``scorecard_limit`` -- checked
+        against the kept scorecard count -- is enforced, so an
+        over-limit query raises :class:`ValueError` without truncating
+        or returning partial records. The query is strictly read-only,
+        shares no object with internal state, and a tokenized success
+        consumes exactly one read while any failure refunds it.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every existing cap and the backtests caps are checked exactly
+        # as in lifetime_churn_forecast_backtests; min_resolved and
+        # scorecard_limit follow in that order, still before every
+        # state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # The same frozen view and cutoff scoring as a backtests query
+        # answer the aggregation, so a scorecard never observes a
+        # different state than the backtest it summarizes.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            result = view._build_lifetime_churn_forecast_scorecards_result(
+                results, min_resolved_value, scorecard_limit_value
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_scorecards_result(
+        backtest_results: list[dict[str, object]],
+        min_resolved: int,
+        scorecard_limit: int,
+    ) -> dict[str, object]:
+        """Aggregate one backtest's outcomes into per-identity scorecards.
+
+        Used only by :meth:`lifetime_churn_forecast_scorecards`. The
+        per-cutoff results are the complete, in-order output of
+        :meth:`_compute_lifetime_backtest_cutoffs`; outcomes are
+        grouped by ``(type, identity)`` in first-appearance order and
+        every outcome counts separately, however often its identity was
+        predicted. Only groups whose resolved count (every status but
+        ``unresolved``) reaches ``min_resolved`` are kept; the kept
+        scorecards are checked against ``scorecard_limit`` only once
+        all of them are built, so an over-limit query raises
+        :class:`ValueError` without truncating. Rates and the mean
+        offset are reduced ``(numerator, denominator)`` integer tuples;
+        with no observed outcome the offset fields are ``None``. Every
+        object is built fresh and shares nothing with the cutoff
+        results.
+        """
+        grouped: dict[tuple[str, object], dict[str, object]] = {}
+        encounter: list[tuple[str, object]] = []
+        for cutoff_result in backtest_results:
+            for outcome in cutoff_result["outcomes"]:
+                key = (outcome["type"], outcome["identity"])
+                entry = grouped.get(key)
+                if entry is None:
+                    entry = {
+                        "type": outcome["type"],
+                        "identity": outcome["identity"],
+                        "predictions": 0,
+                        "hit": 0,
+                        "early": 0,
+                        "late": 0,
+                        "missed": 0,
+                        "unresolved": 0,
+                        "offset_sum": 0,
+                        "offset_count": 0,
+                        "max_abs_offset": 0,
+                    }
+                    grouped[key] = entry
+                    encounter.append(key)
+                entry["predictions"] += 1
+                entry[outcome["status"]] += 1
+                if outcome["actual"] is not None:
+                    offset = outcome["actual"] - outcome["predicted"]
+                    entry["offset_sum"] += offset
+                    entry["offset_count"] += 1
+                    entry["max_abs_offset"] = max(
+                        entry["max_abs_offset"], abs(offset)
+                    )
+
+        scorecards: list[dict[str, object]] = []
+        for key in encounter:
+            entry = grouped[key]
+            resolved = entry["predictions"] - entry["unresolved"]
+            if resolved < min_resolved:
+                continue
+            observed = entry["hit"] + entry["early"] + entry["late"]
+            exact_divisor = math.gcd(entry["hit"], resolved)
+            window_divisor = math.gcd(observed, resolved)
+            if entry["offset_count"]:
+                offset_divisor = math.gcd(
+                    entry["offset_sum"], entry["offset_count"]
+                )
+                mean_offset: tuple[int, int] | None = (
+                    entry["offset_sum"] // offset_divisor,
+                    entry["offset_count"] // offset_divisor,
+                )
+                max_abs_offset: int | None = entry["max_abs_offset"]
+            else:
+                mean_offset = None
+                max_abs_offset = None
+            scorecards.append(
+                {
+                    "type": entry["type"],
+                    "identity": BranchStore._freeze_lifetime_value(
+                        entry["identity"]
+                    ),
+                    "predictions": entry["predictions"],
+                    "resolved": resolved,
+                    "unresolved": entry["unresolved"],
+                    "hit": entry["hit"],
+                    "early": entry["early"],
+                    "late": entry["late"],
+                    "missed": entry["missed"],
+                    "observed": observed,
+                    "exact_rate": (
+                        entry["hit"] // exact_divisor,
+                        resolved // exact_divisor,
+                    ),
+                    "window_rate": (
+                        observed // window_divisor,
+                        resolved // window_divisor,
+                    ),
+                    "mean_offset": mean_offset,
+                    "max_abs_offset": max_abs_offset,
+                }
+            )
+
+        if len(scorecards) > scorecard_limit:
+            raise ValueError(
+                f"lifetime churn scorecard limit exceeded: "
+                f"{len(scorecards)} scorecard records, limit is "
+                f"{scorecard_limit}"
+            )
+
+        totals = {
+            "identities": 0,
+            "predictions": 0,
+            "resolved": 0,
+            "unresolved": 0,
+            "hit": 0,
+            "early": 0,
+            "late": 0,
+            "missed": 0,
+            "observed": 0,
+        }
+        for scorecard in scorecards:
+            totals["identities"] += 1
+            for name in (
+                "predictions",
+                "resolved",
+                "unresolved",
+                "hit",
+                "early",
+                "late",
+                "missed",
+                "observed",
+            ):
+                totals[name] += scorecard[name]
+        return {"scorecards": tuple(scorecards), "totals": totals}
 
     @staticmethod
     def _validate_backtest_cutoffs(cutoffs: Any) -> tuple[int, ...]:
