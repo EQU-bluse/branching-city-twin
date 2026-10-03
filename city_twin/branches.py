@@ -26644,6 +26644,499 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_backtests(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        min_splits: int,
+        streak_result_limit: int,
+        min_active_identities: int,
+        wave_result_limit: int,
+        min_wave_occurrences: int,
+        recurrence_result_limit: int,
+        max_wave_jitter: int,
+        periodicity_result_limit: int,
+        wave_horizon: int,
+        prediction_result_limit: int,
+        wave_cutoffs: tuple[int, ...],
+        match_tolerance: int,
+        prediction_backtest_limit: int,
+        min_evaluated: int,
+        min_cutoffs: int,
+        prediction_scorecard_limit: int,
+        baseline_splits: tuple[int, ...],
+        min_evaluated_delta: int,
+        min_hit_rate_drop: tuple[int, int],
+        regression_limit: int,
+        min_consecutive_splits: int,
+        regression_streak_limit: int,
+        min_active_regressions: int,
+        regression_wave_limit: int,
+        min_regression_wave_occurrences: int,
+        regression_wave_recurrence_limit: int,
+        max_regression_wave_jitter: int,
+        regression_wave_periodicity_limit: int,
+        regression_wave_horizon: int,
+        regression_wave_forecast_limit: int,
+        regression_wave_cutoffs: tuple[int, ...],
+        regression_wave_match_tolerance: int,
+        regression_wave_forecast_backtest_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Backtest regression-wave projections against the later waves.
+
+        Reuses every public input, parameter order, validation order,
+        stage cap and frozen-view semantic of
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecasts`,
+        appending ``regression_wave_cutoffs``,
+        ``regression_wave_match_tolerance`` and
+        ``regression_wave_forecast_backtest_limit`` in that order after
+        ``regression_wave_forecast_limit`` (still before the split
+        membership check and any state lookup), keeping the same
+        optional trailing ``token``. ``regression_wave_cutoffs`` must
+        be a tuple of non-``bool`` :class:`int` values, strictly
+        increasing: a non-tuple container or a
+        ``bool``/non-:class:`int` element raises :class:`TypeError`,
+        while a negative, duplicate or non-strictly-increasing element
+        raises :class:`ValueError`; once the regression wave set
+        exists, an element beyond its last wave serial also raises
+        :class:`ValueError` (an empty wave set skips that range check
+        and returns an empty result). ``regression_wave_match_tolerance``
+        must be a non-``bool`` non-negative :class:`int` and
+        ``regression_wave_forecast_backtest_limit`` a non-``bool``
+        :class:`int` of at least one (a ``bool`` or non-:class:`int`
+        raises :class:`TypeError`, an out-of-range value
+        :class:`ValueError`).
+
+        Every stage through the regression wave set runs exactly once,
+        exactly as in the regression wave forecasts query, and the
+        complete regression wave set of the one frozen view is the
+        observation set. Each cutoff is a regression-wave serial
+        number: training at that cutoff reruns the recurrence and
+        periodicity stages -- with their own caps and
+        ``max_regression_wave_jitter`` -- on the prefix of waves with
+        serial numbers at most the cutoff, so an identity takes part
+        only with at least three training appearances and a jitter of
+        at most ``max_regression_wave_jitter``, and its period, jitter
+        and record order come from the prefix alone. Each kept
+        identity then projects from its last training wave by its
+        median period exactly as the forecasts query does with the
+        cutoff as the observation boundary, keeping only projected
+        waves strictly greater than the cutoff and at most
+        ``cutoff + regression_wave_horizon``; an identity with no
+        projected wave inside that window returns no record.
+        ``regression_wave_forecast_limit`` bounds each cutoff's
+        complete prediction set measured across every identity, and
+        ``regression_wave_forecast_backtest_limit`` bounds the
+        complete cross-cutoff record set, each checked only once its
+        set is complete, so an over-limit query raises
+        :class:`ValueError` without truncating.
+
+        A cutoff's evaluation window is the observed waves with serial
+        numbers greater than the cutoff and at most ``cutoff +
+        regression_wave_horizon``. Each target, in ascending wave
+        order, claims the nearest still-unmatched appearance of the
+        same identity inside the window whose distance is at most
+        ``regression_wave_match_tolerance`` -- equal distances go to
+        the earlier observed wave and no observed wave is matched
+        twice -- and is ``hit`` with that wave as its ``actual``; an
+        unmatched target is ``missed`` when its predicted wave does
+        not exceed the observation set's last wave serial and
+        ``unresolved`` when it does. Observed appearances inside the
+        window that no target claims are the record's ``unexpected``
+        count.
+
+        The result is a fresh dict whose keys are ordered ``backtests,
+        totals``. Each record is a fresh dict whose keys are ordered
+        ``cutoff, identity, waves, first_wave, last_wave, span,
+        points, peak_active, appearances, intervals, period, jitter,
+        targets, hit, missed, unresolved, unexpected`` -- the training
+        periodicity fields exactly as the forecasts query reports
+        them, prefixed with the cutoff and followed by the targets and
+        the four counters; ``targets`` is an ascending-wave tuple of
+        fresh dicts ordered ``ordinal, wave, earliest, latest, actual,
+        status``, with ``actual`` the matched wave's serial or
+        ``None``. Records sort by cutoff ascending and then keep the
+        cutoff's periodicity order. ``totals`` is a fresh dict with
+        keys ordered ``cutoffs, records, hit, missed, unresolved,
+        unexpected``: the number of cutoffs represented in the
+        records, the record count and the four summed counters. An
+        empty ``regression_wave_cutoffs`` tuple, an empty wave set and
+        a query with no qualifying identity all return an empty
+        ``backtests`` tuple and six zero totals. Every object is built
+        fresh and shares nothing with internal state; a tokenized
+        success consumes exactly one read while any failure refunds
+        it, and a tokenless query observes the same frozen view and
+        never mutates branches, the event graph or persistence files.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every cap is checked exactly as in the regression wave
+        # forecasts query; regression_wave_cutoffs,
+        # regression_wave_match_tolerance and
+        # regression_wave_forecast_backtest_limit follow
+        # regression_wave_forecast_limit in that order, still before
+        # the split membership check and every state lookup. Wave
+        # cutoffs cannot be range-checked until the actual regression
+        # waves are known, so only their types, non-negativity and
+        # strict ordering are settled here.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        min_splits_value = BranchStore._require_record_limit(
+            min_splits, "min_splits"
+        )
+        streak_result_limit_value = BranchStore._require_record_limit(
+            streak_result_limit, "streak_result_limit"
+        )
+        min_active_identities_value = BranchStore._require_record_limit(
+            min_active_identities, "min_active_identities"
+        )
+        wave_result_limit_value = BranchStore._require_record_limit(
+            wave_result_limit, "wave_result_limit"
+        )
+        min_wave_occurrences_value = BranchStore._require_record_limit(
+            min_wave_occurrences, "min_wave_occurrences"
+        )
+        recurrence_result_limit_value = BranchStore._require_record_limit(
+            recurrence_result_limit, "recurrence_result_limit"
+        )
+        max_wave_jitter_value = BranchStore._require_non_negative_limit(
+            max_wave_jitter, "max_wave_jitter"
+        )
+        periodicity_result_limit_value = BranchStore._require_record_limit(
+            periodicity_result_limit, "periodicity_result_limit"
+        )
+        wave_horizon_value = BranchStore._require_record_limit(
+            wave_horizon, "wave_horizon"
+        )
+        prediction_result_limit_value = BranchStore._require_record_limit(
+            prediction_result_limit, "prediction_result_limit"
+        )
+        wave_cutoffs_value = BranchStore._validate_wave_cutoffs(wave_cutoffs)
+        match_tolerance_value = BranchStore._require_non_negative_limit(
+            match_tolerance, "match_tolerance"
+        )
+        prediction_backtest_limit_value = BranchStore._require_record_limit(
+            prediction_backtest_limit, "prediction_backtest_limit"
+        )
+        min_evaluated_value = BranchStore._require_non_negative_limit(
+            min_evaluated, "min_evaluated"
+        )
+        min_cutoffs_value = BranchStore._require_record_limit(
+            min_cutoffs, "min_cutoffs"
+        )
+        prediction_scorecard_limit_value = BranchStore._require_record_limit(
+            prediction_scorecard_limit, "prediction_scorecard_limit"
+        )
+        baseline_splits_value = (
+            BranchStore._validate_regression_baseline_splits(baseline_splits)
+        )
+        min_evaluated_delta_value = BranchStore._require_non_negative_limit(
+            min_evaluated_delta, "min_evaluated_delta"
+        )
+        min_hit_rate_drop_value = BranchStore._validate_min_hit_rate_drop(
+            min_hit_rate_drop
+        )
+        regression_limit_value = BranchStore._require_record_limit(
+            regression_limit, "regression_limit"
+        )
+        min_consecutive_splits_value = BranchStore._require_record_limit(
+            min_consecutive_splits, "min_consecutive_splits"
+        )
+        regression_streak_limit_value = BranchStore._require_record_limit(
+            regression_streak_limit, "regression_streak_limit"
+        )
+        min_active_regressions_value = BranchStore._require_record_limit(
+            min_active_regressions, "min_active_regressions"
+        )
+        regression_wave_limit_value = BranchStore._require_record_limit(
+            regression_wave_limit, "regression_wave_limit"
+        )
+        min_regression_wave_occurrences_value = (
+            BranchStore._require_record_limit(
+                min_regression_wave_occurrences,
+                "min_regression_wave_occurrences",
+            )
+        )
+        regression_wave_recurrence_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_recurrence_limit,
+                "regression_wave_recurrence_limit",
+            )
+        )
+        max_regression_wave_jitter_value = (
+            BranchStore._require_non_negative_limit(
+                max_regression_wave_jitter,
+                "max_regression_wave_jitter",
+            )
+        )
+        regression_wave_periodicity_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_periodicity_limit,
+                "regression_wave_periodicity_limit",
+            )
+        )
+        regression_wave_horizon_value = BranchStore._require_record_limit(
+            regression_wave_horizon,
+            "regression_wave_horizon",
+        )
+        regression_wave_forecast_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_forecast_limit,
+                "regression_wave_forecast_limit",
+            )
+        )
+        regression_wave_cutoffs_value = (
+            BranchStore._validate_regression_wave_cutoffs(
+                regression_wave_cutoffs
+            )
+        )
+        regression_wave_match_tolerance_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_match_tolerance,
+                "regression_wave_match_tolerance",
+            )
+        )
+        regression_wave_forecast_backtest_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_forecast_backtest_limit,
+                "regression_wave_forecast_backtest_limit",
+            )
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # Every stage through the regression wave set runs exactly
+        # once on one frozen view, exactly as in the forecasts query;
+        # the complete regression wave set is then the observation set
+        # every cutoff's prefix training and later-wave scoring reads
+        # from.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            scan = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+            streaks = (
+                BranchStore._build_lifetime_churn_forecast_drift_streaks_result(
+                    scan["scans"],
+                    min_splits_value,
+                    streak_result_limit_value,
+                )
+            )
+            waves = (
+                BranchStore._build_lifetime_churn_forecast_drift_waves_result(
+                    scan["scans"],
+                    streaks["streaks"],
+                    min_active_identities_value,
+                    wave_result_limit_value,
+                )
+            )
+            backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_backtests_result(
+                waves["waves"],
+                min_wave_occurrences_value,
+                recurrence_result_limit_value,
+                max_wave_jitter_value,
+                periodicity_result_limit_value,
+                wave_horizon_value,
+                prediction_result_limit_value,
+                wave_cutoffs_value,
+                match_tolerance_value,
+                prediction_backtest_limit_value,
+            )
+            scorecards = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecards_result(
+                backtests["backtests"],
+                min_evaluated_value,
+                min_cutoffs_value,
+                prediction_scorecard_limit_value,
+            )
+            regression_streaks = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_streaks_result(
+                backtests["backtests"],
+                scorecards["scorecards"],
+                baseline_splits_value,
+                min_evaluated_delta_value,
+                min_hit_rate_drop_value,
+                regression_limit_value,
+                min_consecutive_splits_value,
+                regression_streak_limit_value,
+            )
+            regression_waves = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_waves_result(
+                regression_streaks["streaks"],
+                baseline_splits_value,
+                min_active_regressions_value,
+                regression_wave_limit_value,
+            )
+            result = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_backtests_result(
+                regression_waves["waves"],
+                min_regression_wave_occurrences_value,
+                regression_wave_recurrence_limit_value,
+                max_regression_wave_jitter_value,
+                regression_wave_periodicity_limit_value,
+                regression_wave_horizon_value,
+                regression_wave_forecast_limit_value,
+                regression_wave_cutoffs_value,
+                regression_wave_match_tolerance_value,
+                regression_wave_forecast_backtest_limit_value,
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
     @staticmethod
     def _validate_min_hit_rate_drop(
         min_hit_rate_drop: Any,
@@ -28723,6 +29216,250 @@ class BranchStore:
         return {"forecasts": tuple(records), "totals": totals}
 
     @staticmethod
+    def _build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_backtests_result(
+        wave_records: tuple[dict[str, object], ...],
+        min_regression_wave_occurrences: int,
+        regression_wave_recurrence_limit: int,
+        max_regression_wave_jitter: int,
+        regression_wave_periodicity_limit: int,
+        regression_wave_horizon: int,
+        regression_wave_forecast_limit: int,
+        regression_wave_cutoffs: tuple[int, ...],
+        regression_wave_match_tolerance: int,
+        regression_wave_forecast_backtest_limit: int,
+    ) -> dict[str, object]:
+        """Score each cutoff's prefix-trained projections on later waves.
+
+        Used only by
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_backtests`.
+        The wave records are the complete, already-bounded ``waves``
+        tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_waves_result`,
+        so each wave's position in the tuple is its zero-based serial
+        number and the last serial is the observation end. When the
+        wave set is non-empty, every cutoff beyond its last serial
+        raises :class:`ValueError` before any training runs; an empty
+        wave set skips the range check and scores nothing.
+
+        Each cutoff reruns the recurrence and periodicity aggregations
+        on the prefix of waves with serial numbers at most the cutoff,
+        with ``min_regression_wave_occurrences``,
+        ``max_regression_wave_jitter`` and the two stage caps applied
+        exactly as in the forecasts query, and then projects each kept
+        identity's waves from its last training wave by its median
+        period, keeping only projected waves strictly greater than the
+        cutoff and at most ``cutoff + regression_wave_horizon``. The
+        evaluation window is the observed serials greater than the
+        cutoff and at most ``cutoff + regression_wave_horizon``;
+        targets claim same-identity appearances in that window in
+        ascending target order, nearest first, equal distances going
+        to the earlier wave, never reusing an appearance. A claimed
+        target is ``hit``; an unclaimed one is ``missed`` when its
+        predicted wave does not exceed the observation end and
+        ``unresolved`` when it does; unclaimed window appearances
+        count as ``unexpected``.
+
+        ``regression_wave_forecast_limit`` bounds each cutoff's
+        complete prediction set measured across every identity and
+        ``regression_wave_forecast_backtest_limit`` the complete
+        cross-cutoff record set, both enforced only once the set is
+        built, so an over-limit query raises :class:`ValueError`
+        without truncating. Records sort by cutoff ascending and then
+        keep the cutoff's periodicity order; each record is a
+        fresh dict ordered ``cutoff, identity, waves, first_wave,
+        last_wave, span, points, peak_active, appearances, intervals,
+        period, jitter, targets, hit, missed, unresolved, unexpected``
+        and each target a fresh dict ordered ``ordinal, wave,
+        earliest, latest, actual, status``. ``totals`` counts the
+        represented cutoffs, the records and the four outcome
+        counters. Every record, appearance, target and totals dict is
+        built fresh and shares no mutable object with the wave
+        records.
+        """
+        last_wave = len(wave_records) - 1
+        if wave_records:
+            # A cutoff's range is only meaningful once the wave set
+            # exists; an empty wave set scores nothing at all.
+            for cutoff in regression_wave_cutoffs:
+                if cutoff > last_wave:
+                    raise ValueError(
+                        f"regression wave cutoff {cutoff} is out of "
+                        f"range for {last_wave + 1} regression wave(s)"
+                    )
+
+        # Each identity's observed wave serials, ascending, answer
+        # every cutoff's matching from the one observation set.
+        serials_by_identity: dict[object, list[int]] = {}
+        for serial, wave in enumerate(wave_records):
+            present: set[object] = set()
+            for point in wave["points"]:
+                for identity in point["identities"]:
+                    present.add(identity)
+            for identity in present:
+                serials_by_identity.setdefault(identity, []).append(serial)
+
+        records: list[dict[str, object]] = []
+        for cutoff in regression_wave_cutoffs:
+            # Training sees only waves with serial numbers at most the
+            # cutoff; the recurrence and periodicity stages rerun on
+            # that prefix with their own caps, so every record's
+            # period, jitter and order come from the prefix alone.
+            recurrences = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_recurrences_result(
+                wave_records[: cutoff + 1],
+                min_regression_wave_occurrences,
+                regression_wave_recurrence_limit,
+            )
+            periodicities = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_periodicities_result(
+                recurrences["recurrences"],
+                max_regression_wave_jitter,
+                regression_wave_periodicity_limit,
+            )
+            window_end = cutoff + regression_wave_horizon
+            cutoff_records: list[dict[str, object]] = []
+            cutoff_predictions = 0
+            for periodicity in periodicities["periodicities"]:
+                identity = periodicity["identity"]
+                period = periodicity["period"]
+                last_training = periodicity["last_wave"]
+                intervals = periodicity["intervals"]
+                smallest = min(intervals)
+                largest = max(intervals)
+                target_waves: list[tuple[int, int, int, int]] = []
+                ordinal = 1
+                while True:
+                    wave = last_training + ordinal * period
+                    if wave > window_end:
+                        break
+                    if wave > cutoff:
+                        target_waves.append(
+                            (
+                                ordinal,
+                                wave,
+                                last_training + ordinal * smallest,
+                                last_training + ordinal * largest,
+                            )
+                        )
+                    ordinal += 1
+                if not target_waves:
+                    continue
+                # Observed appearances of the identity after the
+                # cutoff and inside the evaluation window, ascending.
+                reals = [
+                    serial
+                    for serial in serials_by_identity.get(identity, ())
+                    if cutoff < serial <= window_end
+                ]
+                used = [False] * len(reals)
+                targets: list[dict[str, object]] = []
+                hit = 0
+                missed = 0
+                unresolved = 0
+                for ordinal, wave, earliest, latest in target_waves:
+                    best_index: int | None = None
+                    best_distance: int | None = None
+                    for index, real in enumerate(reals):
+                        if used[index]:
+                            continue
+                        distance = real - wave
+                        if distance < 0:
+                            distance = -distance
+                        if distance > regression_wave_match_tolerance:
+                            continue
+                        # Ascending scan with a strict improvement
+                        # test keeps the earlier wave on ties.
+                        if best_distance is None or distance < best_distance:
+                            best_distance = distance
+                            best_index = index
+                    if best_index is not None:
+                        used[best_index] = True
+                        actual: int | None = reals[best_index]
+                        status = "hit"
+                        hit += 1
+                    else:
+                        actual = None
+                        if wave <= last_wave:
+                            status = "missed"
+                            missed += 1
+                        else:
+                            status = "unresolved"
+                            unresolved += 1
+                    targets.append(
+                        {
+                            "ordinal": ordinal,
+                            "wave": wave,
+                            "earliest": earliest,
+                            "latest": latest,
+                            "actual": actual,
+                            "status": status,
+                        }
+                    )
+                cutoff_predictions += len(targets)
+                cutoff_records.append(
+                    {
+                        "cutoff": cutoff,
+                        "identity": BranchStore._freeze_lifetime_value(
+                            identity
+                        ),
+                        "waves": periodicity["waves"],
+                        "first_wave": periodicity["first_wave"],
+                        "last_wave": last_training,
+                        "span": periodicity["span"],
+                        "points": periodicity["points"],
+                        "peak_active": periodicity["peak_active"],
+                        "appearances": tuple(
+                            dict(appearance)
+                            for appearance in periodicity["appearances"]
+                        ),
+                        "intervals": tuple(
+                            interval for interval in intervals
+                        ),
+                        "period": period,
+                        "jitter": periodicity["jitter"],
+                        "targets": tuple(targets),
+                        "hit": hit,
+                        "missed": missed,
+                        "unresolved": unresolved,
+                        "unexpected": used.count(False),
+                    }
+                )
+            if cutoff_predictions > regression_wave_forecast_limit:
+                raise ValueError(
+                    f"lifetime churn drift wave prediction scorecard "
+                    f"regression wave forecast limit exceeded: "
+                    f"{cutoff_predictions} prediction records, limit "
+                    f"is {regression_wave_forecast_limit}"
+                )
+            records.extend(cutoff_records)
+
+        if len(records) > regression_wave_forecast_backtest_limit:
+            raise ValueError(
+                f"lifetime churn drift wave prediction scorecard "
+                f"regression wave forecast backtest limit exceeded: "
+                f"{len(records)} prediction records across "
+                f"{len(regression_wave_cutoffs)} cutoff(s), limit is "
+                f"{regression_wave_forecast_backtest_limit}"
+            )
+
+        cutoff_seen: set[object] = set()
+        totals = {
+            "cutoffs": 0,
+            "records": 0,
+            "hit": 0,
+            "missed": 0,
+            "unresolved": 0,
+            "unexpected": 0,
+        }
+        for record in records:
+            cutoff_seen.add(record["cutoff"])
+            totals["records"] += 1
+            totals["hit"] += record["hit"]
+            totals["missed"] += record["missed"]
+            totals["unresolved"] += record["unresolved"]
+            totals["unexpected"] += record["unexpected"]
+        totals["cutoffs"] = len(cutoff_seen)
+        return {"backtests": tuple(records), "totals": totals}
+
+    @staticmethod
     def _validate_wave_cutoffs(wave_cutoffs: Any) -> tuple[int, ...]:
         """Validate the wave cutoff tuple's types, signs and ordering.
 
@@ -28761,6 +29498,51 @@ class BranchStore:
                 )
             previous = wave_cutoff
             validated.append(wave_cutoff)
+        return tuple(validated)
+
+    @staticmethod
+    def _validate_regression_wave_cutoffs(
+        regression_wave_cutoffs: Any,
+    ) -> tuple[int, ...]:
+        """Validate the regression wave cutoff tuple's types and order.
+
+        Used only by
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_backtests`,
+        before any state lookup: ``regression_wave_cutoffs`` must be a
+        tuple (else :class:`TypeError`) of non-``bool`` :class:`int`
+        values (a ``bool`` or non-:class:`int` element raises
+        :class:`TypeError`); a negative, duplicate or
+        non-strictly-increasing element raises :class:`ValueError`.
+        Range against the actual regression wave count is the caller's
+        concern, since the wave set is only known after the frozen
+        view is captured.
+        """
+        if not isinstance(regression_wave_cutoffs, tuple):
+            raise TypeError(
+                f"regression_wave_cutoffs must be a tuple, got "
+                f"{type(regression_wave_cutoffs).__name__}"
+            )
+        validated: list[int] = []
+        previous: int | None = None
+        for position, regression_wave_cutoff in enumerate(
+            regression_wave_cutoffs
+        ):
+            name = f"regression_wave_cutoffs[{position}]"
+            if isinstance(regression_wave_cutoff, bool) or not isinstance(
+                regression_wave_cutoff, int
+            ):
+                raise TypeError(
+                    f"{name} must be an int, got "
+                    f"{type(regression_wave_cutoff).__name__}"
+                )
+            if regression_wave_cutoff < 0:
+                raise ValueError(f"{name} must be non-negative")
+            if previous is not None and regression_wave_cutoff <= previous:
+                raise ValueError(
+                    "regression_wave_cutoffs must be strictly increasing"
+                )
+            previous = regression_wave_cutoff
+            validated.append(regression_wave_cutoff)
         return tuple(validated)
 
     @staticmethod
