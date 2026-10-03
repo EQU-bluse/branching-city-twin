@@ -24204,6 +24204,436 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_wave_prediction_scorecard_regressions(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        min_splits: int,
+        streak_result_limit: int,
+        min_active_identities: int,
+        wave_result_limit: int,
+        min_wave_occurrences: int,
+        recurrence_result_limit: int,
+        max_wave_jitter: int,
+        periodicity_result_limit: int,
+        wave_horizon: int,
+        prediction_result_limit: int,
+        wave_cutoffs: tuple[int, ...],
+        match_tolerance: int,
+        prediction_backtest_limit: int,
+        min_evaluated: int,
+        min_cutoffs: int,
+        prediction_scorecard_limit: int,
+        baseline_cutoffs: int,
+        min_evaluated_delta: int,
+        min_hit_rate_drop: tuple[int, int],
+        regression_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Measure each identity's prediction stability regression.
+
+        Reuses every public input, parameter order, validation order,
+        stage cap, cutoff training, outcome classification, scorecard
+        aggregation, over-limit error and frozen-view semantic of
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecards`,
+        appending ``baseline_cutoffs``, ``min_evaluated_delta``,
+        ``min_hit_rate_drop`` and ``regression_limit`` in that order
+        after ``prediction_scorecard_limit`` (still before the split
+        membership check and any state lookup), keeping the same
+        optional trailing ``token``. ``baseline_cutoffs`` and
+        ``regression_limit`` must be non-``bool`` :class:`int` values
+        of at least one, while ``min_evaluated_delta`` must be a
+        non-``bool`` non-negative :class:`int` (a ``bool`` or
+        non-:class:`int` raises :class:`TypeError`, an out-of-range
+        value raises :class:`ValueError`). ``min_hit_rate_drop`` must
+        be a two-element tuple of non-``bool`` :class:`int` values (a
+        non-tuple container or a ``bool``/non-:class:`int` element
+        raises :class:`TypeError`) whose denominator is positive and
+        whose numerator lies between zero and the denominator
+        inclusive (else :class:`ValueError`).
+
+        The scan, streak, wave, recurrence, periodicity, backtest and
+        scorecard stages run exactly once, exactly as in the
+        prediction scorecards query: the one frozen view produces
+        exactly the complete scorecard set a prediction scorecards
+        call with the same arguments would return, with every
+        underlying stage cap -- including ``prediction_scorecard_limit``
+        over the kept scorecard set -- and every underlying exception
+        unchanged. Only identities kept as scorecards are regression
+        candidates. Each candidate's backtest records run cutoff
+        ascending; the first ``baseline_cutoffs`` records form the
+        identity's baseline segment and the remaining records the
+        observation segment.
+
+        Each kept identity becomes one fresh regression record whose
+        keys are ordered ``identity, baseline_cutoffs,
+        observation_cutoffs, baseline_evaluated, observation_evaluated,
+        baseline_hit_rate, observation_hit_rate, rate_drop,
+        first_regression_cutoff``: the two ``*_cutoffs`` values are
+        each segment's record count (an identity has at most one
+        record per cutoff), each ``*_evaluated`` is the segment's
+        ``hit + missed``, each ``*_hit_rate`` is the segment's reduced
+        ``(hit, evaluated)`` integer tuple, and ``rate_drop`` is the
+        baseline hit rate minus the observation hit rate as a reduced
+        ``(numerator, denominator)`` integer tuple.
+        ``first_regression_cutoff`` is the first observation cutoff,
+        in cutoff ascending order, at which the observation records
+        accumulated so far reach both ``min_evaluated_delta`` over the
+        baseline evaluated count and the ``min_hit_rate_drop``
+        threshold. Only identities with records in both segments, a
+        non-zero evaluated count in each segment, an observation
+        evaluated count exceeding the baseline's by at least
+        ``min_evaluated_delta`` and a hit-rate drop reaching
+        ``min_hit_rate_drop`` are kept; every rate comparison
+        cross-multiplies the integer parts, never dividing. Records
+        sort by ``rate_drop`` descending, then observation
+        ``evaluated`` descending, then the identity in Unicode code
+        point order. The complete qualifying set is built before
+        ``regression_limit`` is enforced, so an over-limit query
+        raises :class:`ValueError` without truncating.
+
+        The result is a fresh dict whose keys are ordered
+        ``regressions, totals``; ``regressions`` is a tuple and
+        ``totals`` is a fresh dict with keys ordered ``identities,
+        baseline_evaluated, baseline_hit, baseline_missed,
+        observation_evaluated, observation_hit, observation_missed``:
+        the kept identity count and the two segments' three counters
+        summed over the kept records. A query with no qualifying
+        identity returns an empty ``regressions`` tuple and seven zero
+        totals. Every object is built fresh and shares nothing with
+        the backtest records or internal state; a tokenized success
+        consumes exactly one read while any failure refunds it, and a
+        tokenless query observes the same frozen view and never
+        mutates branches, the event graph, snapshot quotas or
+        persistence files.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every cap is checked exactly as in the prediction scorecards
+        # query; baseline_cutoffs, min_evaluated_delta,
+        # min_hit_rate_drop and regression_limit follow
+        # prediction_scorecard_limit in that order, still before the
+        # split membership check and every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        min_splits_value = BranchStore._require_record_limit(
+            min_splits, "min_splits"
+        )
+        streak_result_limit_value = BranchStore._require_record_limit(
+            streak_result_limit, "streak_result_limit"
+        )
+        min_active_identities_value = BranchStore._require_record_limit(
+            min_active_identities, "min_active_identities"
+        )
+        wave_result_limit_value = BranchStore._require_record_limit(
+            wave_result_limit, "wave_result_limit"
+        )
+        min_wave_occurrences_value = BranchStore._require_record_limit(
+            min_wave_occurrences, "min_wave_occurrences"
+        )
+        recurrence_result_limit_value = BranchStore._require_record_limit(
+            recurrence_result_limit, "recurrence_result_limit"
+        )
+        max_wave_jitter_value = BranchStore._require_non_negative_limit(
+            max_wave_jitter, "max_wave_jitter"
+        )
+        periodicity_result_limit_value = BranchStore._require_record_limit(
+            periodicity_result_limit, "periodicity_result_limit"
+        )
+        wave_horizon_value = BranchStore._require_record_limit(
+            wave_horizon, "wave_horizon"
+        )
+        prediction_result_limit_value = BranchStore._require_record_limit(
+            prediction_result_limit, "prediction_result_limit"
+        )
+        wave_cutoffs_value = BranchStore._validate_wave_cutoffs(wave_cutoffs)
+        match_tolerance_value = BranchStore._require_non_negative_limit(
+            match_tolerance, "match_tolerance"
+        )
+        prediction_backtest_limit_value = BranchStore._require_record_limit(
+            prediction_backtest_limit, "prediction_backtest_limit"
+        )
+        min_evaluated_value = BranchStore._require_non_negative_limit(
+            min_evaluated, "min_evaluated"
+        )
+        min_cutoffs_value = BranchStore._require_record_limit(
+            min_cutoffs, "min_cutoffs"
+        )
+        prediction_scorecard_limit_value = BranchStore._require_record_limit(
+            prediction_scorecard_limit, "prediction_scorecard_limit"
+        )
+        baseline_cutoffs_value = BranchStore._require_record_limit(
+            baseline_cutoffs, "baseline_cutoffs"
+        )
+        min_evaluated_delta_value = BranchStore._require_non_negative_limit(
+            min_evaluated_delta, "min_evaluated_delta"
+        )
+        min_hit_rate_drop_value = BranchStore._validate_min_hit_rate_drop(
+            min_hit_rate_drop
+        )
+        regression_limit_value = BranchStore._require_record_limit(
+            regression_limit, "regression_limit"
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # One frozen view answers the whole query: the complete
+        # prediction backtest record set and the scorecard set are
+        # produced exactly once, so a regression record never observes
+        # a different state than the scorecard it refines.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            scan = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+            streaks = (
+                BranchStore._build_lifetime_churn_forecast_drift_streaks_result(
+                    scan["scans"],
+                    min_splits_value,
+                    streak_result_limit_value,
+                )
+            )
+            waves = (
+                BranchStore._build_lifetime_churn_forecast_drift_waves_result(
+                    scan["scans"],
+                    streaks["streaks"],
+                    min_active_identities_value,
+                    wave_result_limit_value,
+                )
+            )
+            backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_backtests_result(
+                waves["waves"],
+                min_wave_occurrences_value,
+                recurrence_result_limit_value,
+                max_wave_jitter_value,
+                periodicity_result_limit_value,
+                wave_horizon_value,
+                prediction_result_limit_value,
+                wave_cutoffs_value,
+                match_tolerance_value,
+                prediction_backtest_limit_value,
+            )
+            scorecards = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecards_result(
+                backtests["backtests"],
+                min_evaluated_value,
+                min_cutoffs_value,
+                prediction_scorecard_limit_value,
+            )
+            result = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regressions_result(
+                backtests["backtests"],
+                scorecards["scorecards"],
+                baseline_cutoffs_value,
+                min_evaluated_delta_value,
+                min_hit_rate_drop_value,
+                regression_limit_value,
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
+    @staticmethod
+    def _validate_min_hit_rate_drop(
+        min_hit_rate_drop: Any,
+    ) -> tuple[int, int]:
+        """Validate the minimum hit-rate drop threshold.
+
+        Used only by
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regressions`,
+        before any state lookup: ``min_hit_rate_drop`` must be a tuple
+        (else :class:`TypeError`) of exactly two non-``bool``
+        :class:`int` values (a ``bool`` or non-:class:`int` element
+        raises :class:`TypeError`); a wrong element count, a negative
+        numerator, a non-positive denominator or a numerator exceeding
+        the denominator raises :class:`ValueError`.
+        """
+        if not isinstance(min_hit_rate_drop, tuple):
+            raise TypeError(
+                f"min_hit_rate_drop must be a tuple, got "
+                f"{type(min_hit_rate_drop).__name__}"
+            )
+        if len(min_hit_rate_drop) != 2:
+            raise ValueError(
+                f"min_hit_rate_drop must have exactly 2 elements, got "
+                f"{len(min_hit_rate_drop)}"
+            )
+        numerator, denominator = min_hit_rate_drop
+        for position, part in enumerate(min_hit_rate_drop):
+            name = f"min_hit_rate_drop[{position}]"
+            if isinstance(part, bool) or not isinstance(part, int):
+                raise TypeError(
+                    f"{name} must be an int, got {type(part).__name__}"
+                )
+        if numerator < 0:
+            raise ValueError(
+                "min_hit_rate_drop numerator must be non-negative"
+            )
+        if denominator < 1:
+            raise ValueError(
+                "min_hit_rate_drop denominator must be positive"
+            )
+        if numerator > denominator:
+            raise ValueError(
+                "min_hit_rate_drop numerator must not exceed the "
+                "denominator"
+            )
+        return (numerator, denominator)
+
     @staticmethod
     def _validate_drift_scan_split_cutoffs(
         split_cutoffs: Any,
@@ -25262,6 +25692,246 @@ class BranchStore:
             totals["evaluated"] += entry["hit"] + entry["missed"]
         totals["cutoffs"] = len(cutoff_union)
         return {"scorecards": tuple(scorecards), "totals": totals}
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regressions_result(
+        backtest_records: tuple[dict[str, object], ...],
+        scorecards: tuple[dict[str, object], ...],
+        baseline_cutoffs: int,
+        min_evaluated_delta: int,
+        min_hit_rate_drop: tuple[int, int],
+        regression_limit: int,
+    ) -> dict[str, object]:
+        """Measure kept scorecard identities' hit-rate regressions.
+
+        Used only by
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regressions`.
+        The records are the complete, already-bounded ``backtests``
+        tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_wave_prediction_backtests_result`
+        and the scorecards the already-bounded ``scorecards`` tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_wave_prediction_scorecards_result`,
+        so only identities kept as scorecards are candidates and an
+        identity has at most one record per cutoff. Each candidate's
+        records run cutoff ascending; the first ``baseline_cutoffs``
+        records form the baseline segment and the rest the observation
+        segment. A candidate is kept only when both segments hold
+        records, both segments evaluate at least one target, the
+        observation evaluated count exceeds the baseline's by at least
+        ``min_evaluated_delta`` and the baseline hit rate minus the
+        observation hit rate reaches ``min_hit_rate_drop`` -- every
+        rate comparison cross-multiplies the integer parts, never
+        dividing.
+
+        Each kept record is a fresh dict with keys ordered ``identity,
+        baseline_cutoffs, observation_cutoffs, baseline_evaluated,
+        observation_evaluated, baseline_hit_rate, observation_hit_rate,
+        rate_drop, first_regression_cutoff``: the segment record
+        counts, the segment ``hit + missed`` counts, the reduced
+        ``(hit, evaluated)`` segment rates, the baseline rate minus
+        the observation rate as a reduced ``(numerator, denominator)``
+        integer tuple, and the first observation cutoff at which the
+        accumulated observation records reach both the evaluated delta
+        and the drop threshold. Records sort by ``rate_drop``
+        descending (fractions compared by integer
+        cross-multiplication), then ``observation_evaluated``
+        descending, then the identity in Unicode code point order. The
+        complete qualifying set is built before ``regression_limit``
+        is enforced, so an over-limit query raises :class:`ValueError`
+        without truncating. ``totals`` is a fresh dict ordered
+        ``identities, baseline_evaluated, baseline_hit,
+        baseline_missed, observation_evaluated, observation_hit,
+        observation_missed``, summed over the kept records; no
+        qualifying identity yields an empty tuple and seven zeros.
+        Every record is built fresh and shares no mutable object with
+        the backtest records or the scorecards.
+        """
+        kept_identities = {
+            scorecard["identity"] for scorecard in scorecards
+        }
+        grouped: dict[object, list[dict[str, object]]] = {}
+        encounter: list[object] = []
+        for record in backtest_records:
+            identity = BranchStore._freeze_lifetime_value(
+                record["identity"]
+            )
+            if identity not in kept_identities:
+                continue
+            records = grouped.get(identity)
+            if records is None:
+                records = []
+                grouped[identity] = records
+                encounter.append(identity)
+            records.append(record)
+
+        threshold_numerator, threshold_denominator = min_hit_rate_drop
+        regressions: list[dict[str, object]] = []
+        kept_segments: list[tuple[int, int, int, int, int, int]] = []
+        for identity in encounter:
+            records = sorted(
+                grouped[identity],
+                key=lambda record: record["cutoff"],
+            )
+            baseline_records = records[:baseline_cutoffs]
+            observation_records = records[baseline_cutoffs:]
+            if not baseline_records or not observation_records:
+                continue
+            baseline_hit = sum(
+                record["hit"] for record in baseline_records
+            )
+            baseline_missed = sum(
+                record["missed"] for record in baseline_records
+            )
+            baseline_evaluated = baseline_hit + baseline_missed
+            observation_hit = sum(
+                record["hit"] for record in observation_records
+            )
+            observation_missed = sum(
+                record["missed"] for record in observation_records
+            )
+            observation_evaluated = observation_hit + observation_missed
+            if baseline_evaluated == 0 or observation_evaluated == 0:
+                continue
+            evaluated_delta = observation_evaluated - baseline_evaluated
+            if evaluated_delta < min_evaluated_delta:
+                continue
+            drop_numerator = (
+                baseline_hit * observation_evaluated
+                - observation_hit * baseline_evaluated
+            )
+            drop_denominator = baseline_evaluated * observation_evaluated
+            if (
+                drop_numerator * threshold_denominator
+                < threshold_numerator * drop_denominator
+            ):
+                continue
+
+            # The kept condition guarantees the accumulated observation
+            # segment reaches both thresholds, so the scan always finds
+            # a first regressing cutoff.
+            first_regression_cutoff: object = None
+            cumulative_hit = 0
+            cumulative_evaluated = 0
+            for record in observation_records:
+                cumulative_hit += record["hit"]
+                cumulative_evaluated += record["hit"] + record["missed"]
+                if (
+                    cumulative_evaluated - baseline_evaluated
+                    < min_evaluated_delta
+                ):
+                    continue
+                cumulative_drop_numerator = (
+                    baseline_hit * cumulative_evaluated
+                    - cumulative_hit * baseline_evaluated
+                )
+                cumulative_drop_denominator = (
+                    baseline_evaluated * cumulative_evaluated
+                )
+                if (
+                    cumulative_drop_numerator * threshold_denominator
+                    >= threshold_numerator * cumulative_drop_denominator
+                ):
+                    first_regression_cutoff = record["cutoff"]
+                    break
+
+            divisor = math.gcd(baseline_hit, baseline_evaluated)
+            baseline_hit_rate = (
+                baseline_hit // divisor,
+                baseline_evaluated // divisor,
+            )
+            divisor = math.gcd(observation_hit, observation_evaluated)
+            observation_hit_rate = (
+                observation_hit // divisor,
+                observation_evaluated // divisor,
+            )
+            divisor = math.gcd(drop_numerator, drop_denominator)
+            rate_drop = (
+                drop_numerator // divisor,
+                drop_denominator // divisor,
+            )
+            regressions.append(
+                {
+                    "identity": identity,
+                    "baseline_cutoffs": len(baseline_records),
+                    "observation_cutoffs": len(observation_records),
+                    "baseline_evaluated": baseline_evaluated,
+                    "observation_evaluated": observation_evaluated,
+                    "baseline_hit_rate": baseline_hit_rate,
+                    "observation_hit_rate": observation_hit_rate,
+                    "rate_drop": rate_drop,
+                    "first_regression_cutoff": first_regression_cutoff,
+                }
+            )
+            kept_segments.append(
+                (
+                    baseline_evaluated,
+                    baseline_hit,
+                    baseline_missed,
+                    observation_evaluated,
+                    observation_hit,
+                    observation_missed,
+                )
+            )
+
+        def compare_regressions(
+            left: dict[str, object], right: dict[str, object]
+        ) -> int:
+            left_numerator, left_denominator = left["rate_drop"]
+            right_numerator, right_denominator = right["rate_drop"]
+            # Both drops have positive denominators, so integer
+            # cross-multiplication orders them without dividing.
+            left_cross = left_numerator * right_denominator
+            right_cross = right_numerator * left_denominator
+            if left_cross != right_cross:
+                return -1 if left_cross > right_cross else 1
+            if left["observation_evaluated"] != right["observation_evaluated"]:
+                return (
+                    -1
+                    if left["observation_evaluated"]
+                    > right["observation_evaluated"]
+                    else 1
+                )
+            left_key = BranchStore._lifetime_identity_unicode_key(
+                left["identity"]
+            )
+            right_key = BranchStore._lifetime_identity_unicode_key(
+                right["identity"]
+            )
+            if left_key < right_key:
+                return -1
+            if left_key > right_key:
+                return 1
+            return 0
+
+        regressions.sort(
+            key=functools.cmp_to_key(compare_regressions)
+        )
+
+        if len(regressions) > regression_limit:
+            raise ValueError(
+                f"lifetime churn drift wave prediction scorecard "
+                f"regression limit exceeded: {len(regressions)} "
+                f"regression records, limit is {regression_limit}"
+            )
+
+        totals = {
+            "identities": 0,
+            "baseline_evaluated": 0,
+            "baseline_hit": 0,
+            "baseline_missed": 0,
+            "observation_evaluated": 0,
+            "observation_hit": 0,
+            "observation_missed": 0,
+        }
+        for segments in kept_segments:
+            totals["identities"] += 1
+            totals["baseline_evaluated"] += segments[0]
+            totals["baseline_hit"] += segments[1]
+            totals["baseline_missed"] += segments[2]
+            totals["observation_evaluated"] += segments[3]
+            totals["observation_hit"] += segments[4]
+            totals["observation_missed"] += segments[5]
+        return {"regressions": tuple(regressions), "totals": totals}
 
     @staticmethod
     def _validate_wave_cutoffs(wave_cutoffs: Any) -> tuple[int, ...]:
