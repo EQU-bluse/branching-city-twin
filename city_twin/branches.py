@@ -45232,6 +45232,1030 @@ class BranchStore:
             raise
         return result
 
+    def lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests_scorecards(
+        self,
+        reference: str,
+        series: dict[str, tuple[tuple[str, str], ...]],
+        base_scenario: dict[str, object],
+        axis: str,
+        values: tuple[int | float, ...],
+        min_size: int,
+        max_size: int,
+        required: tuple[str, ...],
+        exclusive_pairs: tuple[tuple[str, str], ...],
+        limit: int,
+        windows: tuple[tuple[int, ...], ...],
+        causes: tuple[str, ...],
+        direction: str,
+        depth: int,
+        node_limit: int,
+        change_limit: int,
+        lifetime_limit: int,
+        diff_limit: int,
+        window_limit: int,
+        total_diff_limit: int,
+        churn_limit: int,
+        streak_limit: int,
+        min_identities: int,
+        wave_limit: int,
+        min_waves: int,
+        recurrence_limit: int,
+        max_jitter: int,
+        periodicity_limit: int,
+        horizon: int,
+        forecast_limit: int,
+        cutoffs: tuple[int, ...],
+        backtest_limit: int,
+        min_resolved: int,
+        scorecard_limit: int,
+        split_cutoffs: tuple[int, ...],
+        min_rate_drop: tuple[int, int],
+        drift_limit: int,
+        scan_limit: int,
+        min_splits: int,
+        streak_result_limit: int,
+        min_active_identities: int,
+        wave_result_limit: int,
+        min_wave_occurrences: int,
+        recurrence_result_limit: int,
+        max_wave_jitter: int,
+        periodicity_result_limit: int,
+        wave_horizon: int,
+        prediction_result_limit: int,
+        wave_cutoffs: tuple[int, ...],
+        match_tolerance: int,
+        prediction_backtest_limit: int,
+        min_evaluated: int,
+        min_cutoffs: int,
+        prediction_scorecard_limit: int,
+        baseline_splits: tuple[int, ...],
+        min_evaluated_delta: int,
+        min_hit_rate_drop: tuple[int, int],
+        regression_limit: int,
+        min_consecutive_splits: int,
+        regression_streak_limit: int,
+        min_active_regressions: int,
+        regression_wave_limit: int,
+        min_regression_wave_occurrences: int,
+        regression_wave_recurrence_limit: int,
+        max_regression_wave_jitter: int,
+        regression_wave_periodicity_limit: int,
+        regression_wave_horizon: int,
+        regression_wave_forecast_limit: int,
+        regression_wave_cutoffs: tuple[int, ...],
+        regression_wave_match_tolerance: int,
+        regression_wave_forecast_backtest_limit: int,
+        regression_wave_min_evaluated: int,
+        regression_wave_min_cutoffs: int,
+        regression_wave_forecast_scorecard_limit: int,
+        regression_wave_baseline_splits: tuple[int, ...],
+        regression_wave_min_evaluated_delta: int,
+        regression_wave_min_hit_rate_drop: tuple[int, int],
+        regression_wave_regression_limit: int,
+        regression_wave_min_consecutive_splits: int,
+        regression_wave_regression_streak_limit: int,
+        regression_wave_min_active_regressions: int,
+        regression_wave_regression_wave_limit: int,
+        regression_wave_min_regression_wave_occurrences: int,
+        regression_wave_regression_wave_recurrence_limit: int,
+        regression_wave_max_regression_wave_jitter: int,
+        regression_wave_regression_wave_periodicity_limit: int,
+        regression_wave_regression_wave_horizon: int,
+        regression_wave_regression_wave_forecast_limit: int,
+        regression_wave_regression_wave_cutoffs: tuple[int, ...],
+        regression_wave_regression_wave_match_tolerance: int,
+        regression_wave_regression_wave_forecast_backtest_limit: int,
+        regression_wave_regression_wave_min_evaluated: int,
+        regression_wave_regression_wave_min_cutoffs: int,
+        regression_wave_regression_wave_forecast_scorecard_limit: int,
+        regression_wave_regression_wave_baseline_splits: tuple[int, ...],
+        regression_wave_regression_wave_min_evaluated_delta: int,
+        regression_wave_regression_wave_min_hit_rate_drop: tuple[int, int],
+        regression_wave_regression_wave_regression_limit: int,
+        regression_wave_regression_wave_min_consecutive_splits: int,
+        regression_wave_regression_wave_regression_streak_limit: int,
+        regression_wave_regression_wave_min_active_regressions: int,
+        regression_wave_regression_wave_regression_wave_limit: int,
+        regression_wave_regression_wave_min_regression_wave_occurrences: int,
+        regression_wave_regression_wave_regression_wave_recurrence_limit: int,
+        regression_wave_regression_wave_max_regression_wave_jitter: int,
+        regression_wave_regression_wave_regression_wave_periodicity_limit: int,
+        regression_wave_regression_wave_regression_wave_horizon: int,
+        regression_wave_regression_wave_regression_wave_forecast_limit: int,
+        regression_wave_regression_wave_regression_wave_cutoffs: tuple[int, ...],
+        regression_wave_regression_wave_regression_wave_match_tolerance: int,
+        regression_wave_regression_wave_regression_wave_forecast_backtest_limit: int,
+        regression_wave_regression_wave_regression_wave_min_evaluated: int,
+        regression_wave_regression_wave_regression_wave_min_cutoffs: int,
+        regression_wave_regression_wave_regression_wave_forecast_scorecard_limit: int,
+        regression_wave_regression_wave_regression_wave_baseline_splits: tuple[int, ...],
+        regression_wave_regression_wave_regression_wave_min_evaluated_delta: int,
+        regression_wave_regression_wave_regression_wave_min_hit_rate_drop: tuple[int, int],
+        regression_wave_regression_wave_regression_wave_regression_limit: int,
+        regression_wave_regression_wave_regression_wave_min_consecutive_splits: int,
+        regression_wave_regression_wave_regression_wave_regression_streak_limit: int,
+        regression_wave_regression_wave_regression_wave_min_active_regressions: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_limit: int,
+        regression_wave_regression_wave_regression_wave_min_regression_wave_occurrences: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_recurrence_limit: int,
+        regression_wave_regression_wave_regression_wave_max_regression_wave_jitter: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_periodicity_limit: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_horizon: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_limit: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_cutoffs: tuple[int, ...],
+        regression_wave_regression_wave_regression_wave_regression_wave_match_tolerance: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit: int,
+        token: str | None = None,
+    ) -> dict[str, object]:
+        """Score each identity's deepest regression wave forecast backtest stability.
+
+        Reuses every public input, parameter order, validation order,
+        stage cap, cutoff training, outcome classification, over-limit
+        error and frozen-view semantic of
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests`,
+        appending
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated``,
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs``
+        and
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit``
+        in that order after
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit``
+        (still before the split membership check and any state
+        lookup), keeping the same optional trailing ``token``.
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated``
+        must be a non-``bool`` non-negative :class:`int`, while
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs``
+        and
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit``
+        must be non-``bool`` :class:`int` values of at least one (a
+        ``bool`` or non-:class:`int` raises :class:`TypeError`, an
+        out-of-range value raises :class:`ValueError`).
+
+        Every stage runs exactly once, exactly as in the deepest
+        regression wave forecast backtests query: the one frozen view
+        produces exactly the complete cross-cutoff deepest regression
+        wave backtest record set a deepest regression wave forecast
+        backtests call with the same arguments would return, with
+        every underlying stage cap -- including
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_limit``
+        per cutoff and
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit``
+        over the complete record set -- and every underlying
+        exception, including the cutoff range error, unchanged. Those
+        records are then grouped by ``identity``; an identity has at
+        most one record per cutoff.
+
+        Each kept identity becomes one fresh scorecard tuple whose
+        fields are ordered ``identity, cutoffs, hit, missed,
+        unresolved, unexpected, evaluated, hit_rate, first_failure``:
+        ``cutoffs`` is the number of distinct cutoffs the identity has
+        a record at, ``evaluated`` is ``hit + missed``, and
+        ``hit_rate`` is ``hit / evaluated`` as a reduced
+        ``(numerator, denominator)`` integer tuple, fixed at
+        ``(0, 0)`` when ``evaluated`` is zero. ``first_failure`` is
+        the smallest cutoff, in cutoff ascending order, at which the
+        identity's ``missed`` or ``unexpected`` count is non-zero; an
+        ``unresolved``-only cutoff is not a failure, and an identity
+        that never fails gets ``None``. Only identities whose
+        ``evaluated`` reaches
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated``
+        and whose distinct cutoff count reaches
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs``
+        are kept. Scorecards sort by ``hit_rate`` descending --
+        fractions compared by integer cross-multiplication, never
+        dividing -- then ``unexpected`` ascending, ``missed``
+        ascending and finally the identity in Unicode code point
+        order. The complete qualifying set is built before
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit``
+        is enforced, so an over-limit query raises :class:`ValueError`
+        without truncating.
+
+        The result is a fresh dict whose keys are ordered
+        ``scorecards, totals``; ``scorecards`` is a fresh tuple of the
+        scorecard tuples and ``totals`` is a fresh tuple ordered
+        ``identities, cutoffs, hit, missed, unresolved, unexpected,
+        evaluated``: the kept identity count, the union size of the
+        cutoffs the kept identities cover, and the four counters plus
+        ``evaluated`` summed over the kept scorecards. A query with no
+        qualifying identity returns an empty ``scorecards`` tuple and
+        seven zero totals. Every object is built fresh and shares
+        nothing with the backtest records or internal state; a
+        tokenized success consumes exactly one read while any failure
+        refunds it, and a tokenless query observes the same frozen
+        view and never mutates branches, the event graph, snapshot
+        quotas or persistence files.
+        """
+        # Ordinary inputs are validated first, in exactly the existing
+        # order, but no branch or historical node is looked up yet.
+        validated = self._validate_frontier_inputs(
+            reference,
+            series,
+            base_scenario,
+            axis,
+            values,
+            min_size,
+            max_size,
+            required,
+            exclusive_pairs,
+            limit,
+        )
+
+        # Every cap is checked exactly as in the deepest regression
+        # wave forecast backtests query;
+        # regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated,
+        # regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs
+        # and
+        # regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit
+        # follow
+        # regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit
+        # in that order, all still before the split membership check
+        # and every state lookup.
+        point_count = self._frontier_point_count(validated)
+        index_windows = self._validate_lifetime_windows(windows, point_count)
+
+        causes, direction, depth_value, node_limit_value = (
+            self._validate_slice_inputs(causes, direction, depth, node_limit)
+        )
+        change_limit_value = BranchStore._require_record_limit(
+            change_limit, "change_limit"
+        )
+        lifetime_limit_value = BranchStore._require_record_limit(
+            lifetime_limit, "lifetime_limit"
+        )
+        diff_limit_value = BranchStore._require_record_limit(
+            diff_limit, "diff_limit"
+        )
+        window_limit_value = BranchStore._require_record_limit(
+            window_limit, "window_limit"
+        )
+        total_diff_limit_value = BranchStore._require_record_limit(
+            total_diff_limit, "total_diff_limit"
+        )
+        churn_limit_value = BranchStore._require_record_limit(
+            churn_limit, "churn_limit"
+        )
+        streak_limit_value = BranchStore._require_record_limit(
+            streak_limit, "streak_limit"
+        )
+        min_identities_value = BranchStore._require_record_limit(
+            min_identities, "min_identities"
+        )
+        wave_limit_value = BranchStore._require_record_limit(
+            wave_limit, "wave_limit"
+        )
+        min_waves_value = BranchStore._require_record_limit(
+            min_waves, "min_waves"
+        )
+        recurrence_limit_value = BranchStore._require_record_limit(
+            recurrence_limit, "recurrence_limit"
+        )
+        max_jitter_value = BranchStore._require_non_negative_limit(
+            max_jitter, "max_jitter"
+        )
+        periodicity_limit_value = BranchStore._require_record_limit(
+            periodicity_limit, "periodicity_limit"
+        )
+        horizon_value = BranchStore._require_record_limit(horizon, "horizon")
+        forecast_limit_value = BranchStore._require_record_limit(
+            forecast_limit, "forecast_limit"
+        )
+        cutoffs_value = BranchStore._validate_backtest_cutoffs(cutoffs)
+        backtest_limit_value = BranchStore._require_record_limit(
+            backtest_limit, "backtest_limit"
+        )
+        min_resolved_value = BranchStore._require_record_limit(
+            min_resolved, "min_resolved"
+        )
+        scorecard_limit_value = BranchStore._require_record_limit(
+            scorecard_limit, "scorecard_limit"
+        )
+        split_cutoffs_value = (
+            BranchStore._validate_drift_scan_split_cutoffs(split_cutoffs)
+        )
+        min_rate_drop_value = BranchStore._validate_min_rate_drop(
+            min_rate_drop
+        )
+        drift_limit_value = BranchStore._require_record_limit(
+            drift_limit, "drift_limit"
+        )
+        scan_limit_value = BranchStore._require_record_limit(
+            scan_limit, "scan_limit"
+        )
+        min_splits_value = BranchStore._require_record_limit(
+            min_splits, "min_splits"
+        )
+        streak_result_limit_value = BranchStore._require_record_limit(
+            streak_result_limit, "streak_result_limit"
+        )
+        min_active_identities_value = BranchStore._require_record_limit(
+            min_active_identities, "min_active_identities"
+        )
+        wave_result_limit_value = BranchStore._require_record_limit(
+            wave_result_limit, "wave_result_limit"
+        )
+        min_wave_occurrences_value = BranchStore._require_record_limit(
+            min_wave_occurrences, "min_wave_occurrences"
+        )
+        recurrence_result_limit_value = BranchStore._require_record_limit(
+            recurrence_result_limit, "recurrence_result_limit"
+        )
+        max_wave_jitter_value = BranchStore._require_non_negative_limit(
+            max_wave_jitter, "max_wave_jitter"
+        )
+        periodicity_result_limit_value = BranchStore._require_record_limit(
+            periodicity_result_limit, "periodicity_result_limit"
+        )
+        wave_horizon_value = BranchStore._require_record_limit(
+            wave_horizon, "wave_horizon"
+        )
+        prediction_result_limit_value = BranchStore._require_record_limit(
+            prediction_result_limit, "prediction_result_limit"
+        )
+        wave_cutoffs_value = BranchStore._validate_wave_cutoffs(wave_cutoffs)
+        match_tolerance_value = BranchStore._require_non_negative_limit(
+            match_tolerance, "match_tolerance"
+        )
+        prediction_backtest_limit_value = BranchStore._require_record_limit(
+            prediction_backtest_limit, "prediction_backtest_limit"
+        )
+        min_evaluated_value = BranchStore._require_non_negative_limit(
+            min_evaluated, "min_evaluated"
+        )
+        min_cutoffs_value = BranchStore._require_record_limit(
+            min_cutoffs, "min_cutoffs"
+        )
+        prediction_scorecard_limit_value = BranchStore._require_record_limit(
+            prediction_scorecard_limit, "prediction_scorecard_limit"
+        )
+        baseline_splits_value = (
+            BranchStore._validate_regression_baseline_splits(baseline_splits)
+        )
+        min_evaluated_delta_value = BranchStore._require_non_negative_limit(
+            min_evaluated_delta, "min_evaluated_delta"
+        )
+        min_hit_rate_drop_value = BranchStore._validate_min_hit_rate_drop(
+            min_hit_rate_drop
+        )
+        regression_limit_value = BranchStore._require_record_limit(
+            regression_limit, "regression_limit"
+        )
+        min_consecutive_splits_value = BranchStore._require_record_limit(
+            min_consecutive_splits, "min_consecutive_splits"
+        )
+        regression_streak_limit_value = BranchStore._require_record_limit(
+            regression_streak_limit, "regression_streak_limit"
+        )
+        min_active_regressions_value = BranchStore._require_record_limit(
+            min_active_regressions, "min_active_regressions"
+        )
+        regression_wave_limit_value = BranchStore._require_record_limit(
+            regression_wave_limit, "regression_wave_limit"
+        )
+        min_regression_wave_occurrences_value = (
+            BranchStore._require_record_limit(
+                min_regression_wave_occurrences,
+                "min_regression_wave_occurrences",
+            )
+        )
+        regression_wave_recurrence_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_recurrence_limit,
+                "regression_wave_recurrence_limit",
+            )
+        )
+        max_regression_wave_jitter_value = (
+            BranchStore._require_non_negative_limit(
+                max_regression_wave_jitter,
+                "max_regression_wave_jitter",
+            )
+        )
+        regression_wave_periodicity_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_periodicity_limit,
+                "regression_wave_periodicity_limit",
+            )
+        )
+        regression_wave_horizon_value = BranchStore._require_record_limit(
+            regression_wave_horizon,
+            "regression_wave_horizon",
+        )
+        regression_wave_forecast_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_forecast_limit,
+                "regression_wave_forecast_limit",
+            )
+        )
+        regression_wave_cutoffs_value = (
+            BranchStore._validate_regression_wave_cutoffs(
+                regression_wave_cutoffs
+            )
+        )
+        regression_wave_match_tolerance_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_match_tolerance,
+                "regression_wave_match_tolerance",
+            )
+        )
+        regression_wave_forecast_backtest_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_forecast_backtest_limit,
+                "regression_wave_forecast_backtest_limit",
+            )
+        )
+        regression_wave_min_evaluated_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_min_evaluated,
+                "regression_wave_min_evaluated",
+            )
+        )
+        regression_wave_min_cutoffs_value = BranchStore._require_record_limit(
+            regression_wave_min_cutoffs,
+            "regression_wave_min_cutoffs",
+        )
+        regression_wave_forecast_scorecard_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_forecast_scorecard_limit,
+                "regression_wave_forecast_scorecard_limit",
+            )
+        )
+        regression_wave_baseline_splits_value = (
+            BranchStore._validate_regression_wave_baseline_splits(
+                regression_wave_baseline_splits
+            )
+        )
+        regression_wave_min_evaluated_delta_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_min_evaluated_delta,
+                "regression_wave_min_evaluated_delta",
+            )
+        )
+        regression_wave_min_hit_rate_drop_value = (
+            BranchStore._validate_regression_wave_min_hit_rate_drop(
+                regression_wave_min_hit_rate_drop
+            )
+        )
+        regression_wave_regression_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_limit,
+                "regression_wave_regression_limit",
+            )
+        )
+        regression_wave_min_consecutive_splits_value = (
+            BranchStore._require_record_limit(
+                regression_wave_min_consecutive_splits,
+                "regression_wave_min_consecutive_splits",
+            )
+        )
+        regression_wave_regression_streak_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_streak_limit,
+                "regression_wave_regression_streak_limit",
+            )
+        )
+        regression_wave_min_active_regressions_value = (
+            BranchStore._require_record_limit(
+                regression_wave_min_active_regressions,
+                "regression_wave_min_active_regressions",
+            )
+        )
+        regression_wave_regression_wave_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_limit,
+                "regression_wave_regression_wave_limit",
+            )
+        )
+        regression_wave_min_regression_wave_occurrences_value = (
+            BranchStore._require_record_limit(
+                regression_wave_min_regression_wave_occurrences,
+                "regression_wave_min_regression_wave_occurrences",
+            )
+        )
+        regression_wave_regression_wave_recurrence_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_recurrence_limit,
+                "regression_wave_regression_wave_recurrence_limit",
+            )
+        )
+        regression_wave_max_regression_wave_jitter_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_max_regression_wave_jitter,
+                "regression_wave_max_regression_wave_jitter",
+            )
+        )
+        regression_wave_regression_wave_periodicity_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_periodicity_limit,
+                "regression_wave_regression_wave_periodicity_limit",
+            )
+        )
+        regression_wave_regression_wave_horizon_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_horizon,
+                "regression_wave_regression_wave_horizon",
+            )
+        )
+        regression_wave_regression_wave_forecast_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_forecast_limit,
+                "regression_wave_regression_wave_forecast_limit",
+            )
+        )
+        regression_wave_regression_wave_cutoffs_value = (
+            BranchStore._validate_regression_wave_regression_wave_cutoffs(
+                regression_wave_regression_wave_cutoffs
+            )
+        )
+        regression_wave_regression_wave_match_tolerance_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_match_tolerance,
+                "regression_wave_regression_wave_match_tolerance",
+            )
+        )
+        regression_wave_regression_wave_forecast_backtest_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_forecast_backtest_limit,
+                "regression_wave_regression_wave_forecast_backtest_limit",
+            )
+        )
+        regression_wave_regression_wave_min_evaluated_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_min_evaluated,
+                "regression_wave_regression_wave_min_evaluated",
+            )
+        )
+        regression_wave_regression_wave_min_cutoffs_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_min_cutoffs,
+                "regression_wave_regression_wave_min_cutoffs",
+            )
+        )
+        regression_wave_regression_wave_forecast_scorecard_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_forecast_scorecard_limit,
+                "regression_wave_regression_wave_forecast_scorecard_limit",
+            )
+        )
+        regression_wave_regression_wave_baseline_splits_value = (
+            BranchStore._validate_regression_wave_regression_wave_baseline_splits(
+                regression_wave_regression_wave_baseline_splits
+            )
+        )
+        regression_wave_regression_wave_min_evaluated_delta_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_min_evaluated_delta,
+                "regression_wave_regression_wave_min_evaluated_delta",
+            )
+        )
+        regression_wave_regression_wave_min_hit_rate_drop_value = (
+            BranchStore._validate_regression_wave_regression_wave_min_hit_rate_drop(
+                regression_wave_regression_wave_min_hit_rate_drop
+            )
+        )
+        regression_wave_regression_wave_regression_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_limit,
+                "regression_wave_regression_wave_regression_limit",
+            )
+        )
+        regression_wave_regression_wave_min_consecutive_splits_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_min_consecutive_splits,
+                "regression_wave_regression_wave_min_consecutive_splits",
+            )
+        )
+        regression_wave_regression_wave_regression_streak_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_streak_limit,
+                "regression_wave_regression_wave_regression_streak_limit",
+            )
+        )
+        regression_wave_regression_wave_min_active_regressions_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_min_active_regressions,
+                "regression_wave_regression_wave_min_active_regressions",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_limit,
+                "regression_wave_regression_wave_regression_wave_limit",
+            )
+        )
+        regression_wave_regression_wave_min_regression_wave_occurrences_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_min_regression_wave_occurrences,
+                "regression_wave_regression_wave_min_regression_wave_occurrences",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_recurrence_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_recurrence_limit,
+                "regression_wave_regression_wave_regression_wave_recurrence_limit",
+            )
+        )
+        regression_wave_regression_wave_max_regression_wave_jitter_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_max_regression_wave_jitter,
+                "regression_wave_regression_wave_max_regression_wave_jitter",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_periodicity_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_periodicity_limit,
+                "regression_wave_regression_wave_regression_wave_periodicity_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_horizon_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_horizon,
+                "regression_wave_regression_wave_regression_wave_horizon",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_forecast_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_forecast_limit,
+                "regression_wave_regression_wave_regression_wave_forecast_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_cutoffs_value = (
+            BranchStore._validate_regression_wave_regression_wave_regression_wave_cutoffs(
+                regression_wave_regression_wave_regression_wave_cutoffs
+            )
+        )
+        regression_wave_regression_wave_regression_wave_match_tolerance_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_regression_wave_match_tolerance,
+                "regression_wave_regression_wave_regression_wave_match_tolerance",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_forecast_backtest_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_forecast_backtest_limit,
+                "regression_wave_regression_wave_regression_wave_forecast_backtest_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_evaluated_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_regression_wave_min_evaluated,
+                "regression_wave_regression_wave_regression_wave_min_evaluated",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_cutoffs_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_min_cutoffs,
+                "regression_wave_regression_wave_regression_wave_min_cutoffs",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_forecast_scorecard_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_forecast_scorecard_limit,
+                "regression_wave_regression_wave_regression_wave_forecast_scorecard_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_baseline_splits_value = (
+            BranchStore._validate_regression_wave_regression_wave_regression_wave_baseline_splits(
+                regression_wave_regression_wave_regression_wave_baseline_splits
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_evaluated_delta_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_regression_wave_min_evaluated_delta,
+                "regression_wave_regression_wave_regression_wave_min_evaluated_delta",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_hit_rate_drop_value = (
+            BranchStore._validate_regression_wave_regression_wave_regression_wave_min_hit_rate_drop(
+                regression_wave_regression_wave_regression_wave_min_hit_rate_drop
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_limit,
+                "regression_wave_regression_wave_regression_wave_regression_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_consecutive_splits_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_min_consecutive_splits,
+                "regression_wave_regression_wave_regression_wave_min_consecutive_splits",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_streak_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_streak_limit,
+                "regression_wave_regression_wave_regression_wave_regression_streak_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_active_regressions_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_min_active_regressions,
+                "regression_wave_regression_wave_regression_wave_min_active_regressions",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_limit,
+                "regression_wave_regression_wave_regression_wave_regression_wave_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_min_regression_wave_occurrences_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_min_regression_wave_occurrences,
+                "regression_wave_regression_wave_regression_wave_min_regression_wave_occurrences",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_recurrence_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_recurrence_limit,
+                "regression_wave_regression_wave_regression_wave_regression_wave_recurrence_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_max_regression_wave_jitter_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_regression_wave_max_regression_wave_jitter,
+                "regression_wave_regression_wave_regression_wave_max_regression_wave_jitter",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_periodicity_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_periodicity_limit,
+                "regression_wave_regression_wave_regression_wave_regression_wave_periodicity_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_horizon_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_horizon,
+                "regression_wave_regression_wave_regression_wave_regression_wave_horizon",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_forecast_limit,
+                "regression_wave_regression_wave_regression_wave_regression_wave_forecast_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_cutoffs_value = (
+            BranchStore._validate_regression_wave_regression_wave_regression_wave_regression_wave_cutoffs(
+                regression_wave_regression_wave_regression_wave_regression_wave_cutoffs
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_match_tolerance_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_match_tolerance,
+                "regression_wave_regression_wave_regression_wave_regression_wave_match_tolerance",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit,
+                "regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated_value = (
+            BranchStore._require_non_negative_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated,
+                "regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs,
+                "regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs",
+            )
+        )
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit_value = (
+            BranchStore._require_record_limit(
+                regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit,
+                "regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit",
+            )
+        )
+        BranchStore._validate_drift_scan_splits(
+            cutoffs_value, split_cutoffs_value
+        )
+        if len(index_windows) > window_limit_value:
+            raise ValueError(
+                f"lifetime churn window limit exceeded: "
+                f"{len(index_windows)} windows, limit is "
+                f"{window_limit_value}"
+            )
+
+        # One frozen view answers the whole query: the complete
+        # cross-cutoff deepest regression wave backtest record set is
+        # produced exactly once and then grouped by identity, so a
+        # scorecard never observes a different state than the backtest
+        # it summarizes.
+        view = self
+        if token is not None:
+            view = self._reserve_snapshot_read(token)
+        try:
+            results, _grand_totals = (
+                view._compute_lifetime_backtest_cutoffs(
+                    validated,
+                    index_windows,
+                    causes,
+                    direction,
+                    depth_value,
+                    node_limit_value,
+                    change_limit_value,
+                    lifetime_limit_value,
+                    diff_limit_value,
+                    total_diff_limit_value,
+                    min_identities_value,
+                    wave_limit_value,
+                    max_jitter_value,
+                    horizon_value,
+                    forecast_limit_value,
+                    cutoffs_value,
+                    backtest_limit_value,
+                )
+            )
+            scan = view._build_lifetime_churn_forecast_drift_scan_result(
+                results,
+                split_cutoffs_value,
+                min_resolved_value,
+                scorecard_limit_value,
+                min_rate_drop_value,
+                drift_limit_value,
+                scan_limit_value,
+            )
+            streaks = (
+                BranchStore._build_lifetime_churn_forecast_drift_streaks_result(
+                    scan["scans"],
+                    min_splits_value,
+                    streak_result_limit_value,
+                )
+            )
+            waves = (
+                BranchStore._build_lifetime_churn_forecast_drift_waves_result(
+                    scan["scans"],
+                    streaks["streaks"],
+                    min_active_identities_value,
+                    wave_result_limit_value,
+                )
+            )
+            backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_backtests_result(
+                waves["waves"],
+                min_wave_occurrences_value,
+                recurrence_result_limit_value,
+                max_wave_jitter_value,
+                periodicity_result_limit_value,
+                wave_horizon_value,
+                prediction_result_limit_value,
+                wave_cutoffs_value,
+                match_tolerance_value,
+                prediction_backtest_limit_value,
+            )
+            scorecards = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecards_result(
+                backtests["backtests"],
+                min_evaluated_value,
+                min_cutoffs_value,
+                prediction_scorecard_limit_value,
+            )
+            regression_streaks = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_streaks_result(
+                backtests["backtests"],
+                scorecards["scorecards"],
+                baseline_splits_value,
+                min_evaluated_delta_value,
+                min_hit_rate_drop_value,
+                regression_limit_value,
+                min_consecutive_splits_value,
+                regression_streak_limit_value,
+            )
+            regression_waves = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_waves_result(
+                regression_streaks["streaks"],
+                baseline_splits_value,
+                min_active_regressions_value,
+                regression_wave_limit_value,
+            )
+            forecast_backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_backtests_result(
+                regression_waves["waves"],
+                min_regression_wave_occurrences_value,
+                regression_wave_recurrence_limit_value,
+                max_regression_wave_jitter_value,
+                regression_wave_periodicity_limit_value,
+                regression_wave_horizon_value,
+                regression_wave_forecast_limit_value,
+                regression_wave_cutoffs_value,
+                regression_wave_match_tolerance_value,
+                regression_wave_forecast_backtest_limit_value,
+            )
+            forecast_scorecards = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecards_result(
+                forecast_backtests["backtests"],
+                regression_wave_min_evaluated_value,
+                regression_wave_min_cutoffs_value,
+                regression_wave_forecast_scorecard_limit_value,
+            )
+            forecast_streaks = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_streaks_result(
+                forecast_backtests["backtests"],
+                forecast_scorecards["scorecards"],
+                regression_wave_baseline_splits_value,
+                regression_wave_min_evaluated_delta_value,
+                regression_wave_min_hit_rate_drop_value,
+                regression_wave_regression_limit_value,
+                regression_wave_min_consecutive_splits_value,
+                regression_wave_regression_streak_limit_value,
+            )
+            forecast_regression_waves = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_waves_result(
+                forecast_streaks["streaks"],
+                regression_wave_baseline_splits_value,
+                regression_wave_min_active_regressions_value,
+                regression_wave_regression_wave_limit_value,
+            )
+            forecast_regression_wave_backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_result(
+                forecast_regression_waves["waves"],
+                regression_wave_min_regression_wave_occurrences_value,
+                regression_wave_regression_wave_recurrence_limit_value,
+                regression_wave_max_regression_wave_jitter_value,
+                regression_wave_regression_wave_periodicity_limit_value,
+                regression_wave_regression_wave_horizon_value,
+                regression_wave_regression_wave_forecast_limit_value,
+                regression_wave_regression_wave_cutoffs_value,
+                regression_wave_regression_wave_match_tolerance_value,
+                regression_wave_regression_wave_forecast_backtest_limit_value,
+            )
+            forecast_regression_wave_scorecards = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_result(
+                forecast_regression_wave_backtests["backtests"],
+                regression_wave_regression_wave_min_evaluated_value,
+                regression_wave_regression_wave_min_cutoffs_value,
+                regression_wave_regression_wave_forecast_scorecard_limit_value,
+            )
+            deep_streaks = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_streaks_result(
+                forecast_regression_wave_backtests["backtests"],
+                forecast_regression_wave_scorecards["scorecards"],
+                regression_wave_regression_wave_baseline_splits_value,
+                regression_wave_regression_wave_min_evaluated_delta_value,
+                regression_wave_regression_wave_min_hit_rate_drop_value,
+                regression_wave_regression_wave_regression_limit_value,
+                regression_wave_regression_wave_min_consecutive_splits_value,
+                regression_wave_regression_wave_regression_streak_limit_value,
+            )
+            regression_waves = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_waves_result(
+                deep_streaks["streaks"],
+                regression_wave_regression_wave_baseline_splits_value,
+                regression_wave_regression_wave_min_active_regressions_value,
+                regression_wave_regression_wave_regression_wave_limit_value,
+            )
+            deep_backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_result(
+                regression_waves["waves"],
+                regression_wave_regression_wave_min_regression_wave_occurrences_value,
+                regression_wave_regression_wave_regression_wave_recurrence_limit_value,
+                regression_wave_regression_wave_max_regression_wave_jitter_value,
+                regression_wave_regression_wave_regression_wave_periodicity_limit_value,
+                regression_wave_regression_wave_regression_wave_horizon_value,
+                regression_wave_regression_wave_regression_wave_forecast_limit_value,
+                regression_wave_regression_wave_regression_wave_cutoffs_value,
+                regression_wave_regression_wave_regression_wave_match_tolerance_value,
+                regression_wave_regression_wave_regression_wave_forecast_backtest_limit_value,
+            )
+            deep_scorecards = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_result(
+                deep_backtests["backtests"],
+                regression_wave_regression_wave_regression_wave_min_evaluated_value,
+                regression_wave_regression_wave_regression_wave_min_cutoffs_value,
+                regression_wave_regression_wave_regression_wave_forecast_scorecard_limit_value,
+            )
+            deepest_streaks = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regressions_streaks_result(
+                deep_backtests["backtests"],
+                deep_scorecards["scorecards"],
+                regression_wave_regression_wave_regression_wave_baseline_splits_value,
+                regression_wave_regression_wave_regression_wave_min_evaluated_delta_value,
+                regression_wave_regression_wave_regression_wave_min_hit_rate_drop_value,
+                regression_wave_regression_wave_regression_wave_regression_limit_value,
+                regression_wave_regression_wave_regression_wave_min_consecutive_splits_value,
+                regression_wave_regression_wave_regression_wave_regression_streak_limit_value,
+            )
+            deepest_waves = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regressions_waves_result(
+                deepest_streaks["streaks"],
+                regression_wave_regression_wave_regression_wave_baseline_splits_value,
+                regression_wave_regression_wave_regression_wave_min_active_regressions_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_limit_value,
+            )
+            deepest_backtests = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests_result(
+                deepest_waves["waves"],
+                regression_wave_regression_wave_regression_wave_min_regression_wave_occurrences_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_recurrence_limit_value,
+                regression_wave_regression_wave_regression_wave_max_regression_wave_jitter_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_periodicity_limit_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_horizon_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_forecast_limit_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_cutoffs_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_match_tolerance_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_forecast_backtest_limit_value,
+            )
+            result = BranchStore._build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests_scorecards_result(
+                deepest_backtests["backtests"],
+                regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs_value,
+                regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit_value,
+            )
+        except BaseException:
+            if token is not None:
+                self._refund_snapshot_read(token)
+            raise
+        return result
+
     @staticmethod
     def _validate_min_hit_rate_drop(
         min_hit_rate_drop: Any,
@@ -52033,6 +53057,204 @@ class BranchStore:
             totals["unexpected"] += record["unexpected"]
         totals["cutoffs"] = len(cutoff_seen)
         return {"backtests": tuple(records), "totals": totals}
+
+    @staticmethod
+    def _build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests_scorecards_result(
+        backtest_records: tuple[dict[str, object], ...],
+        regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs: int,
+        regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit: int,
+    ) -> dict[str, object]:
+        """Aggregate the deepest regression wave backtests by identity.
+
+        Used only by
+        :meth:`lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests_scorecards`.
+        The records are the complete, already-bounded ``backtests``
+        tuple of
+        :meth:`_build_lifetime_churn_forecast_drift_wave_prediction_scorecard_regression_wave_forecast_scorecard_regression_wave_forecast_backtests_scorecards_regression_wave_forecast_backtests_scorecards_regression_wave_forecasts_backtests_result`,
+        so they run cutoff ascending -- each cutoff itself strictly
+        increasing -- and an identity has at most one record per
+        cutoff. Records are grouped by ``identity`` in first-appearance
+        order, and the four outcome counters sum over every one of the
+        identity's records.
+
+        Each kept scorecard is a fresh tuple whose fields are ordered
+        ``identity, cutoffs, hit, missed, unresolved, unexpected,
+        evaluated, hit_rate, first_failure``: ``cutoffs`` is the
+        distinct cutoff count, ``evaluated`` is ``hit + missed`` and
+        ``hit_rate`` is the reduced ``(hit, evaluated)`` integer
+        tuple, fixed at ``(0, 0)`` when nothing was evaluated.
+        ``first_failure`` is the smallest cutoff whose record has a
+        non-zero ``missed`` or ``unexpected`` count; unresolved-only
+        cutoffs never fail and a never-failing identity gets ``None``.
+
+        Only groups whose evaluated count reaches
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated``
+        and whose distinct cutoff count reaches
+        ``regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs``
+        are kept; they sort by ``hit_rate`` descending (fractions
+        compared by integer cross-multiplication, never dividing, with
+        the fixed ``(0, 0)`` rate below every real fraction), then
+        ``unexpected`` ascending, ``missed`` ascending and the
+        identity in Unicode code point order. The complete qualifying
+        set is built before
+        ``regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit``
+        is enforced, so an over-limit query raises :class:`ValueError`
+        without truncating. ``totals`` is a fresh tuple ordered
+        ``identities, cutoffs, hit, missed, unresolved, unexpected,
+        evaluated``, with ``cutoffs`` the union size of the cutoffs
+        covered by kept scorecards; no qualifying identity yields an
+        empty ``scorecards`` tuple and seven zero totals. Every
+        scorecard and totals tuple is built fresh and shares no mutable
+        object with the backtest records.
+        """
+        grouped: dict[object, dict[str, object]] = {}
+        encounter: list[object] = []
+        for record in backtest_records:
+            identity = record["identity"]
+            entry = grouped.get(identity)
+            if entry is None:
+                entry = {
+                    "identity": identity,
+                    "cutoff_values": set(),
+                    "hit": 0,
+                    "missed": 0,
+                    "unresolved": 0,
+                    "unexpected": 0,
+                    "first_failure": None,
+                }
+                grouped[identity] = entry
+                encounter.append(identity)
+            cutoff = record["cutoff"]
+            entry["cutoff_values"].add(cutoff)
+            entry["hit"] += record["hit"]
+            entry["missed"] += record["missed"]
+            entry["unresolved"] += record["unresolved"]
+            entry["unexpected"] += record["unexpected"]
+            if record["missed"] > 0 or record["unexpected"] > 0:
+                if (
+                    entry["first_failure"] is None
+                    or cutoff < entry["first_failure"]
+                ):
+                    entry["first_failure"] = cutoff
+
+        scorecards: list[tuple[object, ...]] = []
+        kept_entries: list[dict[str, object]] = []
+        for identity in encounter:
+            entry = grouped[identity]
+            evaluated = entry["hit"] + entry["missed"]
+            cutoff_count = len(entry["cutoff_values"])
+            if (
+                evaluated
+                < regression_wave_regression_wave_regression_wave_regression_wave_min_evaluated
+                or cutoff_count
+                < regression_wave_regression_wave_regression_wave_regression_wave_min_cutoffs
+            ):
+                continue
+            if evaluated == 0:
+                hit_rate: tuple[int, int] = (0, 0)
+            else:
+                divisor = math.gcd(entry["hit"], evaluated)
+                hit_rate = (entry["hit"] // divisor, evaluated // divisor)
+            scorecards.append(
+                (
+                    BranchStore._freeze_lifetime_value(identity),
+                    cutoff_count,
+                    entry["hit"],
+                    entry["missed"],
+                    entry["unresolved"],
+                    entry["unexpected"],
+                    evaluated,
+                    hit_rate,
+                    entry["first_failure"],
+                )
+            )
+            kept_entries.append(entry)
+
+        # Field offsets inside a scorecard tuple, in field order.
+        identity_index = 0
+        missed_index = 3
+        unexpected_index = 5
+        hit_rate_index = 7
+
+        def compare_scorecards(
+            left: tuple[object, ...], right: tuple[object, ...]
+        ) -> int:
+            left_numerator, left_denominator = left[hit_rate_index]
+            right_numerator, right_denominator = right[hit_rate_index]
+            # The fixed (0, 0) rate belongs below every real fraction;
+            # real fractions are compared by cross-multiplication.
+            if left_denominator == 0 or right_denominator == 0:
+                if left_denominator != right_denominator:
+                    return 1 if left_denominator == 0 else -1
+            else:
+                left_cross = left_numerator * right_denominator
+                right_cross = right_numerator * left_denominator
+                if left_cross != right_cross:
+                    return -1 if left_cross > right_cross else 1
+            if left[unexpected_index] != right[unexpected_index]:
+                return (
+                    -1
+                    if left[unexpected_index] < right[unexpected_index]
+                    else 1
+                )
+            if left[missed_index] != right[missed_index]:
+                return -1 if left[missed_index] < right[missed_index] else 1
+            left_key = BranchStore._lifetime_identity_unicode_key(
+                left[identity_index]
+            )
+            right_key = BranchStore._lifetime_identity_unicode_key(
+                right[identity_index]
+            )
+            if left_key < right_key:
+                return -1
+            if left_key > right_key:
+                return 1
+            return 0
+
+        scorecards.sort(key=functools.cmp_to_key(compare_scorecards))
+
+        if (
+            len(scorecards)
+            > regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit
+        ):
+            raise ValueError(
+                f"lifetime churn drift wave prediction scorecard "
+                f"regression wave forecast scorecard regression wave "
+                f"forecast backtest scorecard regression wave forecast "
+                f"backtest scorecard regression wave forecast backtest "
+                f"scorecard limit exceeded: "
+                f"{len(scorecards)} scorecard records, limit is "
+                f"{regression_wave_regression_wave_regression_wave_regression_wave_forecast_scorecard_limit}"
+            )
+
+        cutoff_union: set[object] = set()
+        identities_total = 0
+        cutoffs_total = 0
+        hit_total = 0
+        missed_total = 0
+        unresolved_total = 0
+        unexpected_total = 0
+        evaluated_total = 0
+        for entry in kept_entries:
+            cutoff_union.update(entry["cutoff_values"])
+            identities_total += 1
+            hit_total += entry["hit"]
+            missed_total += entry["missed"]
+            unresolved_total += entry["unresolved"]
+            unexpected_total += entry["unexpected"]
+            evaluated_total += entry["hit"] + entry["missed"]
+        cutoffs_total = len(cutoff_union)
+        totals = (
+            identities_total,
+            cutoffs_total,
+            hit_total,
+            missed_total,
+            unresolved_total,
+            unexpected_total,
+            evaluated_total,
+        )
+        return {"scorecards": tuple(scorecards), "totals": totals}
 
     @staticmethod
     def _validate_wave_cutoffs(wave_cutoffs: Any) -> tuple[int, ...]:
